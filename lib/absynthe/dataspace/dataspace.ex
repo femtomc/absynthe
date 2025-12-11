@@ -328,7 +328,8 @@ defmodule Absynthe.Dataspace.Dataspace do
     observer_id = generate_observer_id(handle)
 
     # Add observer to skeleton and get existing matches
-    {skeleton, existing_matches} = Skeleton.add_observer(dataspace.skeleton, handle, entity_ref, compiled)
+    # Skeleton is ETS-based, so it's mutated in place
+    existing_matches = Skeleton.add_observer(dataspace.skeleton, handle, entity_ref, compiled)
 
     # Notify observer of existing assertions
     turn = notify_observer_of_existing(turn, entity_ref, existing_matches)
@@ -336,8 +337,7 @@ defmodule Absynthe.Dataspace.Dataspace do
     # Update dataspace with new observer
     updated_dataspace = %__MODULE__{
       dataspace
-      | skeleton: skeleton,
-        observers: Map.put(dataspace.observers, observer_id, observer),
+      | observers: Map.put(dataspace.observers, observer_id, observer),
         handle_to_observer: Map.put(dataspace.handle_to_observer, handle, observer_id)
     }
 
@@ -346,13 +346,13 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   defp handle_observe_retraction(%__MODULE__{} = dataspace, observer_id, handle, turn) do
     # Remove observer from skeleton
-    skeleton = Skeleton.remove_observer(dataspace.skeleton, handle)
+    # Skeleton is ETS-based, so it's mutated in place
+    Skeleton.remove_observer(dataspace.skeleton, handle)
 
     # Clean up observer tracking
     updated_dataspace = %__MODULE__{
       dataspace
-      | skeleton: skeleton,
-        observers: Map.delete(dataspace.observers, observer_id),
+      | observers: Map.delete(dataspace.observers, observer_id),
         handle_to_observer: Map.delete(dataspace.handle_to_observer, handle)
     }
 
@@ -365,12 +365,13 @@ defmodule Absynthe.Dataspace.Dataspace do
     case Bag.add(dataspace.bag, assertion, handle) do
       {:new, bag} ->
         # First occurrence - add to skeleton and notify observers
-        {skeleton, observer_matches} = Skeleton.add_assertion(dataspace.skeleton, handle, assertion)
+        # Skeleton is ETS-based, so it's mutated in place
+        observer_matches = Skeleton.add_assertion(dataspace.skeleton, handle, assertion)
 
         # Notify all matching observers
         turn = notify_observers_of_publish(turn, observer_matches, assertion, handle)
 
-        updated_dataspace = %__MODULE__{dataspace | bag: bag, skeleton: skeleton}
+        updated_dataspace = %__MODULE__{dataspace | bag: bag}
         {updated_dataspace, turn}
 
       {:existing, bag} ->
@@ -384,12 +385,13 @@ defmodule Absynthe.Dataspace.Dataspace do
     case Bag.remove(dataspace.bag, handle) do
       {:removed, bag} ->
         # Last occurrence - remove from skeleton and notify observers
-        {skeleton, observer_refs} = Skeleton.remove_assertion(dataspace.skeleton, handle)
+        # Skeleton is ETS-based, so it's mutated in place
+        observer_refs = Skeleton.remove_assertion(dataspace.skeleton, handle)
 
         # Notify all observers that were watching this assertion
         turn = notify_observers_of_retract(turn, observer_refs, handle)
 
-        updated_dataspace = %__MODULE__{dataspace | bag: bag, skeleton: skeleton}
+        updated_dataspace = %__MODULE__{dataspace | bag: bag}
         {updated_dataspace, turn}
 
       {:decremented, bag} ->

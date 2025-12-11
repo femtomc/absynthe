@@ -283,8 +283,16 @@ defmodule Absynthe.Preserves.Decoder.Binary do
   end
 
   defp decode_value(@tag_embedded, rest) do
-    with {:ok, embedded_value, rest} <- decode(rest) do
-      {:ok, Value.embedded(embedded_value), rest}
+    with {:ok, wire_value, rest} <- decode(rest) do
+      codec = Absynthe.Preserves.EmbeddedCodec.get_codec()
+
+      case codec.decode(wire_value) do
+        {:ok, payload} ->
+          {:ok, Value.embedded(payload), rest}
+
+        {:error, reason} ->
+          {:error, {:embedded_decode_error, reason}}
+      end
     end
   end
 

@@ -147,9 +147,8 @@ defmodule Absynthe do
     Absynthe.Preserves.Encoder.Binary.encode!(value)
   end
 
-  def encode!(_value, :text) do
-    # Text encoder is not yet implemented - use binary for now
-    raise ArgumentError, "Text encoding is not yet implemented. Use :binary format."
+  def encode!(value, :text) do
+    Absynthe.Preserves.Encoder.Text.encode!(value)
   end
 
   @doc """

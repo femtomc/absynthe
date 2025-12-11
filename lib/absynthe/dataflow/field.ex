@@ -192,44 +192,143 @@ defmodule Absynthe.Dataflow.Field do
     dirty?: false
   ]
 
-  # Process dictionary key for tracking current computation
+  # Process dictionary keys for tracking current computation
   @computing_field_key :__dataflow_computing_field__
+  @computing_stack_key :__dataflow_computing_stack__
 
-  # Field Registry - In a real implementation, this would be a proper store
-  # For now, we use a simple Agent for demonstration
-  @doc false
-  def start_registry do
-    case Agent.start_link(fn -> %{} end, name: __MODULE__.Registry) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
-  end
+  # Registry alias for cleaner code
+  alias Absynthe.Dataflow.Registry
 
   @doc false
-  defp get_registry do
-    case Process.whereis(__MODULE__.Registry) do
-      nil ->
-        {:ok, _} = start_registry()
-        Agent.get(__MODULE__.Registry, & &1)
-
-      _pid ->
-        Agent.get(__MODULE__.Registry, & &1)
-    end
-  end
-
-  @doc false
-  defp update_registry(field) do
-    start_registry()
-    Agent.update(__MODULE__.Registry, fn registry ->
-      Map.put(registry, field.id, field)
-    end)
-    field
+  defp update_registry(field, owner_pid \\ self()) do
+    Registry.put_field(field, owner_pid)
   end
 
   @doc false
   defp lookup_field(field_id) do
-    get_registry()
-    |> Map.get(field_id)
+    Registry.get_field(field_id)
+  end
+
+  @doc """
+  Reassigns ownership of a field to a new process.
+
+  This is useful when fields are created in one process (e.g., a caller building
+  an entity struct) but should be owned by a different process (e.g., the actor
+  that will host the entity).
+
+  ## Parameters
+
+  - `field` - The field to reassign
+  - `new_owner_pid` - The PID of the new owner process
+
+  ## Returns
+
+  The field (unchanged, but registry updated).
+
+  ## Examples
+
+      iex> field = Absynthe.Dataflow.Field.new("test")
+      iex> Absynthe.Dataflow.Field.reassign_owner(field, spawn(fn -> :ok end))
+      iex> :ok
+  """
+  @spec reassign_owner(t(), pid()) :: t()
+  def reassign_owner(%__MODULE__{id: field_id} = field, new_owner_pid) when is_pid(new_owner_pid) do
+    # Remove old ownership entries for this field
+    Registry.remove_ownership(field_id)
+    # Add new ownership
+    Registry.add_ownership(field_id, new_owner_pid)
+    field
+  end
+
+  @doc """
+  Recursively finds all Field structs within a data structure and reassigns
+  their ownership to the specified process.
+
+  This is called automatically when spawning entities to ensure fields created
+  outside the actor are properly owned by the actor process.
+
+  ## Parameters
+
+  - `data` - Any data structure that may contain Field structs
+  - `new_owner_pid` - The PID of the new owner process
+
+  ## Returns
+
+  `:ok`
+  """
+  @spec reassign_all_owners(term(), pid()) :: :ok
+  def reassign_all_owners(data, new_owner_pid) when is_pid(new_owner_pid) do
+    find_and_reassign_fields(data, new_owner_pid)
+    :ok
+  end
+
+  defp find_and_reassign_fields(%__MODULE__{} = field, new_owner_pid) do
+    reassign_owner(field, new_owner_pid)
+  end
+
+  defp find_and_reassign_fields(%{__struct__: _} = struct, new_owner_pid) do
+    # Walk struct fields
+    struct
+    |> Map.from_struct()
+    |> Enum.each(fn {_key, value} -> find_and_reassign_fields(value, new_owner_pid) end)
+  end
+
+  defp find_and_reassign_fields(map, new_owner_pid) when is_map(map) do
+    Enum.each(map, fn {key, value} ->
+      find_and_reassign_fields(key, new_owner_pid)
+      find_and_reassign_fields(value, new_owner_pid)
+    end)
+  end
+
+  defp find_and_reassign_fields(list, new_owner_pid) when is_list(list) do
+    Enum.each(list, fn elem -> find_and_reassign_fields(elem, new_owner_pid) end)
+  end
+
+  defp find_and_reassign_fields(tuple, new_owner_pid) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.each(fn elem -> find_and_reassign_fields(elem, new_owner_pid) end)
+  end
+
+  defp find_and_reassign_fields(_other, _new_owner_pid), do: :ok
+
+  @doc """
+  Cleans up all fields owned by the current process.
+
+  Call this when an actor/process terminates to prevent memory leaks.
+  All fields created by the current process will be removed from the registry.
+
+  ## Returns
+
+  `:ok`
+
+  ## Examples
+
+      iex> field = Absynthe.Dataflow.Field.new("test")
+      iex> Absynthe.Dataflow.Field.cleanup()
+      :ok
+  """
+  @spec cleanup() :: :ok
+  def cleanup do
+    Registry.cleanup(self())
+  end
+
+  @doc """
+  Cleans up all fields owned by the specified process.
+
+  Call this when an actor/process terminates to prevent memory leaks.
+
+  ## Parameters
+
+  - `owner_pid` - The PID of the process whose fields should be cleaned up
+
+  ## Returns
+
+  `:ok`
+  """
+  @spec cleanup(pid()) :: :ok
+  def cleanup(owner_pid) when is_pid(owner_pid) do
+    Registry.cleanup(owner_pid)
   end
 
   # Constructor Functions
@@ -428,7 +527,7 @@ defmodule Absynthe.Dataflow.Field do
       iex> name = Absynthe.Dataflow.Field.new("Alice")
       iex> turn = Absynthe.Core.Turn.new(:actor, :facet)
       iex> turn = Absynthe.Dataflow.Field.set(name, "Bob", turn)
-      iex> {_turn, _actions} = Absynthe.Core.Turn.commit(turn)
+      iex> Absynthe.Dataflow.Field.commit_field_updates(turn)
       iex> Absynthe.Dataflow.Field.get(name)
       "Bob"
 
@@ -442,23 +541,109 @@ defmodule Absynthe.Dataflow.Field do
       20
       iex> turn = Absynthe.Core.Turn.new(:actor, :facet)
       iex> turn = Absynthe.Dataflow.Field.set(x, 15, turn)
-      iex> {_turn, _actions} = Absynthe.Core.Turn.commit(turn)
+      iex> Absynthe.Dataflow.Field.commit_field_updates(turn)
       iex> Absynthe.Dataflow.Field.get(doubled)
       30
   """
   @spec set(t(), term(), Turn.t()) :: Turn.t()
-  def set(%__MODULE__{compute: nil} = field, new_value, %Turn{} = turn) do
-    # Create an action to update the field
-    update_action = fn ->
-      perform_update(field, new_value)
-    end
-
-    Turn.add_action(turn, {:field_update, update_action})
+  def set(%__MODULE__{compute: nil, id: field_id}, new_value, %Turn{} = turn) do
+    # Store field ID and new value - lookup happens at commit time to get fresh dependents
+    Turn.add_action(turn, {:field_update, field_id, new_value})
   end
 
   def set(%__MODULE__{compute: compute}, _new_value, %Turn{} = _turn)
       when is_function(compute) do
     raise ArgumentError, "Cannot set value of computed field"
+  end
+
+  @doc """
+  Commits all field updates from a Turn.
+
+  This function executes all staged field updates from a turn. It looks up
+  the current field state from the registry (not a stale snapshot) to ensure
+  newly added dependents are properly notified.
+
+  ## Important: Use Outside Actor Context Only
+
+  **WARNING**: Do NOT use this function when working within an Actor. The Actor
+  automatically commits field updates when processing turns via `Actor.commit_turn/2`.
+  Calling this function in addition to Actor's commit would execute field updates twice.
+
+  This function is intended for:
+  - Standalone dataflow usage outside of actors
+  - Testing field behavior in isolation
+  - Custom execution contexts that don't use the Actor system
+
+  When using Actors, field updates flow automatically:
+  1. Entity handler calls `Field.set(field, value, turn)`
+  2. Actor commits the turn after entity processing
+  3. Field updates are executed via `Field.execute_field_update/2`
+
+  ## Parameters
+
+  - `turn` - The turn containing field updates to commit
+
+  ## Returns
+
+  `:ok`
+
+  ## Examples
+
+      iex> field = Absynthe.Dataflow.Field.new(1)
+      iex> turn = Absynthe.Core.Turn.new(:actor, :facet)
+      iex> turn = Absynthe.Dataflow.Field.set(field, 2, turn)
+      iex> Absynthe.Dataflow.Field.commit_field_updates(turn)
+      :ok
+      iex> Absynthe.Dataflow.Field.get(field)
+      2
+  """
+  @spec commit_field_updates(Turn.t()) :: :ok
+  def commit_field_updates(%Turn{} = turn) do
+    {_committed_turn, actions} = Turn.commit(turn)
+
+    # Execute only field_update actions
+    Enum.each(actions, fn
+      {:field_update, field_id, new_value} ->
+        execute_field_update(field_id, new_value)
+
+      _other_action ->
+        :ok
+    end)
+
+    :ok
+  end
+
+  @doc """
+  Executes a single field update by ID.
+
+  Looks up the current field state from the registry to ensure
+  newly added dependents are notified.
+
+  ## Parameters
+
+  - `field_id` - The ID of the field to update
+  - `new_value` - The new value to assign
+
+  ## Returns
+
+  The updated field, or `nil` if field not found.
+  """
+  @spec execute_field_update(term(), term()) :: t() | nil
+  def execute_field_update(field_id, new_value) do
+    # Use atomic update to prevent lost updates from concurrent writers
+    updated_field = Registry.update_field(field_id, fn %__MODULE__{} = field ->
+      %{field | value: new_value, version: field.version + 1}
+    end)
+
+    case updated_field do
+      nil ->
+        nil
+
+      %__MODULE__{} = field ->
+        # Mark all dependents as dirty (reads fresh dependents from registry)
+        mark_dependents_dirty(field)
+        field
+    end
   end
 
   @doc """
@@ -477,21 +662,9 @@ defmodule Absynthe.Dataflow.Field do
   The updated field.
   """
   @spec perform_update(t(), term()) :: t()
-  def perform_update(%__MODULE__{} = field, new_value) do
-    # Increment version to invalidate dependent computations
-    updated_field = %__MODULE__{
-      field
-      | value: new_value,
-        version: field.version + 1
-    }
-
-    # Update in registry
-    update_registry(updated_field)
-
-    # Mark all dependents as dirty
-    mark_dependents_dirty(updated_field)
-
-    updated_field
+  def perform_update(%__MODULE__{id: field_id}, new_value) do
+    # Delegate to execute_field_update for atomic update
+    execute_field_update(field_id, new_value)
   end
 
   # Dependency Management
@@ -523,13 +696,18 @@ defmodule Absynthe.Dataflow.Field do
       true
   """
   @spec add_dependent(t(), term()) :: t()
-  def add_dependent(%__MODULE__{} = field, dependent_id) do
-    updated_field = %__MODULE__{
-      field
-      | dependents: MapSet.put(field.dependents, dependent_id)
-    }
+  def add_dependent(%__MODULE__{id: field_id} = field, dependent_id) do
+    # Use atomic update to prevent losing dependents from concurrent adds
+    case Registry.update_field(field_id, fn %__MODULE__{} = f ->
+      %{f | dependents: MapSet.put(f.dependents, dependent_id)}
+    end) do
+      nil ->
+        # Field not found, return original with local update
+        %__MODULE__{field | dependents: MapSet.put(field.dependents, dependent_id)}
 
-    update_registry(updated_field)
+      updated ->
+        updated
+    end
   end
 
   @doc """
@@ -557,13 +735,18 @@ defmodule Absynthe.Dataflow.Field do
       false
   """
   @spec remove_dependent(t(), term()) :: t()
-  def remove_dependent(%__MODULE__{} = field, dependent_id) do
-    updated_field = %__MODULE__{
-      field
-      | dependents: MapSet.delete(field.dependents, dependent_id)
-    }
+  def remove_dependent(%__MODULE__{id: field_id} = field, dependent_id) do
+    # Use atomic update to prevent losing dependents from concurrent removes
+    case Registry.update_field(field_id, fn %__MODULE__{} = f ->
+      %{f | dependents: MapSet.delete(f.dependents, dependent_id)}
+    end) do
+      nil ->
+        # Field not found, return original with local update
+        %__MODULE__{field | dependents: MapSet.delete(field.dependents, dependent_id)}
 
-    update_registry(updated_field)
+      updated ->
+        updated
+    end
   end
 
   @doc """
@@ -649,17 +832,33 @@ defmodule Absynthe.Dataflow.Field do
   @spec recompute(t()) :: t()
   def recompute(%__MODULE__{compute: nil} = field), do: field
 
-  def recompute(%__MODULE__{compute: compute_fn} = field) when is_function(compute_fn, 0) do
+  def recompute(%__MODULE__{id: field_id, compute: compute_fn} = field) when is_function(compute_fn, 0) do
+    # Check for cycles - if this field is already being computed, we have a cycle
+    stack = Process.get(@computing_stack_key, MapSet.new())
+
+    if MapSet.member?(stack, field_id) do
+      raise ArgumentError,
+            "Cycle detected in dataflow computation: field #{inspect(field_id)} depends on itself"
+    end
+
     # Clear old dependencies
     clear_old_dependencies(field)
 
-    # Track dependencies during computation
-    Process.put(@computing_field_key, field.id)
-    new_dependencies = MapSet.new()
-    Process.put({@computing_field_key, :deps}, new_dependencies)
+    # Push this field onto the computation stack
+    Process.put(@computing_stack_key, MapSet.put(stack, field_id))
 
-    # Execute computation
-    new_value = compute_fn.()
+    # Track dependencies during computation
+    Process.put(@computing_field_key, field_id)
+    Process.put({@computing_field_key, :deps}, MapSet.new())
+
+    # Execute computation (with try/after to ensure stack cleanup)
+    new_value =
+      try do
+        compute_fn.()
+      after
+        # Pop this field from the computation stack (restore previous stack)
+        Process.put(@computing_stack_key, stack)
+      end
 
     # Collect tracked dependencies
     tracked_deps = Process.get({@computing_field_key, :deps}, MapSet.new())
@@ -683,7 +882,7 @@ defmodule Absynthe.Dataflow.Field do
     Enum.each(tracked_deps, fn dep_id ->
       case lookup_field(dep_id) do
         nil -> :ok
-        dep_field -> add_dependent(dep_field, field.id)
+        dep_field -> add_dependent(dep_field, field_id)
       end
     end)
 

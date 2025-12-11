@@ -22,3 +22,22 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 absynthe-*.tar
 
+# ElixirLS language server
+/.elixir_ls/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment variables (if used)
+.env
+.env.local
+
+# Claude Code session data
+.claude/

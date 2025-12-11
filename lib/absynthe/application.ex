@@ -8,8 +8,9 @@ defmodule Absynthe.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # Starts a worker by calling: Absynthe.Worker.start_link(arg)
-      # {Absynthe.Worker, arg}
+      # Dataflow field registry - provides ETS-based storage for reactive fields.
+      # Must be started before any actors that use dataflow fields.
+      Absynthe.Dataflow.Registry
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

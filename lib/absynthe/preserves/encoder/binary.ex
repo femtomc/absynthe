@@ -213,31 +213,19 @@ defmodule Absynthe.Preserves.Encoder.Binary do
     <<@tag_annotation, annotation_bytes::binary, value_bytes::binary>>
   end
 
-  # Embedded: requires the payload to be a Preserves Value
+  # Embedded: uses codec to convert payload to Preserves Value for wire format
   def encode!({:embedded, payload}) do
-    case payload do
-      {tag, _}
-      when tag in [
-             :boolean,
-             :integer,
-             :double,
-             :string,
-             :binary,
-             :symbol,
-             :record,
-             :sequence,
-             :set,
-             :dictionary,
-             :embedded,
-             :annotated
-           ] ->
-        payload_bytes = encode!(payload)
+    codec = Absynthe.Preserves.EmbeddedCodec.get_codec()
+
+    case codec.encode(payload) do
+      {:ok, encoded_value} ->
+        payload_bytes = encode!(encoded_value)
         <<@tag_embedded, payload_bytes::binary>>
 
-      _ ->
+      {:error, reason} ->
         raise ArgumentError,
-              "Embedded values must be Preserves Values, got: #{inspect(payload)}. " <>
-                "Convert to a Preserves Value first (e.g., use {:string, ...} or {:record, ...})."
+              "Failed to encode embedded value: #{inspect(reason)}. " <>
+                "Payload: #{inspect(payload)}"
     end
   end
 

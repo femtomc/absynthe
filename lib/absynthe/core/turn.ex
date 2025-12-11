@@ -166,6 +166,10 @@ defmodule Absynthe.Core.Turn do
       2
   """
   @spec add_action(t(), Event.t()) :: t()
+  def add_action(%__MODULE__{committed?: true}, _action) do
+    raise ArgumentError, "Cannot add actions to an already committed turn"
+  end
+
   def add_action(%__MODULE__{pending_actions: actions} = turn, action) do
     # Prepend for O(1) insertion - actions stored in reverse order
     %__MODULE__{turn | pending_actions: [action | actions]}
@@ -242,6 +246,10 @@ defmodule Absynthe.Core.Turn do
       []
   """
   @spec commit(t()) :: {t(), [Event.t()]}
+  def commit(%__MODULE__{committed?: true}) do
+    raise ArgumentError, "Cannot commit an already committed turn"
+  end
+
   def commit(%__MODULE__{pending_actions: actions} = turn) do
     committed_turn = %__MODULE__{turn | committed?: true}
     # Reverse to restore original insertion order

@@ -776,8 +776,16 @@ defmodule Absynthe.Preserves.Decoder.Text do
 
   defp parse_embedded(input, pos) do
     case parse_value(input, pos) do
-      {:ok, value, rest, new_pos} ->
-        {:ok, Value.embedded(value), rest, new_pos}
+      {:ok, wire_value, rest, new_pos} ->
+        codec = Absynthe.Preserves.EmbeddedCodec.get_codec()
+
+        case codec.decode(wire_value) do
+          {:ok, payload} ->
+            {:ok, Value.embedded(payload), rest, new_pos}
+
+          {:error, reason} ->
+            {:error, "Embedded codec decode error: #{inspect(reason)}", pos}
+        end
 
       {:error, reason, pos} ->
         {:error, "Invalid embedded value: #{reason}", pos}

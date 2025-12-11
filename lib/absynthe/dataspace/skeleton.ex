@@ -87,7 +87,8 @@ defmodule Absynthe.Dataspace.Skeleton do
   """
 
   alias Absynthe.Assertions.Handle
-  alias Absynthe.Preserves.{Value, Pattern}
+  alias Absynthe.Preserves.Value
+  alias Absynthe.Dataspace.Pattern
 
   @typedoc """
   Path into a Preserves value structure.
@@ -176,7 +177,7 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   """
   @spec add_assertion(t(), Handle.t(), Value.t()) ::
-          [{observer_ref :: term(), captures :: [Value.t()]}]
+          [{observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
   def add_assertion(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
     # Store the full assertion
     :ets.insert(skeleton.assertions, {handle, value})
@@ -227,34 +228,34 @@ defmodule Absynthe.Dataspace.Skeleton do
       notifications = Absynthe.Dataspace.Skeleton.remove_assertion(skeleton, handle)
 
   """
-  @spec remove_assertion(t(), Handle.t()) ::
-          [{observer_ref :: term(), captures :: [Value.t()]}]
+  @spec remove_assertion(t(), Handle.t()) :: [observer_ref :: term()]
   def remove_assertion(%__MODULE__{} = skeleton, %Handle{} = handle) do
-    # Get the assertion value before removing
-    notifications =
+    # Get the assertion value before removing and find matching observers
+    {value_for_cleanup, observer_refs} =
       case :ets.lookup(skeleton.assertions, handle) do
         [{^handle, value}] ->
-          find_matching_observers(skeleton, handle, value)
+          matches = find_matching_observers(skeleton, handle, value)
+          # Extract just observer refs for retraction notifications
+          refs = Enum.map(matches, fn {observer_ref, _value, _captures} -> observer_ref end)
+          {value, refs}
 
         [] ->
-          []
+          {nil, []}
       end
 
     # Remove from assertions table
     :ets.delete(skeleton.assertions, handle)
 
-    # Get the value to clean up path indices
-    case :ets.lookup(skeleton.assertions, handle) do
-      [{^handle, value}] ->
-        remove_from_path_index(skeleton, handle, value)
-
-      [] ->
-        # If we can't find it, we need to scan the entire path index
-        # This is expensive but necessary for cleanup
-        cleanup_handle_from_index(skeleton, handle)
+    # Clean up path indices
+    if value_for_cleanup do
+      remove_from_path_index(skeleton, handle, value_for_cleanup)
+    else
+      # If we can't find it, we need to scan the entire path index
+      # This is expensive but necessary for cleanup
+      cleanup_handle_from_index(skeleton, handle)
     end
 
-    notifications
+    observer_refs
   end
 
   @doc """
@@ -290,15 +291,14 @@ defmodule Absynthe.Dataspace.Skeleton do
       )
 
   """
-  @spec add_observer(t(), observer_id :: term(), observer_ref :: term(), Pattern.pattern()) ::
-          [{Handle.t(), captures :: [Value.t()]}]
+  @spec add_observer(t(), observer_id :: term(), observer_ref :: term(), Pattern.t()) ::
+          [{Handle.t(), Value.t(), captures :: [Value.t()]}]
   def add_observer(%__MODULE__{} = skeleton, observer_id, observer_ref, pattern) do
     # Store the observer
     :ets.insert(skeleton.observers, {observer_id, {pattern, observer_ref}})
 
-    # Find all existing matching assertions
+    # Find all existing matching assertions - query returns {handle, value, captures}
     query(skeleton, pattern)
-    |> Enum.map(fn {handle, _value, captures} -> {handle, captures} end)
   end
 
   @doc """
@@ -357,26 +357,23 @@ defmodule Absynthe.Dataspace.Skeleton do
       results = Absynthe.Dataspace.Skeleton.query(skeleton, pattern)
 
   """
-  @spec query(t(), Pattern.pattern()) ::
+  @spec query(t(), Pattern.t()) ::
           [{Handle.t(), Value.t(), captures :: [Value.t()]}]
-  def query(%__MODULE__{} = skeleton, pattern) do
-    # Extract constraints from the pattern
-    constraints = extract_constraints(pattern)
+  def query(%__MODULE__{} = skeleton, %Pattern{} = compiled_pattern) do
+    # Extract constraints from the compiled pattern
+    index_paths = Pattern.index_paths(compiled_pattern)
 
     # Get candidate handles using the most selective constraint
     candidate_handles =
-      case constraints do
+      case index_paths do
         [] ->
           # No constraints - must check all assertions
           :ets.tab2list(skeleton.assertions)
           |> Enum.map(fn {handle, _value} -> handle end)
 
-        [constraint | _rest] ->
-          # Use the first constraint (could be optimized to choose most selective)
-          case :ets.lookup(skeleton.path_index, constraint) do
-            [{^constraint, handle_set}] -> MapSet.to_list(handle_set)
-            [] -> []
-          end
+        constraints ->
+          # Find the most selective constraint (smallest handle set)
+          find_most_selective_candidates(skeleton, constraints)
       end
 
     # For each candidate, retrieve the full value and perform pattern matching
@@ -384,13 +381,11 @@ defmodule Absynthe.Dataspace.Skeleton do
     |> Enum.flat_map(fn handle ->
       case :ets.lookup(skeleton.assertions, handle) do
         [{^handle, value}] ->
-          case Pattern.match(pattern, value) do
-            {:ok, bindings} ->
-              # Extract captures in variable order
-              captures = extract_ordered_captures(pattern, bindings)
+          case Pattern.match(compiled_pattern, value) do
+            {:ok, captures} ->
               [{handle, value, captures}]
 
-            :error ->
+            :no_match ->
               []
           end
 
@@ -398,6 +393,41 @@ defmodule Absynthe.Dataspace.Skeleton do
           []
       end
     end)
+  end
+
+  # Finds candidates using the most selective (smallest) index
+  defp find_most_selective_candidates(skeleton, constraints) do
+    # Look up all constraints and find the one with the smallest result set
+    candidates_by_constraint =
+      constraints
+      |> Enum.map(fn {path, expected} ->
+        lookup_key = {path, expected}
+        case :ets.lookup(skeleton.path_index, lookup_key) do
+          [{^lookup_key, handle_set}] -> {MapSet.size(handle_set), handle_set}
+          [] -> {0, MapSet.new()}
+        end
+      end)
+
+    case candidates_by_constraint do
+      [] ->
+        []
+
+      results ->
+        # Pick the constraint with the smallest non-empty result set
+        # If all are empty, return empty list
+        non_empty = Enum.filter(results, fn {size, _set} -> size > 0 end)
+
+        case non_empty do
+          [] ->
+            # All constraints returned empty - no matches possible
+            []
+
+          _ ->
+            # Pick the smallest (most selective)
+            {_size, best_set} = Enum.min_by(non_empty, fn {size, _set} -> size end)
+            MapSet.to_list(best_set)
+        end
+    end
   end
 
   @doc """
@@ -483,94 +513,6 @@ defmodule Absynthe.Dataspace.Skeleton do
   # Atomic values don't have nested paths
   defp extract_paths(_atomic, _path), do: []
 
-  # Extracts constraints (concrete path-value pairs) from a pattern
-  @spec extract_constraints(Pattern.pattern()) :: [{path(), Value.t()}]
-  defp extract_constraints(pattern), do: extract_constraints(pattern, [])
-
-  @spec extract_constraints(Pattern.pattern(), path()) :: [{path(), Value.t()}]
-  defp extract_constraints(:_, _path), do: []
-  defp extract_constraints({:capture, _name}, _path), do: []
-  defp extract_constraints({:bind, _name, pattern}, path), do: extract_constraints(pattern, path)
-
-  defp extract_constraints({:record, {label_pattern, field_patterns}}, path) do
-    # If label is concrete, it's a constraint
-    label_constraints =
-      case label_pattern do
-        :_ -> []
-        {:capture, _} -> []
-        {:bind, _, _} -> extract_constraints(label_pattern, path ++ [:label])
-        concrete -> [{path ++ [:label], concrete}]
-      end
-
-    # Check field patterns for constraints
-    field_constraints =
-      field_patterns
-      |> Enum.with_index()
-      |> Enum.flat_map(fn {field_pattern, idx} ->
-        extract_constraints(field_pattern, path ++ [:field, idx])
-      end)
-
-    label_constraints ++ field_constraints
-  end
-
-  defp extract_constraints({:sequence, item_patterns}, path) do
-    item_patterns
-    |> Enum.with_index()
-    |> Enum.flat_map(fn {item_pattern, idx} ->
-      extract_constraints(item_pattern, path ++ [:element, idx])
-    end)
-  end
-
-  defp extract_constraints({:set, item_patterns}, path) do
-    item_patterns
-    |> Enum.flat_map(fn item_pattern ->
-      case item_pattern do
-        :_ -> []
-        {:capture, _} -> []
-        {:bind, _, _} -> extract_constraints(item_pattern, path)
-        concrete -> [{path ++ [:member, concrete], concrete}]
-      end
-    end)
-  end
-
-  defp extract_constraints({:dictionary, pattern_map}, path) do
-    pattern_map
-    |> Enum.flat_map(fn {key_pattern, val_pattern} ->
-      key_constraints =
-        case key_pattern do
-          :_ -> []
-          {:capture, _} -> []
-          {:bind, _, _} -> extract_constraints(key_pattern, path)
-          concrete_key -> [{path ++ [:key, concrete_key], concrete_key}]
-        end
-
-      val_constraints =
-        case key_pattern do
-          :_ -> []
-          {:capture, _} -> []
-          concrete_key -> extract_constraints(val_pattern, path ++ [:value, concrete_key])
-        end
-
-      key_constraints ++ val_constraints
-    end)
-  end
-
-  # Concrete values are constraints
-  defp extract_constraints(concrete, path) when is_tuple(concrete) do
-    case concrete do
-      {:boolean, _} -> [{path, concrete}]
-      {:integer, _} -> [{path, concrete}]
-      {:double, _} -> [{path, concrete}]
-      {:string, _} -> [{path, concrete}]
-      {:binary, _} -> [{path, concrete}]
-      {:symbol, _} -> [{path, concrete}]
-      {:embedded, _} -> [{path, concrete}]
-      _ -> []
-    end
-  end
-
-  defp extract_constraints(_other, _path), do: []
-
   # Removes assertion handle from path index
   defp remove_from_path_index(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
     paths = extract_paths(value)
@@ -617,28 +559,17 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   # Find observers that match a given assertion
   @spec find_matching_observers(t(), Handle.t(), Value.t()) ::
-          [{observer_ref :: term(), captures :: [Value.t()]}]
+          [{observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
   defp find_matching_observers(%__MODULE__{} = skeleton, _handle, value) do
     :ets.tab2list(skeleton.observers)
     |> Enum.flat_map(fn {_observer_id, {pattern, observer_ref}} ->
       case Pattern.match(pattern, value) do
-        {:ok, bindings} ->
-          captures = extract_ordered_captures(pattern, bindings)
-          [{observer_ref, captures}]
+        {:ok, captures} ->
+          [{observer_ref, value, captures}]
 
-        :error ->
+        :no_match ->
           []
       end
-    end)
-  end
-
-  # Extract captures in the order variables appear in the pattern
-  @spec extract_ordered_captures(Pattern.pattern(), Pattern.bindings()) :: [Value.t()]
-  defp extract_ordered_captures(pattern, bindings) do
-    variables = Pattern.variables(pattern)
-
-    Enum.map(variables, fn var ->
-      Map.get(bindings, var)
     end)
   end
 end

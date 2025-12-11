@@ -518,18 +518,9 @@ defmodule Absynthe.Core.Actor do
     # Create and deliver the assert event
     event = Event.assert(ref, assertion, handle)
 
-    # If local, deliver immediately; otherwise would send to remote actor
-    case Ref.local?(ref, state.id) do
-      true ->
-        # Deliver locally
-        new_state = deliver_event_impl(new_state, ref, event)
-        {:reply, {:ok, handle}, new_state}
-
-      false ->
-        # Remote delivery not yet implemented
-        Logger.warning("Remote assertion not yet implemented: #{inspect(ref)}")
-        {:reply, {:ok, handle}, new_state}
-    end
+    # Deliver to local or remote actor
+    new_state = deliver_to_ref(new_state, ref, event)
+    {:reply, {:ok, handle}, new_state}
   end
 
   @impl GenServer
@@ -542,15 +533,9 @@ defmodule Absynthe.Core.Actor do
         # Create and deliver the retract event
         event = Event.retract(ref, handle)
 
-        case Ref.local?(ref, state.id) do
-          true ->
-            new_state = deliver_event_impl(new_state, ref, event)
-            {:reply, :ok, new_state}
-
-          false ->
-            Logger.warning("Remote retraction not yet implemented: #{inspect(ref)}")
-            {:reply, :ok, new_state}
-        end
+        # Deliver to local or remote actor
+        new_state = deliver_to_ref(new_state, ref, event)
+        {:reply, :ok, new_state}
 
       :error ->
         {:reply, {:error, :not_found}, state}
@@ -592,6 +577,11 @@ defmodule Absynthe.Core.Actor do
     # Verify the facet exists
     case Map.fetch(state.facets, facet_id) do
       {:ok, facet} ->
+        # Reassign ownership of any fields in the entity to this actor process.
+        # This ensures cleanup works correctly when the actor terminates,
+        # even if the entity was created in a different process.
+        Absynthe.Dataflow.Field.reassign_all_owners(entity, self())
+
         # Generate new entity ID
         entity_id = state.next_entity_id
 
@@ -776,10 +766,115 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc false
-  defp process_action(state, action) do
-    # Stub for processing individual actions
-    # Will be implemented when Turn and Action types are defined
-    Logger.debug("Processing action: #{inspect(action)}")
+  defp process_action(state, {:field_update, field_id, new_value}) do
+    # Execute dataflow field updates
+    Absynthe.Dataflow.Field.execute_field_update(field_id, new_value)
     state
+  end
+
+  # Handle Assert actions - deliver to target entity
+  # Note: We do NOT track these in outbound_assertions here because:
+  # 1. Actor-initiated assertions are tracked in handle_call({:assert, ...})
+  # 2. Notification assertions (from dataspace to observers) reuse the original handle
+  #    and tracking them would overwrite the original assertion tracking
+  defp process_action(state, %Assert{ref: ref} = event) do
+    deliver_action_to_ref(state, ref, event)
+  end
+
+  # Handle Retract actions - deliver to target entity
+  # Note: We do NOT remove from outbound_assertions here because:
+  # 1. Actor-initiated retractions are handled in handle_call({:retract, ...})
+  # 2. Notification retractions shouldn't affect the actor's own tracking
+  defp process_action(state, %Retract{ref: ref} = event) do
+    deliver_action_to_ref(state, ref, event)
+  end
+
+  # Handle Message actions - deliver to target entity
+  defp process_action(state, %Message{ref: ref} = event) do
+    deliver_action_to_ref(state, ref, event)
+  end
+
+  # Handle Sync actions - deliver to target entity
+  defp process_action(state, %Sync{ref: ref} = event) do
+    deliver_action_to_ref(state, ref, event)
+  end
+
+  defp process_action(state, action) do
+    # Unknown action type - log warning
+    Logger.warning("Unknown action type: #{inspect(action)}")
+    state
+  end
+
+  # Deliver an event to a target ref (local or remote)
+  # Used by handle_call for assertions/retractions initiated by the actor
+  defp deliver_to_ref(state, ref, event) do
+    case Ref.local?(ref, state.id) do
+      true ->
+        # Local delivery - process directly
+        deliver_event_impl(state, ref, event)
+
+      false ->
+        # Remote delivery - send to remote actor
+        remote_actor_id = Ref.actor_id(ref)
+
+        case resolve_actor(remote_actor_id) do
+          {:ok, actor_pid} ->
+            GenServer.cast(actor_pid, {:deliver, ref, event})
+            state
+
+          :error ->
+            Logger.warning("Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found")
+            state
+        end
+    end
+  end
+
+  # Deliver an action/event to a target ref (used during turn commit)
+  defp deliver_action_to_ref(state, ref, event) do
+    case Ref.local?(ref, state.id) do
+      true ->
+        # Local delivery - process directly
+        deliver_event_impl(state, ref, event)
+
+      false ->
+        # Remote delivery - send to remote actor
+        # For now, attempt to find actor by ID if it's a PID or registered name
+        remote_actor_id = Ref.actor_id(ref)
+
+        case resolve_actor(remote_actor_id) do
+          {:ok, actor_pid} ->
+            GenServer.cast(actor_pid, {:deliver, ref, event})
+            state
+
+          :error ->
+            Logger.warning("Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found")
+            state
+        end
+    end
+  end
+
+  # Resolve an actor ID to a PID
+  defp resolve_actor(actor_id) when is_pid(actor_id) do
+    if Process.alive?(actor_id), do: {:ok, actor_id}, else: :error
+  end
+
+  defp resolve_actor(actor_id) when is_atom(actor_id) do
+    case Process.whereis(actor_id) do
+      nil -> :error
+      pid -> {:ok, pid}
+    end
+  end
+
+  defp resolve_actor(_), do: :error
+
+  # Cleanup on termination
+  @impl GenServer
+  def terminate(reason, state) do
+    Logger.debug("Actor #{inspect(state.id)} terminating: #{inspect(reason)}")
+
+    # Clean up dataflow fields owned by this process
+    Absynthe.Dataflow.Field.cleanup()
+
+    :ok
   end
 end
