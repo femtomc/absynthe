@@ -60,7 +60,196 @@ defmodule Absynthe do
   """
 
   alias Absynthe.Preserves.Value
-  alias Absynthe.Core.Turn
+  alias Absynthe.Core.{Actor, Turn, Ref, Entity}
+  alias Absynthe.Assertions.Handle
+
+  # ============================================================================
+  # Actor API
+  # ============================================================================
+
+  @doc """
+  Starts a new actor process.
+
+  Actors are the fundamental unit of computation in the Syndicated Actor Model.
+  Each actor is an isolated process that hosts entities, processes events through
+  turns, and manages assertions.
+
+  ## Options
+
+  - `:id` - Unique identifier for the actor (default: `self()`)
+  - `:name` - Optional registered name for the GenServer
+
+  ## Examples
+
+      # Start an anonymous actor
+      {:ok, actor} = Absynthe.start_actor(id: :my_actor)
+
+      # Start a named actor
+      {:ok, actor} = Absynthe.start_actor(id: :my_actor, name: MyApp.MainActor)
+
+  ## Returns
+
+  - `{:ok, pid}` - Successfully started actor
+  - `{:error, reason}` - Failed to start
+  """
+  @spec start_actor(keyword()) :: GenServer.on_start()
+  defdelegate start_actor(opts \\ []), to: Actor, as: :start_link
+
+  @doc """
+  Spawns a new entity within an actor's facet.
+
+  Entities are the computational objects within actors. They implement the
+  `Absynthe.Core.Entity` protocol to handle messages, assertions, and sync events.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+  - `facet_id` - The facet to spawn the entity in (use `:root` for the root facet)
+  - `entity` - A struct implementing the `Absynthe.Core.Entity` protocol
+
+  ## Examples
+
+      defmodule Counter do
+        defstruct count: 0
+      end
+
+      defimpl Absynthe.Core.Entity, for: Counter do
+        def on_message(%{count: n} = counter, {:increment, amount}, turn) do
+          {%{counter | count: n + amount}, turn}
+        end
+        def on_publish(entity, _assertion, _handle, turn), do: {entity, turn}
+        def on_retract(entity, _handle, turn), do: {entity, turn}
+        def on_sync(entity, _peer, turn), do: {entity, turn}
+      end
+
+      {:ok, actor} = Absynthe.start_actor(id: :counter_actor)
+      {:ok, ref} = Absynthe.spawn_entity(actor, :root, %Counter{count: 0})
+
+  ## Returns
+
+  - `{:ok, ref}` - The entity reference for sending messages/assertions
+  - `{:error, reason}` - Failed to spawn
+  """
+  @spec spawn_entity(GenServer.server(), Actor.facet_id(), struct()) ::
+          {:ok, Ref.t()} | {:error, term()}
+  defdelegate spawn_entity(actor, facet_id, entity), to: Actor
+
+  @doc """
+  Sends a message to an entity.
+
+  Messages are ephemeral, one-shot communications. They are delivered once
+  and do not persist. Use messages for commands and requests.
+
+  ## Parameters
+
+  - `actor` - The actor PID (for local entities) or any actor (for routing)
+  - `ref` - The target entity reference
+  - `message` - The message value (Preserves value)
+
+  ## Examples
+
+      Absynthe.send_to(actor, counter_ref, {:increment, 5})
+      Absynthe.send_to(actor, greeter_ref, {:string, "Hello!"})
+
+  ## Returns
+
+  - `:ok` - Message queued for delivery
+  """
+  @spec send_to(GenServer.server(), Ref.t(), Value.t()) :: :ok
+  defdelegate send_to(actor, ref, message), to: Actor, as: :send_message
+
+  @doc """
+  Asserts a value to an entity.
+
+  Assertions are persistent facts that remain until explicitly retracted.
+  They are the primary communication mechanism for dataspaces.
+
+  ## Parameters
+
+  - `actor` - The actor making the assertion
+  - `ref` - The target entity reference (often a dataspace)
+  - `assertion` - The value to assert
+
+  ## Examples
+
+      {:ok, handle} = Absynthe.assert_to(actor, dataspace_ref,
+        Absynthe.record(:Status, [:online, "user-123"]))
+
+      # Later, retract it
+      :ok = Absynthe.retract_from(actor, handle)
+
+  ## Returns
+
+  - `{:ok, handle}` - Handle for later retraction
+  """
+  @spec assert_to(GenServer.server(), Ref.t(), Value.t()) :: {:ok, Handle.t()}
+  defdelegate assert_to(actor, ref, assertion), to: Actor, as: :assert
+
+  @doc """
+  Retracts a previously made assertion.
+
+  ## Parameters
+
+  - `actor` - The actor that made the assertion
+  - `handle` - The handle returned from `assert_to/3`
+
+  ## Examples
+
+      {:ok, handle} = Absynthe.assert_to(actor, ref, value)
+      :ok = Absynthe.retract_from(actor, handle)
+
+  ## Returns
+
+  - `:ok` - Assertion retracted
+  - `{:error, :not_found}` - Handle not found
+  """
+  @spec retract_from(GenServer.server(), Handle.t()) :: :ok | {:error, term()}
+  defdelegate retract_from(actor, handle), to: Actor, as: :retract
+
+  @doc """
+  Creates a child facet within an actor.
+
+  Facets provide scoped resource management. When a facet terminates,
+  all its entities and child facets are cleaned up (fate-sharing).
+
+  ## Parameters
+
+  - `actor` - The actor PID
+  - `parent_id` - The parent facet ID
+  - `facet_id` - The new facet's ID
+
+  ## Examples
+
+      :ok = Absynthe.create_facet(actor, :root, :conversation_1)
+      {:ok, ref} = Absynthe.spawn_entity(actor, :conversation_1, entity)
+
+  ## Returns
+
+  - `:ok` - Facet created
+  - `{:error, reason}` - Failed to create
+  """
+  @spec create_facet(GenServer.server(), Actor.facet_id(), Actor.facet_id()) ::
+          :ok | {:error, term()}
+  defdelegate create_facet(actor, parent_id, facet_id), to: Actor
+
+  @doc """
+  Terminates a facet and all its contents.
+
+  This implements fate-sharing: all entities and child facets within
+  the terminated facet are also cleaned up.
+
+  ## Parameters
+
+  - `actor` - The actor PID
+  - `facet_id` - The facet to terminate
+
+  ## Returns
+
+  - `:ok` - Facet terminated
+  - `{:error, reason}` - Failed to terminate
+  """
+  @spec terminate_facet(GenServer.server(), Actor.facet_id()) :: :ok | {:error, term()}
+  defdelegate terminate_facet(actor, facet_id), to: Actor
 
   # ============================================================================
   # Preserves API
