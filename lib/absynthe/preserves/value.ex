@@ -86,9 +86,15 @@ defmodule Absynthe.Preserves.Value do
 
       iex> Absynthe.Preserves.Value.double(-0.5)
       {:double, -0.5}
+
+      iex> Absynthe.Preserves.Value.double(:infinity)
+      {:double, :infinity}
   """
-  @spec double(float()) :: t()
+  @spec double(float() | :infinity | :neg_infinity | :nan) :: t()
   def double(value) when is_float(value), do: {:double, value}
+  def double(:infinity), do: {:double, :infinity}
+  def double(:neg_infinity), do: {:double, :neg_infinity}
+  def double(:nan), do: {:double, :nan}
 
   @doc """
   Creates a string Value.

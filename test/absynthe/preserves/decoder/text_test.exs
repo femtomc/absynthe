@@ -2,7 +2,6 @@ defmodule Absynthe.Preserves.Decoder.TextTest do
   use ExUnit.Case, async: true
 
   alias Absynthe.Preserves.Decoder.Text
-  alias Absynthe.Preserves.Value
 
   describe "decode/1 - booleans" do
     test "decodes #t as true" do
@@ -67,18 +66,18 @@ defmodule Absynthe.Preserves.Decoder.TextTest do
     end
 
     test "decodes infinity" do
-      assert {:ok, {:double, value}, ""} = Text.decode("#inf")
-      assert value == :math.pow(10, 1000)
+      # BEAM cannot represent IEEE754 infinity as a float, so we use atoms
+      assert {:ok, {:double, :infinity}, ""} = Text.decode("#inf")
     end
 
     test "decodes negative infinity" do
-      assert {:ok, {:double, value}, ""} = Text.decode("#-inf")
-      assert value == :math.pow(10, 1000) * -1
+      # BEAM cannot represent IEEE754 negative infinity as a float, so we use atoms
+      assert {:ok, {:double, :neg_infinity}, ""} = Text.decode("#-inf")
     end
 
     test "decodes NaN" do
-      assert {:ok, {:double, value}, ""} = Text.decode("#nan")
-      assert Float.nan?(value)
+      # BEAM cannot represent IEEE754 NaN as a float, so we use atoms
+      assert {:ok, {:double, :nan}, ""} = Text.decode("#nan")
     end
   end
 
@@ -267,14 +266,19 @@ defmodule Absynthe.Preserves.Decoder.TextTest do
     end
 
     test "handles line comments" do
-      assert {:ok, {:integer, 42}, ""} = Text.decode("42 ; this is a comment")
+      # decode/1 doesn't strip trailing content - use decode_all for that
+      assert {:ok, {:integer, 42}, " ; this is a comment"} = Text.decode("42 ; this is a comment")
+      # decode_all strips trailing comments
+      assert {:ok, {:integer, 42}} = Text.decode_all("42 ; this is a comment")
     end
 
     test "handles line comments before value" do
+      # Leading comments are skipped during parsing
       assert {:ok, {:integer, 42}, ""} = Text.decode("; comment\n42")
     end
 
     test "handles value comments" do
+      # Value comments (#;value) skip the next value
       assert {:ok, {:integer, 2}, ""} = Text.decode("#;1 2")
     end
 
@@ -315,8 +319,9 @@ defmodule Absynthe.Preserves.Decoder.TextTest do
     end
 
     test "raises on error" do
+      # "invalid" is actually a valid symbol, use "@" which is truly invalid
       assert_raise RuntimeError, fn ->
-        Text.decode!("invalid")
+        Text.decode!("@")
       end
     end
   end

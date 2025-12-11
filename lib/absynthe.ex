@@ -135,10 +135,10 @@ defmodule Absynthe do
   ## Examples
 
       iex> Absynthe.encode!({:integer, 42})
-      <<...>>
+      <<0xB0, 0x01, 0x2A>>
 
-      iex> Absynthe.encode!({:string, "hello"}, :text)
-      "\\"hello\\""
+      iex> Absynthe.encode!({:boolean, true})
+      <<0x81>>
   """
   @spec encode!(Value.t(), :binary | :text) :: binary()
   def encode!(value, format \\ :binary)
@@ -170,7 +170,7 @@ defmodule Absynthe do
   def decode!(data, format \\ :binary)
 
   def decode!(data, :binary) do
-    Absynthe.Preserves.Decoder.Binary.decode!(data)
+    Absynthe.Preserves.Decoder.Binary.decode_all!(data)
   end
 
   def decode!(data, :text) do

@@ -62,14 +62,17 @@ defmodule Absynthe.Preserves.Decoder.Text do
       iex> Absynthe.Preserves.Decoder.Text.decode("42")
       {:ok, {:integer, 42}, ""}
 
-      iex> Absynthe.Preserves.Decoder.Text.decode("#t followed by more")
-      {:ok, {:boolean, true}, " followed by more"}
+      iex> Absynthe.Preserves.Decoder.Text.decode("#t more")
+      {:ok, {:boolean, true}, " more"}
   """
   @spec decode(String.t()) :: parse_result()
   def decode(input) when is_binary(input) do
     case parse_value(input, 0) do
-      {:ok, value, rest, _pos} -> {:ok, value, rest}
-      {:error, reason, pos} -> {:error, reason, pos}
+      {:ok, value, rest, _pos} ->
+        {:ok, value, rest}
+
+      {:error, reason, pos} ->
+        {:error, reason, pos}
     end
   end
 
@@ -555,6 +558,8 @@ defmodule Absynthe.Preserves.Decoder.Text do
     end
   end
 
+  # Note: < and > are excluded from bare symbols since they're record delimiters
+  # Use |...| quoted symbol syntax for symbols containing these characters
   defp is_symbol_start(char) when char in ?a..?z, do: true
   defp is_symbol_start(char) when char in ?A..?Z, do: true
   defp is_symbol_start(?_), do: true
@@ -568,9 +573,6 @@ defmodule Absynthe.Preserves.Decoder.Text do
   defp is_symbol_start(?%), do: true
   defp is_symbol_start(?&), do: true
   defp is_symbol_start(?=), do: true
-  defp is_symbol_start(?<), do: true
-  defp is_symbol_start(?>), do: true
-  defp is_symbol_start(?:), do: true
   defp is_symbol_start(?~), do: true
   defp is_symbol_start(_), do: false
 
@@ -696,33 +698,79 @@ defmodule Absynthe.Preserves.Decoder.Text do
   end
 
   defp parse_dict_entry(input, pos) do
-    # Parse key
-    case parse_value(input, pos) do
+    # Try to parse symbol shorthand first (e.g., name: "value" where name is a symbol key)
+    case try_parse_symbol_key(input, pos) do
       {:ok, key, rest, pos} ->
+        # Found symbol: shorthand, now parse the value
         {rest, pos} = skip_whitespace_and_comments(rest, pos)
 
-        # Expect colon
-        case rest do
-          <<":" <> rest::binary>> ->
-            {rest, pos} = skip_whitespace_and_comments(rest, pos + 1)
+        case parse_value(rest, pos) do
+          {:ok, value, rest, pos} ->
+            {:ok, {key, value}, rest, pos}
 
-            # Parse value
-            case parse_value(rest, pos) do
-              {:ok, value, rest, pos} ->
-                {:ok, {key, value}, rest, pos}
-
-              {:error, reason, pos} ->
-                {:error, "Invalid dictionary value: #{reason}", pos}
-            end
-
-          _ ->
-            {:error, "Expected ':' after dictionary key", pos}
+          {:error, reason, pos} ->
+            {:error, "Invalid dictionary value: #{reason}", pos}
         end
 
-      {:error, reason, pos} ->
-        {:error, "Invalid dictionary key: #{reason}", pos}
+      :not_symbol_key ->
+        # Parse key as a normal value
+        case parse_value(input, pos) do
+          {:ok, key, rest, pos} ->
+            {rest, pos} = skip_whitespace_and_comments(rest, pos)
+
+            # Expect colon
+            case rest do
+              <<":" <> rest::binary>> ->
+                {rest, pos} = skip_whitespace_and_comments(rest, pos + 1)
+
+                # Parse value
+                case parse_value(rest, pos) do
+                  {:ok, value, rest, pos} ->
+                    {:ok, {key, value}, rest, pos}
+
+                  {:error, reason, pos} ->
+                    {:error, "Invalid dictionary value: #{reason}", pos}
+                end
+
+              _ ->
+                {:error, "Expected ':' after dictionary key", pos}
+            end
+
+          {:error, reason, pos} ->
+            {:error, "Invalid dictionary key: #{reason}", pos}
+        end
     end
   end
+
+  # Try to parse a symbol followed immediately by a colon (shorthand syntax)
+  # Returns {:ok, symbol_value, rest_after_colon, pos} or :not_symbol_key
+  defp try_parse_symbol_key(input, pos) do
+    # Look for pattern: symbol_chars followed by colon
+    case input do
+      <<char::utf8, _::binary>> when char in ?a..?z or char in ?A..?Z or char == ?_ ->
+        # Collect symbol characters (but NOT colon for this purpose)
+        {sym_str, rest} = take_symbol_key_chars(input, "")
+
+        case rest do
+          <<":" <> rest::binary>> when sym_str != "" ->
+            {:ok, Value.symbol(sym_str), rest, pos + byte_size(sym_str) + 1}
+
+          _ ->
+            :not_symbol_key
+        end
+
+      _ ->
+        :not_symbol_key
+    end
+  end
+
+  # Take symbol characters except colon (for key shorthand parsing)
+  defp take_symbol_key_chars(<<char::utf8, rest::binary>>, acc)
+       when char in ?a..?z or char in ?A..?Z or char in ?0..?9 or char == ?_ or char == ?- do
+    take_symbol_key_chars(rest, acc <> <<char::utf8>>)
+  end
+
+  defp take_symbol_key_chars(input, acc), do: {acc, input}
 
   # Embedded values: #!value
 
@@ -753,15 +801,9 @@ defmodule Absynthe.Preserves.Decoder.Text do
   defp take_while_acc("", _predicate, acc), do: {acc, ""}
 
   # Special float values
-  defp pos_infinity do
-    :math.pow(10, 1000)
-  end
-
-  defp neg_infinity do
-    :math.pow(10, 1000) * -1
-  end
-
-  defp nan do
-    :math.acos(2)
-  end
+  # Note: BEAM cannot represent IEEE754 infinity/NaN as native floats,
+  # so we use atoms as per Preserves convention for Erlang/Elixir
+  defp pos_infinity, do: :infinity
+  defp neg_infinity, do: :neg_infinity
+  defp nan, do: :nan
 end
