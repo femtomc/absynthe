@@ -169,6 +169,7 @@ defmodule Absynthe.Core.Actor do
 
   alias Absynthe.Core.Ref
   alias Absynthe.Core.Entity
+  alias Absynthe.Core.Turn
   alias Absynthe.Protocol.Event
   alias Absynthe.Assertions.Handle
 
@@ -728,17 +729,9 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc false
-  defp execute_turn(state, facet_id, entity_id, entity, event) do
-    # Create a turn context
-    # NOTE: Turn module not yet implemented, using a simple map
-    turn = %{
-      actor_id: state.id,
-      facet_id: facet_id,
-      entity_id: entity_id,
-      event: event,
-      pending_actions: [],
-      committed?: false
-    }
+  defp execute_turn(state, facet_id, _entity_id, entity, event) do
+    # Create a turn context using the Turn module
+    turn = Turn.new(state.id, facet_id)
 
     try do
       # Dispatch to entity based on event type
@@ -770,18 +763,14 @@ defmodule Absynthe.Core.Actor do
 
   @doc false
   defp commit_turn(state, turn) do
-    # Execute all pending actions accumulated during the turn
-    # For now, this is a stub - full implementation would process:
-    # - Spawn entity actions
-    # - Assert/retract actions
-    # - Send message actions
-    # - Sync actions
+    # Commit the turn and get the actions to execute
+    {_committed_turn, actions} = Turn.commit(turn)
 
-    # TODO: Implement action processing when Turn module is complete
-    Logger.debug("Committing turn with #{length(turn.pending_actions)} pending actions")
+    Logger.debug("Committing turn with #{length(actions)} pending actions")
 
     # Process each pending action
-    Enum.reduce(turn.pending_actions, state, fn action, acc_state ->
+    # TODO: Implement full action processing for spawn, assert, retract, message, sync
+    Enum.reduce(actions, state, fn action, acc_state ->
       process_action(acc_state, action)
     end)
   end

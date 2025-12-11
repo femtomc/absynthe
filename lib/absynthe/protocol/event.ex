@@ -33,7 +33,7 @@ defmodule Absynthe.Protocol.Event do
       # Create an assertion event
       assertion = {:string, "Hello"}
       ref = %Absynthe.Core.Ref{actor_id: 1, entity_id: 2}
-      handle = %Absynthe.Assertions.Handle{actor_id: 1, seq: 1}
+      handle = %Absynthe.Assertions.Handle{id: 1}
       event = Absynthe.Protocol.Event.assert(ref, assertion, handle)
 
       # Create a message event
@@ -132,7 +132,7 @@ defmodule Absynthe.Protocol.Event do
   ## Examples
 
       iex> ref = %Absynthe.Core.Ref{actor_id: 1, entity_id: 2}
-      iex> handle = %Absynthe.Assertions.Handle{actor_id: 1, seq: 1}
+      iex> handle = %Absynthe.Assertions.Handle{id: 1}
       iex> event = Absynthe.Protocol.Event.assert(ref, {:string, "test"}, handle)
       iex> Absynthe.Protocol.Event.assert?(event)
       true
@@ -161,7 +161,7 @@ defmodule Absynthe.Protocol.Event do
   ## Examples
 
       iex> ref = %Absynthe.Core.Ref{actor_id: 1, entity_id: 2}
-      iex> handle = %Absynthe.Assertions.Handle{actor_id: 1, seq: 1}
+      iex> handle = %Absynthe.Assertions.Handle{id: 1}
       iex> event = Absynthe.Protocol.Event.retract(ref, handle)
       iex> Absynthe.Protocol.Event.retract?(event)
       true

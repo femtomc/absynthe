@@ -167,7 +167,8 @@ defmodule Absynthe.Core.Turn do
   """
   @spec add_action(t(), Event.t()) :: t()
   def add_action(%__MODULE__{pending_actions: actions} = turn, action) do
-    %__MODULE__{turn | pending_actions: actions ++ [action]}
+    # Prepend for O(1) insertion - actions stored in reverse order
+    %__MODULE__{turn | pending_actions: [action | actions]}
   end
 
   @doc """
@@ -199,7 +200,7 @@ defmodule Absynthe.Core.Turn do
       true
   """
   @spec actions(t()) :: [Event.t()]
-  def actions(%__MODULE__{pending_actions: actions}), do: actions
+  def actions(%__MODULE__{pending_actions: actions}), do: Enum.reverse(actions)
 
   # Transaction Operations
 
@@ -243,7 +244,8 @@ defmodule Absynthe.Core.Turn do
   @spec commit(t()) :: {t(), [Event.t()]}
   def commit(%__MODULE__{pending_actions: actions} = turn) do
     committed_turn = %__MODULE__{turn | committed?: true}
-    {committed_turn, actions}
+    # Reverse to restore original insertion order
+    {committed_turn, Enum.reverse(actions)}
   end
 
   @doc """
