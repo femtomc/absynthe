@@ -702,9 +702,9 @@ defmodule Absynthe.Core.Actor do
         result = execute_turn(state, facet_id, entity_id, entity, event)
 
         case result do
-          {:ok, updated_entity, new_state} ->
-            # Update the entity in state
-            %{new_state | entities: Map.put(new_state.entities, entity_id, {facet_id, updated_entity})}
+          {:ok, _updated_entity, new_state} ->
+            # Entity state is already updated in execute_turn before action processing
+            new_state
 
           {:error, reason} ->
             Logger.error("Turn failed for entity #{entity_id}: #{inspect(reason)}")
@@ -719,7 +719,7 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc false
-  defp execute_turn(state, facet_id, _entity_id, entity, event) do
+  defp execute_turn(state, facet_id, entity_id, entity, event) do
     # Create a turn context using the Turn module
     turn = Turn.new(state.id, facet_id)
 
@@ -740,8 +740,14 @@ defmodule Absynthe.Core.Actor do
             Entity.on_sync(entity, peer, turn)
         end
 
-      # Commit the turn - execute pending actions
-      new_state = commit_turn(state, updated_turn)
+      # IMPORTANT: Update entity state BEFORE processing actions.
+      # This ensures nested message deliveries see the updated entity state.
+      state_with_updated_entity = %{state |
+        entities: Map.put(state.entities, entity_id, {facet_id, updated_entity})
+      }
+
+      # Commit the turn - execute pending actions (may trigger nested turns)
+      new_state = commit_turn(state_with_updated_entity, updated_turn)
 
       {:ok, updated_entity, new_state}
     rescue

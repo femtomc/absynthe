@@ -60,7 +60,7 @@ defmodule Absynthe do
   """
 
   alias Absynthe.Preserves.Value
-  alias Absynthe.Core.{Actor, Turn, Ref, Entity}
+  alias Absynthe.Core.{Actor, Turn, Ref}
   alias Absynthe.Assertions.Handle
 
   # ============================================================================
@@ -466,18 +466,19 @@ defmodule Absynthe do
 
   ## Parameters
 
-  - `pattern` - The pattern to match against
+  - `pattern` - The pattern to match against (use `wildcard/0` and `capture/1` for matching)
   - `observer_ref` - The entity ref that should receive notifications
 
   ## Examples
 
       # Subscribe to all Person records
-      observe = Absynthe.observe(
-        Absynthe.record(:Observe, [
-          Absynthe.record(:Person, [:_, :_]),  # Pattern with wildcards
-          observer_ref
-        ])
+      observe_assertion = Absynthe.observe(
+        Absynthe.record(:Person, [Absynthe.wildcard(), Absynthe.wildcard()]),
+        observer_ref
       )
+
+      # Assert the observation to the dataspace
+      {:ok, _handle} = Absynthe.assert_to(actor, dataspace_ref, observe_assertion)
   """
   @spec observe(Value.t(), Absynthe.Core.Ref.t()) :: Value.t()
   def observe(pattern, observer_ref) do
