@@ -32,11 +32,16 @@ defmodule Absynthe.Preserves.Value do
 
   @typedoc """
   The core Preserves Value type - a tagged union of all possible value types.
+
+  Note: For doubles, special IEEE754 values are represented as atoms:
+  - `:infinity` - positive infinity
+  - `:neg_infinity` - negative infinity
+  - `:nan` - Not a Number
   """
   @type t ::
           {:boolean, boolean()}
           | {:integer, integer()}
-          | {:double, float()}
+          | {:double, float() | :infinity | :neg_infinity | :nan}
           | {:string, String.t()}
           | {:binary, binary()}
           | {:symbol, String.t()}
@@ -45,6 +50,7 @@ defmodule Absynthe.Preserves.Value do
           | {:set, MapSet.t(t())}
           | {:dictionary, %{t() => t()}}
           | {:embedded, term()}
+          | {:annotated, annotation :: t(), value :: t()}
 
   # Constructor Functions
 
@@ -221,6 +227,22 @@ defmodule Absynthe.Preserves.Value do
   """
   @spec embedded(term()) :: t()
   def embedded(ref), do: {:embedded, ref}
+
+  @doc """
+  Creates an annotated Value with a single annotation.
+
+  Per Preserves spec, each annotation wraps a value. For multiple annotations,
+  nest the annotated values: `annotated(ann1, annotated(ann2, value))`.
+
+  ## Examples
+
+      iex> value = Absynthe.Preserves.Value.integer(42)
+      iex> annotation = Absynthe.Preserves.Value.symbol("important")
+      iex> Absynthe.Preserves.Value.annotated(annotation, value)
+      {:annotated, {:symbol, "important"}, {:integer, 42}}
+  """
+  @spec annotated(t(), t()) :: t()
+  def annotated(annotation, value), do: {:annotated, annotation, value}
 
   # Type Guard Functions
 

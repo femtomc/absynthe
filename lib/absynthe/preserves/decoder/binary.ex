@@ -191,30 +191,17 @@ defmodule Absynthe.Preserves.Decoder.Binary do
   defp decode_value(@tag_false, rest), do: {:ok, Value.boolean(false), rest}
   defp decode_value(@tag_true, rest), do: {:ok, Value.boolean(true), rest}
 
-  # IEEE754 Double: tag 0x87 + varint(length) + bytes
-  # Standard form is length=8 for 64-bit double
+  # IEEE754 Double: tag 0x87 + varint(8) + 8 bytes big-endian
+  # Per spec, length is fixed at 8 for 64-bit double
   defp decode_value(@tag_ieee754_double, rest) do
-    with {:ok, byte_count, rest} <- decode_varint(rest),
-         {:ok, double_bytes, rest} <- take_bytes(rest, byte_count) do
+    with {:ok, byte_count, rest} <- decode_varint(rest) do
       case byte_count do
         8 ->
-          <<double_bits::64-big-unsigned>> = double_bytes
-          <<float::64-big-float>> = <<double_bits::64-big-unsigned>>
-          # Handle negative zero by checking the sign bit (bit 63)
-          value =
-            if float == 0.0 and (double_bits &&& 0x8000000000000000) != 0, do: -0.0, else: float
-
-          {:ok, Value.double(value), rest}
-
-        4 ->
-          # Also support 32-bit float if length is 4
-          <<float_bits::32-big-unsigned>> = double_bytes
-          <<float::32-big-float>> = <<float_bits::32-big-unsigned>>
-          # Handle negative zero by checking the sign bit (bit 31)
-          value =
-            if float == 0.0 and (float_bits &&& 0x80000000) != 0, do: -0.0, else: float
-
-          {:ok, Value.double(value), rest}
+          with {:ok, double_bytes, rest} <- take_bytes(rest, 8) do
+            <<double_bits::64-big-unsigned>> = double_bytes
+            value = decode_ieee754_double(double_bits)
+            {:ok, Value.double(value), rest}
+          end
 
         _ ->
           {:error, {:invalid_double_length, byte_count}}
@@ -287,11 +274,11 @@ defmodule Absynthe.Preserves.Decoder.Binary do
     end
   end
 
-  # Annotation: tag 0x85 + value + annotations until end marker
+  # Annotation: tag 0x85 + annotation + value (per spec, no end marker)
   defp decode_value(@tag_annotation, rest) do
-    with {:ok, value, rest} <- decode(rest),
-         {:ok, annotations, rest} <- decode_until_end(rest, []) do
-      {:ok, {:annotated, value, Enum.reverse(annotations)}, rest}
+    with {:ok, annotation, rest} <- decode(rest),
+         {:ok, value, rest} <- decode(rest) do
+      {:ok, Value.annotated(annotation, value), rest}
     end
   end
 
@@ -311,6 +298,30 @@ defmodule Absynthe.Preserves.Decoder.Binary do
 
   defp decode_value(tag, _rest) do
     {:error, {:invalid_tag, tag}}
+  end
+
+  # Decode IEEE754 double, handling special values that BEAM can't represent natively
+  defp decode_ieee754_double(bits) do
+    # Extract sign, exponent, and mantissa
+    sign = bits >>> 63
+    exponent = (bits >>> 52) &&& 0x7FF
+    mantissa = bits &&& 0xFFFFFFFFFFFFF
+
+    cond do
+      # Infinity: exponent all 1s, mantissa all 0s
+      exponent == 0x7FF and mantissa == 0 ->
+        if sign == 0, do: :infinity, else: :neg_infinity
+
+      # NaN: exponent all 1s, mantissa non-zero
+      exponent == 0x7FF and mantissa != 0 ->
+        :nan
+
+      # Normal or subnormal float - try to decode as native float
+      true ->
+        <<float::64-big-float>> = <<bits::64-big-unsigned>>
+        # Handle negative zero by checking the sign bit
+        if float == 0.0 and sign == 1, do: -0.0, else: float
+    end
   end
 
   # Decode varint (variable-length integer)

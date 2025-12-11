@@ -133,6 +133,20 @@ defmodule Absynthe.Preserves.Encoder.Binary do
     <<@tag_ieee754_double, 0x08, value::float-big-64>>
   end
 
+  # Special IEEE754 values (BEAM can't represent these as native floats)
+  def encode!({:double, :infinity}) do
+    <<@tag_ieee754_double, 0x08, 0x7FF0000000000000::big-64>>
+  end
+
+  def encode!({:double, :neg_infinity}) do
+    <<@tag_ieee754_double, 0x08, 0xFFF0000000000000::big-64>>
+  end
+
+  def encode!({:double, :nan}) do
+    # Quiet NaN with canonical bit pattern
+    <<@tag_ieee754_double, 0x08, 0x7FF8000000000000::big-64>>
+  end
+
   def encode!({:integer, value}) when is_integer(value) do
     encode_signed_integer(value)
   end
@@ -191,11 +205,12 @@ defmodule Absynthe.Preserves.Encoder.Binary do
     <<@tag_dictionary, pairs_bytes::binary, @tag_end>>
   end
 
-  # Annotation: tag 0x85 + underlying value + annotation values
-  def encode!({:annotated, value, annotations}) when is_list(annotations) do
+  # Annotation: tag 0x85 + annotation + value (per spec, no end marker)
+  # For a single annotation wrapping a value
+  def encode!({:annotated, annotation, value}) do
+    annotation_bytes = encode!(annotation)
     value_bytes = encode!(value)
-    annotations_bytes = Enum.map_join(annotations, &encode!/1)
-    <<@tag_annotation, value_bytes::binary, annotations_bytes::binary, @tag_end>>
+    <<@tag_annotation, annotation_bytes::binary, value_bytes::binary>>
   end
 
   # Embedded: requires the payload to be a Preserves Value

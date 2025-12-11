@@ -55,4 +55,55 @@ defmodule AbsyntheTest do
       assert Absynthe.capture(:name) == {:symbol, "$name"}
     end
   end
+
+  describe "binary round-trip" do
+    alias Absynthe.Preserves.Value
+
+    test "round-trips special float values" do
+      # Infinity
+      inf = {:double, :infinity}
+      assert Absynthe.decode!(Absynthe.encode!(inf)) == inf
+
+      # Negative infinity
+      neg_inf = {:double, :neg_infinity}
+      assert Absynthe.decode!(Absynthe.encode!(neg_inf)) == neg_inf
+
+      # NaN
+      nan = {:double, :nan}
+      assert Absynthe.decode!(Absynthe.encode!(nan)) == nan
+    end
+
+    test "round-trips annotated values" do
+      # Single annotation
+      value = Value.integer(42)
+      annotation = Value.symbol("important")
+      annotated = Value.annotated(annotation, value)
+
+      assert Absynthe.decode!(Absynthe.encode!(annotated)) == annotated
+    end
+
+    test "round-trips nested annotations" do
+      # Multiple annotations nest: @a @b value becomes annotated(a, annotated(b, value))
+      value = Value.string("hello")
+      ann1 = Value.symbol("first")
+      ann2 = Value.symbol("second")
+      nested = Value.annotated(ann1, Value.annotated(ann2, value))
+
+      assert Absynthe.decode!(Absynthe.encode!(nested)) == nested
+    end
+
+    test "round-trips regular doubles" do
+      values = [
+        {:double, 3.14159},
+        {:double, -0.0},
+        {:double, 0.0},
+        {:double, 1.0e100},
+        {:double, -1.0e-100}
+      ]
+
+      for value <- values do
+        assert Absynthe.decode!(Absynthe.encode!(value)) == value
+      end
+    end
+  end
 end
