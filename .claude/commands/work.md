@@ -35,10 +35,34 @@ When you believe the implementation is complete:
    - path/to/file1.ex
    - path/to/file2.ex
 
-   Check: correctness, edge cases, code quality, test coverage, Elixir conventions.'
+   Be critical and thorough:
+   - Look for bugs, logic errors, and incorrect assumptions
+   - Question whether the approach is correct for the problem domain
+   - Identify missing edge cases in tests (boundary conditions, error paths, concurrency)
+   - Check for performance issues (unnecessary allocations, N+2 queries, inefficient algorithms)
+   - Verify consistency with existing patterns in the codebase
+   - Point out any untested code paths or missing test coverage
+   - Challenge if the implementation matches specifications/semantics
+   - Look for potential race conditions or process interaction issues'
    ```
 
-   Replace the file list with the actual files you modified.
+   **Key principle**: Encourage Codex to be **skeptical and critical**, not just verify correctness.
+
+   **Bad example** (too passive):
+   ```bash
+   codex review 'Check if this code is correct.'
+   ```
+
+   **Good example** (encourages critical thinking):
+   ```bash
+   codex review 'Review set pattern matching fix.
+
+   Be critical:
+   - Is using sorted order correct for unordered sets?
+   - Are we missing size mismatch checks?
+   - What happens with nested sets or duplicate elements?
+   - Is sorting on every extraction a performance issue?'
+   ```
 
 4. Parse the review response:
    - If review finds **no issues**: Proceed to Phase 4
