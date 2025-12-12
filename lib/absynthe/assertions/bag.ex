@@ -52,7 +52,7 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> assertion = Value.string("hello")
-      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(:actor, 1))
       iex> Bag.member?(bag, assertion)
       true
       iex> Bag.count(bag, assertion)
@@ -64,8 +64,8 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> assertion = Value.string("hello")
-      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(1))
-      iex> {:existing, bag} = Bag.add(bag, assertion, Handle.new(2))
+      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(:actor, 1))
+      iex> {:existing, bag} = Bag.add(bag, assertion, Handle.new(:actor, 2))
       iex> Bag.count(bag, assertion)
       2
 
@@ -75,12 +75,12 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> assertion = Value.string("hello")
-      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(1))
-      iex> {:existing, bag} = Bag.add(bag, assertion, Handle.new(2))
-      iex> {:decremented, bag} = Bag.remove(bag, Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, assertion, Handle.new(:actor, 1))
+      iex> {:existing, bag} = Bag.add(bag, assertion, Handle.new(:actor, 2))
+      iex> {:decremented, bag} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> Bag.count(bag, assertion)
       1
-      iex> {:removed, bag} = Bag.remove(bag, Handle.new(2))
+      iex> {:removed, bag} = Bag.remove(bag, Handle.new(:actor, 2))
       iex> Bag.member?(bag, assertion)
       false
 
@@ -89,8 +89,8 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(2))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(:actor, 2))
       iex> assertions = Bag.assertions(bag)
       iex> length(assertions)
       2
@@ -156,15 +156,15 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {status, _bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
+      iex> {status, _bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
       iex> status
       :new
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {status, _bag} = Bag.add(bag, Value.string("hello"), Handle.new(2))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {status, _bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 2))
       iex> status
       :existing
   """
@@ -224,23 +224,23 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {status, _bag} = Bag.remove(bag, Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {status, _bag} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> status
       :removed
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(2))
-      iex> {status, _bag} = Bag.remove(bag, Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 2))
+      iex> {status, _bag} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> status
       :decremented
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> bag = Absynthe.Assertions.Bag.new()
-      iex> Bag.remove(bag, Handle.new(999))
+      iex> Bag.remove(bag, Handle.new(:actor, 999))
       :not_found
   """
   @spec remove(t(), Handle.t()) :: {:removed | :decremented, t()} | :not_found
@@ -302,15 +302,15 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
       iex> Bag.member?(bag, Value.string("hello"))
       true
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:removed, bag} = Bag.remove(bag, Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:removed, bag} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> Bag.member?(bag, Value.string("hello"))
       false
   """
@@ -340,8 +340,8 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(2))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(:actor, 2))
       iex> assertions = Bag.assertions(bag)
       iex> length(assertions)
       2
@@ -377,16 +377,16 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
       iex> Bag.count(bag, Value.string("hello"))
       1
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(2))
-      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(3))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 2))
+      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 3))
       iex> Bag.count(bag, Value.string("hello"))
       3
   """
@@ -418,16 +418,16 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
       iex> Bag.size(bag)
       1
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
-      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(1))
-      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(2))
-      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(3))
+      iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
+      iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 2))
+      iex> {:new, bag} = Bag.add(bag, Value.integer(42), Handle.new(:actor, 3))
       iex> Bag.size(bag)
       3
   """

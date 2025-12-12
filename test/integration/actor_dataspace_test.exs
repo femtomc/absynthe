@@ -161,7 +161,7 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
       dataspace = Dataspace.new()
 
       # Simulate assertion handling via Entity protocol
-      handle = Handle.new(1)
+      handle = Handle.new(:test_actor, 1)
       turn = Turn.new(:test_actor, :test_facet)
 
       {updated_dataspace, _turn} =
@@ -174,7 +174,7 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
 
     test "dataspace removes assertions on retract" do
       dataspace = Dataspace.new()
-      handle = Handle.new(1)
+      handle = Handle.new(:test_actor, 1)
       turn = Turn.new(:test_actor, :test_facet)
 
       # Add assertion

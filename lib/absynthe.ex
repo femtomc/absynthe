@@ -410,7 +410,10 @@ defmodule Absynthe do
   """
   @spec assert_value(Turn.t(), Absynthe.Core.Ref.t(), Value.t()) :: Turn.t()
   def assert_value(%Turn{} = turn, target, assertion) do
-    handle = Absynthe.Assertions.Handle.new(:erlang.unique_integer([:positive]))
+    # Use turn's actor_id for handle namespace + unique integer for local id
+    handle =
+      Absynthe.Assertions.Handle.new(Turn.actor_id(turn), :erlang.unique_integer([:positive]))
+
     action = Absynthe.Protocol.Event.assert(target, assertion, handle)
     Turn.add_action(turn, action)
   end
