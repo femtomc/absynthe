@@ -200,7 +200,9 @@ defmodule Absynthe.Core.Actor do
           root_facet_id: facet_id(),
           facets: %{facet_id() => facet_state()},
           entities: %{entity_id() => {facet_id(), term()}},
-          outbound_assertions: %{Handle.t() => {Ref.t(), term()}}
+          outbound_assertions: %{Handle.t() => {Ref.t(), term()}},
+          # Maps each facet to its owned assertion handles for automatic cleanup
+          facet_handles: %{facet_id() => MapSet.t(Handle.t())}
         }
 
   @typedoc """
@@ -487,7 +489,8 @@ defmodule Absynthe.Core.Actor do
       root_facet_id: root_facet_id,
       facets: %{root_facet_id => root_facet},
       entities: %{},
-      outbound_assertions: %{}
+      outbound_assertions: %{},
+      facet_handles: %{root_facet_id => MapSet.new()}
     }
 
     Logger.debug("Actor #{inspect(actor_id)} initialized with root facet #{root_facet_id}")
@@ -512,8 +515,9 @@ defmodule Absynthe.Core.Actor do
     handle = Handle.new(state.next_handle_id)
     new_state = %{state | next_handle_id: state.next_handle_id + 1}
 
-    # Store the outbound assertion for potential retraction
-    new_state = put_in(new_state.outbound_assertions[handle], {ref, assertion})
+    # Track the assertion handle with the root facet
+    # (client-initiated assertions don't have a specific facet context)
+    new_state = track_assertion_handle(new_state, state.root_facet_id, handle, ref, assertion)
 
     # Create and deliver the assert event
     event = Event.assert(ref, assertion, handle)
@@ -527,8 +531,8 @@ defmodule Absynthe.Core.Actor do
   def handle_call({:retract, handle}, _from, state) do
     case Map.fetch(state.outbound_assertions, handle) do
       {:ok, {ref, _assertion}} ->
-        # Remove from outbound assertions
-        new_state = %{state | outbound_assertions: Map.delete(state.outbound_assertions, handle)}
+        # Remove from tracking (outbound_assertions and facet_handles)
+        new_state = untrack_assertion_handle(state, handle)
 
         # Create and deliver the retract event
         event = Event.retract(ref, handle)
@@ -639,7 +643,8 @@ defmodule Absynthe.Core.Actor do
           | facets:
               state.facets
               |> Map.put(facet_id, new_facet)
-              |> Map.put(parent_id, updated_parent)
+              |> Map.put(parent_id, updated_parent),
+            facet_handles: Map.put(state.facet_handles, facet_id, MapSet.new())
         }
 
         Logger.debug("Created facet #{facet_id} under parent #{parent_id}")
@@ -663,6 +668,9 @@ defmodule Absynthe.Core.Actor do
               updated_state
             end)
 
+          # Retract all assertions owned by this facet
+          new_state = retract_facet_handles(new_state, facet_id)
+
           # Remove all entities in this facet
           new_state =
             Enum.reduce(facet.entities, new_state, fn entity_id, acc_state ->
@@ -679,8 +687,12 @@ defmodule Absynthe.Core.Actor do
               new_state
             end
 
-          # Remove the facet itself
-          new_state = %{new_state | facets: Map.delete(new_state.facets, facet_id)}
+          # Remove the facet itself and its handle tracking
+          new_state = %{
+            new_state
+            | facets: Map.delete(new_state.facets, facet_id),
+              facet_handles: Map.delete(new_state.facet_handles, facet_id)
+          }
 
           Logger.debug("Terminated facet #{facet_id}")
 
@@ -690,6 +702,28 @@ defmodule Absynthe.Core.Actor do
           {:error, :facet_not_found}
       end
     end
+  end
+
+  # Retract all handles owned by a facet
+  @doc false
+  defp retract_facet_handles(state, facet_id) do
+    handles = Map.get(state.facet_handles, facet_id, MapSet.new())
+
+    Enum.reduce(handles, state, fn handle, acc_state ->
+      case Map.fetch(acc_state.outbound_assertions, handle) do
+        {:ok, {ref, _assertion}} ->
+          # Create and deliver the retract event
+          event = Event.retract(ref, handle)
+          acc_state = deliver_to_ref(acc_state, ref, event)
+
+          # Remove from outbound assertions
+          %{acc_state | outbound_assertions: Map.delete(acc_state.outbound_assertions, handle)}
+
+        :error ->
+          # Handle not found, skip (may have been manually retracted)
+          acc_state
+      end
+    end)
   end
 
   @doc false
@@ -765,51 +799,100 @@ defmodule Absynthe.Core.Actor do
 
     Logger.debug("Committing turn with #{length(actions)} pending actions")
 
+    # Get the facet_id from the turn for tracking assertion ownership
+    facet_id = Turn.facet_id(turn)
+
     # Process each pending action
     # TODO: Implement full action processing for spawn, assert, retract, message, sync
     Enum.reduce(actions, state, fn action, acc_state ->
-      process_action(acc_state, action)
+      process_action(acc_state, action, facet_id)
     end)
   end
 
   @doc false
-  defp process_action(state, {:field_update, field_id, new_value}) do
+  defp process_action(state, {:field_update, field_id, new_value}, _facet_id) do
     # Execute dataflow field updates
     Absynthe.Dataflow.Field.execute_field_update(field_id, new_value)
     state
   end
 
   # Handle Assert actions - deliver to target entity
-  # Note: We do NOT track these in outbound_assertions here because:
-  # 1. Actor-initiated assertions are tracked in handle_call({:assert, ...})
-  # 2. Notification assertions (from dataspace to observers) reuse the original handle
-  #    and tracking them would overwrite the original assertion tracking
-  defp process_action(state, %Assert{ref: ref} = event) do
+  # Track the assertion if it was created by this actor (i.e., handle not already tracked).
+  # Notification assertions (from dataspace to observers) reuse the original handle
+  # which won't be in our outbound_assertions, so we detect and track new assertions.
+  defp process_action(
+         state,
+         %Assert{ref: ref, handle: handle, assertion: assertion} = event,
+         facet_id
+       ) do
+    # Check if this handle is already tracked - if not, this is a new assertion
+    # that should be tracked for cleanup when the facet terminates
+    state =
+      if not Map.has_key?(state.outbound_assertions, handle) do
+        # This is a new assertion created during this turn - track it
+        state
+        |> track_assertion_handle(facet_id, handle, ref, assertion)
+      else
+        state
+      end
+
     deliver_action_to_ref(state, ref, event)
   end
 
   # Handle Retract actions - deliver to target entity
-  # Note: We do NOT remove from outbound_assertions here because:
-  # 1. Actor-initiated retractions are handled in handle_call({:retract, ...})
-  # 2. Notification retractions shouldn't affect the actor's own tracking
-  defp process_action(state, %Retract{ref: ref} = event) do
+  # Remove from tracking if this was a turn-initiated retraction of our own assertion
+  defp process_action(state, %Retract{ref: ref, handle: handle} = event, _facet_id) do
+    # Remove from outbound assertions and facet handles if we own this handle
+    state = untrack_assertion_handle(state, handle)
     deliver_action_to_ref(state, ref, event)
   end
 
   # Handle Message actions - deliver to target entity
-  defp process_action(state, %Message{ref: ref} = event) do
+  defp process_action(state, %Message{ref: ref} = event, _facet_id) do
     deliver_action_to_ref(state, ref, event)
   end
 
   # Handle Sync actions - deliver to target entity
-  defp process_action(state, %Sync{ref: ref} = event) do
+  defp process_action(state, %Sync{ref: ref} = event, _facet_id) do
     deliver_action_to_ref(state, ref, event)
   end
 
-  defp process_action(state, action) do
+  defp process_action(state, action, _facet_id) do
     # Unknown action type - log warning
     Logger.warning("Unknown action type: #{inspect(action)}")
     state
+  end
+
+  # Track an assertion handle as belonging to a facet
+  defp track_assertion_handle(state, facet_id, handle, ref, assertion) do
+    # Add to outbound assertions
+    state = put_in(state.outbound_assertions[handle], {ref, assertion})
+
+    # Add to facet's handles (create the set if it doesn't exist)
+    facet_handles = Map.get(state.facet_handles, facet_id, MapSet.new())
+    facet_handles = MapSet.put(facet_handles, handle)
+    %{state | facet_handles: Map.put(state.facet_handles, facet_id, facet_handles)}
+  end
+
+  # Remove an assertion handle from tracking
+  defp untrack_assertion_handle(state, handle) do
+    case Map.fetch(state.outbound_assertions, handle) do
+      {:ok, _} ->
+        # Remove from outbound assertions
+        state = %{state | outbound_assertions: Map.delete(state.outbound_assertions, handle)}
+
+        # Remove from facet handles (check all facets since we don't know which one owns it)
+        facet_handles =
+          Map.new(state.facet_handles, fn {fid, handles} ->
+            {fid, MapSet.delete(handles, handle)}
+          end)
+
+        %{state | facet_handles: facet_handles}
+
+      :error ->
+        # Not our handle, nothing to do
+        state
+    end
   end
 
   # Deliver an event to a target ref (local or remote)
@@ -884,6 +967,27 @@ defmodule Absynthe.Core.Actor do
   @impl GenServer
   def terminate(reason, state) do
     Logger.debug("Actor #{inspect(state.id)} terminating: #{inspect(reason)}")
+
+    # Retract all outbound assertions
+    # Note: We iterate all assertions and send retraction events.
+    # For local entities, these may not be processed if the actor is shutting down,
+    # but for remote entities/dataspaces, this ensures cleanup.
+    Enum.each(state.outbound_assertions, fn {handle, {ref, _assertion}} ->
+      event = Event.retract(ref, handle)
+
+      # Only send to remote actors - local delivery won't work during termination
+      if not Ref.local?(ref, state.id) do
+        remote_actor_id = Ref.actor_id(ref)
+
+        case resolve_actor(remote_actor_id) do
+          {:ok, actor_pid} ->
+            GenServer.cast(actor_pid, {:deliver, ref, event})
+
+          :error ->
+            :ok
+        end
+      end
+    end)
 
     # Clean up dataflow fields owned by this process
     Absynthe.Dataflow.Field.cleanup()
