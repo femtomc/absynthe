@@ -80,7 +80,7 @@ defmodule Absynthe.Assertions.Bag do
       iex> {:decremented, bag} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> Bag.count(bag, assertion)
       1
-      iex> {:removed, bag} = Bag.remove(bag, Handle.new(:actor, 2))
+      iex> {:removed, bag, _assertion} = Bag.remove(bag, Handle.new(:actor, 2))
       iex> Bag.member?(bag, assertion)
       false
 
@@ -210,7 +210,9 @@ defmodule Absynthe.Assertions.Bag do
   reaches zero, the assertion is completely removed from the bag.
 
   Returns a tuple indicating the result:
-  - `{:removed, bag}` - The last instance was removed (count went from 1 to 0)
+  - `{:removed, bag, assertion}` - The last instance was removed (count went from 1 to 0).
+    The assertion value is returned to allow proper cleanup of dependent structures
+    (like the skeleton index) that may have stored a different handle for this value.
   - `{:decremented, bag}` - An instance was removed but others remain (count decreased but still > 0)
   - `:not_found` - The handle was not found in the bag
 
@@ -225,25 +227,21 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
-      iex> {status, _bag} = Bag.remove(bag, Handle.new(:actor, 1))
-      iex> status
-      :removed
+      iex> {:removed, _bag, _assertion} = Bag.remove(bag, Handle.new(:actor, 1))
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
       iex> {:existing, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 2))
-      iex> {status, _bag} = Bag.remove(bag, Handle.new(:actor, 1))
-      iex> status
-      :decremented
+      iex> {:decremented, _bag} = Bag.remove(bag, Handle.new(:actor, 1))
 
       iex> alias Absynthe.Assertions.{Bag, Handle}
       iex> bag = Absynthe.Assertions.Bag.new()
       iex> Bag.remove(bag, Handle.new(:actor, 999))
       :not_found
   """
-  @spec remove(t(), Handle.t()) :: {:removed | :decremented, t()} | :not_found
+  @spec remove(t(), Handle.t()) :: {:removed, t(), Value.t()} | {:decremented, t()} | :not_found
   def remove(%__MODULE__{} = bag, %Handle{} = handle) do
     case Map.get(bag.handle_to_assertion, handle) do
       nil ->
@@ -257,7 +255,7 @@ defmodule Absynthe.Assertions.Bag do
         new_handle_map = Map.delete(bag.handle_to_assertion, handle)
 
         if count == 1 do
-          # Last instance being removed
+          # Last instance being removed - return assertion value for skeleton cleanup
           new_assertions = Map.delete(bag.assertions, assertion)
 
           new_bag = %__MODULE__{
@@ -265,7 +263,7 @@ defmodule Absynthe.Assertions.Bag do
             handle_to_assertion: new_handle_map
           }
 
-          {:removed, new_bag}
+          {:removed, new_bag, assertion}
         else
           # Still have other instances
           new_assertions = Map.put(bag.assertions, assertion, {count - 1, new_handles})
@@ -310,7 +308,7 @@ defmodule Absynthe.Assertions.Bag do
       iex> alias Absynthe.Preserves.Value
       iex> bag = Bag.new()
       iex> {:new, bag} = Bag.add(bag, Value.string("hello"), Handle.new(:actor, 1))
-      iex> {:removed, bag} = Bag.remove(bag, Handle.new(:actor, 1))
+      iex> {:removed, bag, _assertion} = Bag.remove(bag, Handle.new(:actor, 1))
       iex> Bag.member?(bag, Value.string("hello"))
       false
   """

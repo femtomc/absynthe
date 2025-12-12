@@ -385,6 +385,67 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       assert Absynthe.Dataspace.Observer.match_count(observer) == 0
       refute Absynthe.Dataspace.Observer.matches?(observer, msg_handle)
     end
+
+    test "multi-handle retraction correctly cleans up active_handles" do
+      # This test verifies the fix for the refcounted assertion bug:
+      # When the same assertion value is published with multiple handles,
+      # retracting the non-canonical handle last should still properly
+      # clean up the skeleton and observer active_handles.
+
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up observer first
+      pattern = Value.record(Value.symbol("Data"), [Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 100)
+      {dataspace, turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Publish same assertion value with two different handles
+      data_value = Value.record(Value.symbol("Data"), [Value.integer(42)])
+      h1 = Handle.new(:test_actor, 1)
+      h2 = Handle.new(:test_actor, 2)
+
+      # H1 is the canonical handle (first one added to skeleton)
+      {dataspace, turn} = Entity.on_publish(dataspace, data_value, h1, turn)
+      # H2 increments ref count but doesn't add to skeleton
+      {dataspace, _turn} = Entity.on_publish(dataspace, data_value, h2, turn)
+
+      # Observer should track the canonical handle (H1)
+      observer_id = {:observer, observe_handle}
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 1
+      assert Absynthe.Dataspace.Observer.matches?(observer, h1)
+      # H2 is NOT in active_handles (only canonical handle is tracked)
+      refute Absynthe.Dataspace.Observer.matches?(observer, h2)
+
+      # Retract H1 first (decrements count, assertion still exists)
+      turn = Turn.new(:test_actor, :test_facet)
+      {dataspace, turn} = Entity.on_retract(dataspace, h1, turn)
+
+      # Observer should STILL have the match (assertion not fully removed)
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 1
+
+      # Retract H2 (last handle - should remove from skeleton and notify)
+      {dataspace, updated_turn} = Entity.on_retract(dataspace, h2, turn)
+
+      # Observer should now have NO matches
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 0
+
+      # Verify retraction notification was generated
+      {_committed, actions} = Turn.commit(updated_turn)
+      retract_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Retract{}, &1))
+      assert length(retract_actions) == 1
+    end
   end
 
   describe "observer capture bindings" do

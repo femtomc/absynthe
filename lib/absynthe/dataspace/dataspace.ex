@@ -407,27 +407,40 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   defp handle_regular_retraction(%__MODULE__{} = dataspace, handle, turn) do
     case Bag.remove(dataspace.bag, handle) do
-      {:removed, bag} ->
+      {:removed, bag, assertion_value} ->
         # Last occurrence - remove from skeleton and notify observers
-        # Skeleton is ETS-based, so it's mutated in place
-        # Returns [{observer_id, observer_ref}]
-        observer_info = Skeleton.remove_assertion(dataspace.skeleton, handle)
+        # Use remove_assertion_by_value because the skeleton may have stored
+        # a different (canonical) handle for this assertion value
+        # Returns {canonical_handle, [{observer_id, observer_ref}]}
+        {canonical_handle, observer_info} =
+          Skeleton.remove_assertion_by_value(dataspace.skeleton, assertion_value)
 
-        # Remove the assertion handle from each observer's active_handles
+        # Remove the canonical handle from each observer's active_handles
+        # (observers track the canonical handle, not the one being retracted)
         observers =
-          Enum.reduce(observer_info, dataspace.observers, fn
-            {observer_id, _observer_ref}, obs_map ->
-              case Map.get(obs_map, observer_id) do
-                nil ->
-                  obs_map
+          if canonical_handle do
+            Enum.reduce(observer_info, dataspace.observers, fn
+              {observer_id, _observer_ref}, obs_map ->
+                case Map.get(obs_map, observer_id) do
+                  nil ->
+                    obs_map
 
-                observer ->
-                  Map.put(obs_map, observer_id, Observer.remove_match(observer, handle))
-              end
-          end)
+                  observer ->
+                    Map.put(
+                      obs_map,
+                      observer_id,
+                      Observer.remove_match(observer, canonical_handle)
+                    )
+                end
+            end)
+          else
+            dataspace.observers
+          end
 
         # Notify all observers that were watching this assertion
-        turn = notify_observers_of_retract(turn, observer_info, handle)
+        # Use the canonical handle in notifications for consistency
+        notification_handle = canonical_handle || handle
+        turn = notify_observers_of_retract(turn, observer_info, notification_handle)
 
         updated_dataspace = %__MODULE__{dataspace | bag: bag, observers: observers}
         {updated_dataspace, turn}
