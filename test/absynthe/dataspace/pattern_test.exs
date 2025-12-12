@@ -133,19 +133,120 @@ defmodule Absynthe.Dataspace.PatternTest do
       assert {:ok, []} = Pattern.match(compiled, value)
     end
 
-    test "empty set matches" do
+    test "empty set matches only empty sets" do
       pattern = {:set, MapSet.new([])}
       compiled = Pattern.compile(pattern)
 
       value = {:set, MapSet.new([])}
       assert {:ok, []} = Pattern.match(compiled, value)
 
-      # Note: Current implementation treats sets like sequences in canonical order.
-      # An empty pattern generates no constraints, so it matches any set.
-      # This is a known limitation - proper set matching would verify sizes match
-      # when there are no wildcards/captures.
+      # Empty pattern should NOT match non-empty sets
+      # (structural size equality is now enforced)
       value2 = {:set, MapSet.new([{:integer, 1}])}
-      assert {:ok, []} = Pattern.match(compiled, value2)
+      assert :no_match = Pattern.match(compiled, value2)
+    end
+  end
+
+  describe "structural size equality (arity/length checks)" do
+    test "record pattern rejects value with extra fields" do
+      # Pattern: <Person $name>
+      pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$name"}]}}
+      compiled = Pattern.compile(pattern)
+
+      # Value with same arity - should match
+      value1 = {:record, {{:symbol, "Person"}, [{:string, "Alice"}]}}
+      assert {:ok, [{:string, "Alice"}]} = Pattern.match(compiled, value1)
+
+      # Value with extra field - should NOT match
+      value2 = {:record, {{:symbol, "Person"}, [{:string, "Alice"}, {:integer, 30}]}}
+      assert :no_match = Pattern.match(compiled, value2)
+
+      # Value with fewer fields - should NOT match
+      value3 = {:record, {{:symbol, "Person"}, []}}
+      assert :no_match = Pattern.match(compiled, value3)
+    end
+
+    test "sequence pattern rejects value with extra elements" do
+      # Pattern: [$first, $second]
+      pattern = {:sequence, [{:symbol, "$first"}, {:symbol, "$second"}]}
+      compiled = Pattern.compile(pattern)
+
+      # Value with same length - should match
+      value1 = {:sequence, [{:integer, 1}, {:integer, 2}]}
+      assert {:ok, [{:integer, 1}, {:integer, 2}]} = Pattern.match(compiled, value1)
+
+      # Value with extra element - should NOT match
+      value2 = {:sequence, [{:integer, 1}, {:integer, 2}, {:integer, 3}]}
+      assert :no_match = Pattern.match(compiled, value2)
+
+      # Value with fewer elements - should NOT match
+      value3 = {:sequence, [{:integer, 1}]}
+      assert :no_match = Pattern.match(compiled, value3)
+    end
+
+    test "empty sequence pattern only matches empty sequences" do
+      pattern = {:sequence, []}
+      compiled = Pattern.compile(pattern)
+
+      assert {:ok, []} = Pattern.match(compiled, {:sequence, []})
+      assert :no_match = Pattern.match(compiled, {:sequence, [{:integer, 1}]})
+    end
+
+    test "dictionary pattern rejects value with extra keys" do
+      # Pattern: {name: $n}
+      pattern = {:dictionary, [{{:symbol, "name"}, {:symbol, "$n"}}]}
+      compiled = Pattern.compile(pattern)
+
+      # Value with same keys - should match
+      value1 = {:dictionary, [{{:symbol, "name"}, {:string, "Alice"}}]}
+      assert {:ok, [{:string, "Alice"}]} = Pattern.match(compiled, value1)
+
+      # Value with extra key - should NOT match
+      value2 =
+        {:dictionary,
+         [{{:symbol, "name"}, {:string, "Alice"}}, {{:symbol, "age"}, {:integer, 30}}]}
+
+      assert :no_match = Pattern.match(compiled, value2)
+
+      # Value with different key - should NOT match
+      value3 = {:dictionary, [{{:symbol, "age"}, {:integer, 30}}]}
+      assert :no_match = Pattern.match(compiled, value3)
+    end
+
+    test "empty dictionary pattern only matches empty dictionaries" do
+      pattern = {:dictionary, []}
+      compiled = Pattern.compile(pattern)
+
+      assert {:ok, []} = Pattern.match(compiled, {:dictionary, []})
+      assert :no_match = Pattern.match(compiled, {:dictionary, [{{:symbol, "a"}, {:integer, 1}}]})
+    end
+
+    test "nested structure size checks work" do
+      # Pattern: <Wrapper [$a, $b]>
+      pattern =
+        {:record, {{:symbol, "Wrapper"}, [{:sequence, [{:symbol, "$a"}, {:symbol, "$b"}]}]}}
+
+      compiled = Pattern.compile(pattern)
+
+      # Matching nested structure
+      value1 =
+        {:record, {{:symbol, "Wrapper"}, [{:sequence, [{:integer, 1}, {:integer, 2}]}]}}
+
+      assert {:ok, [{:integer, 1}, {:integer, 2}]} = Pattern.match(compiled, value1)
+
+      # Extra element in nested sequence - should NOT match
+      value2 =
+        {:record,
+         {{:symbol, "Wrapper"}, [{:sequence, [{:integer, 1}, {:integer, 2}, {:integer, 3}]}]}}
+
+      assert :no_match = Pattern.match(compiled, value2)
+
+      # Extra field in outer record - should NOT match
+      value3 =
+        {:record,
+         {{:symbol, "Wrapper"}, [{:sequence, [{:integer, 1}, {:integer, 2}]}, {:string, "extra"}]}}
+
+      assert :no_match = Pattern.match(compiled, value3)
     end
   end
 end

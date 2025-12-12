@@ -70,13 +70,20 @@ defmodule Absynthe.Dataspace.Pattern do
           | {:key, Value.t()}
           | non_neg_integer()
 
+  @type structure_check ::
+          {:record_arity, path(), non_neg_integer()}
+          | {:sequence_length, path(), non_neg_integer()}
+          | {:dictionary_keys, path(), [Value.t()]}
+          | {:set_size, path(), non_neg_integer()}
+
   @type t :: %__MODULE__{
           constraints: [{path(), Value.t()}],
           captures: [path()],
+          structure_checks: [structure_check()],
           original: Value.t()
         }
 
-  defstruct constraints: [], captures: [], original: nil
+  defstruct constraints: [], captures: [], structure_checks: [], original: nil
 
   @wildcard {:symbol, "_"}
 
@@ -113,11 +120,12 @@ defmodule Absynthe.Dataspace.Pattern do
   """
   @spec compile(Value.t()) :: t()
   def compile(pattern) do
-    {constraints, captures} = compile_pattern(pattern, [])
+    {constraints, captures, structure_checks} = compile_pattern(pattern, [])
 
     %__MODULE__{
       constraints: constraints,
       captures: captures,
+      structure_checks: structure_checks,
       original: pattern
     }
   end
@@ -154,34 +162,93 @@ defmodule Absynthe.Dataspace.Pattern do
       :no_match
   """
   @spec match(t(), Value.t()) :: {:ok, [Value.t()]} | :no_match
-  def match(%__MODULE__{constraints: constraints, captures: capture_paths}, value) do
-    # First check all constraints
-    constraints_satisfied =
-      Enum.all?(constraints, fn {path, expected} ->
-        case extract_path(value, path) do
-          {:ok, actual} -> actual == expected
-          :error -> false
-        end
-      end)
+  def match(
+        %__MODULE__{constraints: constraints, captures: capture_paths, structure_checks: checks},
+        value
+      ) do
+    # First check all structure constraints (arity, length, keys)
+    structure_ok = Enum.all?(checks, &check_structure(&1, value))
 
-    if constraints_satisfied do
-      # Extract all captures
-      captures =
-        Enum.map(capture_paths, fn path ->
+    if structure_ok do
+      # Then check all value constraints
+      constraints_satisfied =
+        Enum.all?(constraints, fn {path, expected} ->
           case extract_path(value, path) do
-            {:ok, captured} -> captured
-            :error -> nil
+            {:ok, actual} -> actual == expected
+            :error -> false
           end
         end)
 
-      # If any capture failed, no match
-      if Enum.any?(captures, &is_nil/1) do
-        :no_match
+      if constraints_satisfied do
+        # Extract all captures
+        captures =
+          Enum.map(capture_paths, fn path ->
+            case extract_path(value, path) do
+              {:ok, captured} -> captured
+              :error -> nil
+            end
+          end)
+
+        # If any capture failed, no match
+        if Enum.any?(captures, &is_nil/1) do
+          :no_match
+        else
+          {:ok, captures}
+        end
       else
-        {:ok, captures}
+        :no_match
       end
     else
       :no_match
+    end
+  end
+
+  # Check structural constraints (arity, length, keys)
+  defp check_structure({:record_arity, path, expected_arity}, value) do
+    case extract_path(value, path) do
+      {:ok, {:record, {_label, fields}}} ->
+        length(fields) == expected_arity
+
+      _ ->
+        path == [] and match?({:record, {_, fields}} when length(fields) == expected_arity, value)
+    end
+  end
+
+  defp check_structure({:sequence_length, path, expected_length}, value) do
+    case extract_path(value, path) do
+      {:ok, {:sequence, elements}} -> length(elements) == expected_length
+      _ -> path == [] and match?({:sequence, elems} when length(elems) == expected_length, value)
+    end
+  end
+
+  defp check_structure({:set_size, path, expected_size}, value) do
+    case extract_path(value, path) do
+      {:ok, {:set, elements}} -> MapSet.size(elements) == expected_size
+      _ -> path == [] and match?({:set, elems} when map_size(elems) == expected_size, value)
+    end
+  end
+
+  defp check_structure({:dictionary_keys, path, expected_keys}, value) do
+    case extract_path(value, path) do
+      {:ok, {:dictionary, entries}} ->
+        actual_keys = Enum.map(entries, fn {k, _v} -> k end) |> Enum.sort()
+        sorted_expected = Enum.sort(expected_keys)
+        actual_keys == sorted_expected
+
+      _ ->
+        if path == [] do
+          case value do
+            {:dictionary, entries} ->
+              actual_keys = Enum.map(entries, fn {k, _v} -> k end) |> Enum.sort()
+              sorted_expected = Enum.sort(expected_keys)
+              actual_keys == sorted_expected
+
+            _ ->
+              false
+          end
+        else
+          false
+        end
     end
   end
 
@@ -296,67 +363,105 @@ defmodule Absynthe.Dataspace.Pattern do
 
   # Private compilation functions
 
-  @spec compile_pattern(Value.t(), path()) :: {[{path(), Value.t()}], [path()]}
+  @spec compile_pattern(Value.t(), path()) ::
+          {[{path(), Value.t()}], [path()], [structure_check()]}
   defp compile_pattern(@wildcard, _path) do
-    # Wildcard: no constraints, no captures
-    {[], []}
+    # Wildcard: no constraints, no captures, no structure checks
+    {[], [], []}
   end
 
   defp compile_pattern({:symbol, "$" <> _}, path) do
     # Capture (either "$" or "$name"): no constraints, add current path to captures
-    {[], [Enum.reverse(path)]}
+    {[], [Enum.reverse(path)], []}
   end
 
   defp compile_pattern({:record, {label, fields}}, path) do
+    # Add structure check for record arity
+    arity_check = {:record_arity, Enum.reverse(path), length(fields)}
+
     # Compile the label
-    {label_constraints, label_captures} = compile_pattern(label, [:label | path])
+    {label_constraints, label_captures, label_checks} = compile_pattern(label, [:label | path])
 
     # Compile each field
-    {field_constraints, field_captures} =
+    {field_constraints, field_captures, field_checks} =
       fields
       |> Enum.with_index()
-      |> Enum.reduce({[], []}, fn {field, index}, {constraints_acc, captures_acc} ->
-        {field_constraints, field_captures} = compile_pattern(field, [{:field, index} | path])
-        {constraints_acc ++ field_constraints, captures_acc ++ field_captures}
+      |> Enum.reduce({[], [], []}, fn {field, index},
+                                      {constraints_acc, captures_acc, checks_acc} ->
+        {field_constraints, field_captures, field_checks} =
+          compile_pattern(field, [{:field, index} | path])
+
+        {constraints_acc ++ field_constraints, captures_acc ++ field_captures,
+         checks_acc ++ field_checks}
       end)
 
     # Combine label and field results
-    {label_constraints ++ field_constraints, label_captures ++ field_captures}
+    {label_constraints ++ field_constraints, label_captures ++ field_captures,
+     [arity_check | label_checks ++ field_checks]}
   end
 
   defp compile_pattern({:sequence, elements}, path) do
+    # Add structure check for sequence length
+    length_check = {:sequence_length, Enum.reverse(path), length(elements)}
+
     # Compile each element
-    elements
-    |> Enum.with_index()
-    |> Enum.reduce({[], []}, fn {element, index}, {constraints_acc, captures_acc} ->
-      {elem_constraints, elem_captures} = compile_pattern(element, [index | path])
-      {constraints_acc ++ elem_constraints, captures_acc ++ elem_captures}
-    end)
+    {constraints, captures, checks} =
+      elements
+      |> Enum.with_index()
+      |> Enum.reduce({[], [], []}, fn {element, index},
+                                      {constraints_acc, captures_acc, checks_acc} ->
+        {elem_constraints, elem_captures, elem_checks} = compile_pattern(element, [index | path])
+
+        {constraints_acc ++ elem_constraints, captures_acc ++ elem_captures,
+         checks_acc ++ elem_checks}
+      end)
+
+    {constraints, captures, [length_check | checks]}
   end
 
   defp compile_pattern({:dictionary, entries}, path) do
+    # Add structure check for dictionary keys (exact match, not superset)
+    keys = Enum.map(entries, fn {k, _v} -> k end)
+    keys_check = {:dictionary_keys, Enum.reverse(path), keys}
+
     # Compile each dictionary entry
-    Enum.reduce(entries, {[], []}, fn {key, value}, {constraints_acc, captures_acc} ->
-      {value_constraints, value_captures} = compile_pattern(value, [{:key, key} | path])
-      {constraints_acc ++ value_constraints, captures_acc ++ value_captures}
-    end)
+    {constraints, captures, checks} =
+      Enum.reduce(entries, {[], [], []}, fn {key, value},
+                                            {constraints_acc, captures_acc, checks_acc} ->
+        {value_constraints, value_captures, value_checks} =
+          compile_pattern(value, [{:key, key} | path])
+
+        {constraints_acc ++ value_constraints, captures_acc ++ value_captures,
+         checks_acc ++ value_checks}
+      end)
+
+    {constraints, captures, [keys_check | checks]}
   end
 
   defp compile_pattern({:set, elements}, path) do
+    # Add structure check for set size
+    size_check = {:set_size, Enum.reverse(path), MapSet.size(elements)}
+
     # Sets have canonical ordering - sort elements before compiling
     # This ensures indices match the sorted order used in extract_path
     sorted_elements = elements |> MapSet.to_list() |> Absynthe.Preserves.Compare.sort()
 
-    sorted_elements
-    |> Enum.with_index()
-    |> Enum.reduce({[], []}, fn {element, index}, {constraints_acc, captures_acc} ->
-      {elem_constraints, elem_captures} = compile_pattern(element, [index | path])
-      {constraints_acc ++ elem_constraints, captures_acc ++ elem_captures}
-    end)
+    {constraints, captures, checks} =
+      sorted_elements
+      |> Enum.with_index()
+      |> Enum.reduce({[], [], []}, fn {element, index},
+                                      {constraints_acc, captures_acc, checks_acc} ->
+        {elem_constraints, elem_captures, elem_checks} = compile_pattern(element, [index | path])
+
+        {constraints_acc ++ elem_constraints, captures_acc ++ elem_captures,
+         checks_acc ++ elem_checks}
+      end)
+
+    {constraints, captures, [size_check | checks]}
   end
 
   defp compile_pattern(literal, path) do
-    # Literal value: add as constraint at current path
-    {[{Enum.reverse(path), literal}], []}
+    # Literal value: add as constraint at current path, no structure checks
+    {[{Enum.reverse(path), literal}], [], []}
   end
 end
