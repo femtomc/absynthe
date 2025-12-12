@@ -161,9 +161,11 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   ## Returns
 
-  A list of tuples `{observer_ref, captures}` representing observers that should
-  be notified about this new assertion, along with the captured values from the
-  pattern match.
+  A list of tuples `{observer_id, observer_ref, value, captures}` where:
+  - `observer_id` - The unique identifier for the observer (used for lookup in dataspace)
+  - `observer_ref` - The entity reference to notify
+  - `value` - The matched assertion value
+  - `captures` - Values captured by pattern variables
 
   ## Examples
 
@@ -209,6 +211,10 @@ defmodule Absynthe.Dataspace.Skeleton do
   the assertion from storage. Also checks which observers were matching this
   assertion and returns a list of notifications.
 
+  Note: If the assertion was added multiple times with different handles (via
+  reference counting in the Bag), use `remove_assertion_by_value/2` instead
+  to ensure the correct handle is removed.
+
   ## Parameters
 
     - `skeleton` - The Skeleton index
@@ -216,9 +222,9 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   ## Returns
 
-  A list of tuples `{observer_ref, captures}` representing observers that should
-  be notified about the removal of this assertion, along with the captured values
-  from the pattern match.
+  A list of tuples `{observer_id, observer_ref}` where:
+  - `observer_id` - The unique identifier for the observer (used for lookup in dataspace)
+  - `observer_ref` - The entity reference to notify about the retraction
 
   ## Examples
 
@@ -260,6 +266,67 @@ defmodule Absynthe.Dataspace.Skeleton do
     end
 
     observer_info
+  end
+
+  @doc """
+  Removes an assertion from the index by its value.
+
+  This function is used when the Bag tracks multiple handles for the same assertion
+  value, but the Skeleton only knows about the first (canonical) handle. When the
+  last handle is removed from the Bag, this function finds and removes the canonical
+  handle from the Skeleton.
+
+  ## Parameters
+
+    - `skeleton` - The Skeleton index
+    - `value` - The assertion value to remove
+
+  ## Returns
+
+  A tuple `{canonical_handle, observer_info}` where:
+  - `canonical_handle` - The handle that was stored in the skeleton for this value,
+    or `nil` if not found
+  - `observer_info` - List of `{observer_id, observer_ref}` tuples for observers
+    that need retraction notifications
+
+  ## Examples
+
+      skeleton = Absynthe.Dataspace.Skeleton.new()
+      handle = Absynthe.Assertions.Handle.new(:my_actor, 1)
+      value = Absynthe.Preserves.Value.string("test")
+      # ... add assertion ...
+      {canonical_handle, notifications} =
+        Absynthe.Dataspace.Skeleton.remove_assertion_by_value(skeleton, value)
+
+  """
+  @spec remove_assertion_by_value(t(), Value.t()) ::
+          {Handle.t() | nil, [{observer_id :: term(), observer_ref :: term()}]}
+  def remove_assertion_by_value(%__MODULE__{} = skeleton, value) do
+    # Find the canonical handle for this value by scanning the assertions table
+    canonical_handle = find_handle_for_value(skeleton, value)
+
+    case canonical_handle do
+      nil ->
+        {nil, []}
+
+      handle ->
+        observer_info = remove_assertion(skeleton, handle)
+        {handle, observer_info}
+    end
+  end
+
+  # Finds the handle stored in the skeleton for a given assertion value
+  defp find_handle_for_value(%__MODULE__{} = skeleton, value) do
+    :ets.foldl(
+      fn
+        {handle, ^value}, _acc -> throw({:found, handle})
+        _, acc -> acc
+      end,
+      nil,
+      skeleton.assertions
+    )
+  catch
+    {:found, handle} -> handle
   end
 
   @doc """
