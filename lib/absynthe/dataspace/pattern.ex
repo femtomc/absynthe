@@ -251,6 +251,18 @@ defmodule Absynthe.Dataspace.Pattern do
     end
   end
 
+  def extract_path({:set, elements}, [index | rest])
+      when is_integer(index) and index >= 0 do
+    # Sets have canonical ordering - convert to sorted list and access by index
+    sorted_elements = elements |> MapSet.to_list() |> Absynthe.Preserves.Compare.sort()
+
+    if index < length(sorted_elements) do
+      extract_path(Enum.at(sorted_elements, index), rest)
+    else
+      :error
+    end
+  end
+
   def extract_path(_value, _path), do: :error
 
   @doc """
@@ -331,8 +343,11 @@ defmodule Absynthe.Dataspace.Pattern do
   end
 
   defp compile_pattern({:set, elements}, path) do
-    # Sets are treated similarly to sequences for pattern matching
-    elements
+    # Sets have canonical ordering - sort elements before compiling
+    # This ensures indices match the sorted order used in extract_path
+    sorted_elements = elements |> MapSet.to_list() |> Absynthe.Preserves.Compare.sort()
+
+    sorted_elements
     |> Enum.with_index()
     |> Enum.reduce({[], []}, fn {element, index}, {constraints_acc, captures_acc} ->
       {elem_constraints, elem_captures} = compile_pattern(element, [index | path])
