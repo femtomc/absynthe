@@ -396,6 +396,53 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc """
+  Atomically updates an assertion by retracting the old value and asserting a new one.
+
+  This is the key operation for maintaining consistent state in the Syndicated Actor Model.
+  Instead of manually tracking handles and doing separate retract/assert operations,
+  `update_assertion/4` provides atomic state-change notification (SCN) semantics.
+
+  When the old handle is `nil` or no new assertion is provided, this becomes a simple
+  assert or retract operation respectively.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+  - `handle` - The current handle to retract (or `nil` if this is a new assertion)
+  - `ref` - The entity reference to assert to
+  - `assertion` - The new assertion value (or `nil` to just retract)
+
+  ## Examples
+
+      # Initial assertion (no previous handle)
+      {:ok, handle} = Actor.update_assertion(actor, nil, ref, {:status, :online})
+
+      # Update to new value (atomically retracts old, asserts new)
+      {:ok, new_handle} = Actor.update_assertion(actor, handle, ref, {:status, :busy})
+
+      # Retract completely (no new assertion)
+      :ok = Actor.update_assertion(actor, handle, ref, nil)
+
+  ## Returns
+
+  - `{:ok, handle}` - New assertion made, returns new handle for future updates
+  - `:ok` - Only retraction performed (assertion was nil)
+  - `{:error, :attenuation_rejected}` - New assertion rejected by ref attenuation
+  - `{:error, :not_found}` - Old handle not found (already retracted?)
+
+  ## Atomicity
+
+  The retraction and assertion happen in a single GenServer call, ensuring that
+  observers see the state change as a single coherent update rather than
+  separate remove/add events that could expose intermediate states.
+  """
+  @spec update_assertion(GenServer.server(), Handle.t() | nil, Ref.t(), term() | nil) ::
+          {:ok, Handle.t()} | :ok | {:error, term()}
+  def update_assertion(actor, handle, ref, assertion) do
+    GenServer.call(actor, {:update_assertion, handle, ref, assertion})
+  end
+
+  @doc """
   Sends a synchronization event to an entity.
 
   Synchronization ensures that all events sent before the sync have been
@@ -580,6 +627,101 @@ defmodule Absynthe.Core.Actor do
 
       :error ->
         {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:update_assertion, old_handle, ref, new_assertion}, _from, state) do
+    # Atomic update: retract old (if present) then assert new (if present)
+    # This provides SCN-style state-change semantics
+    #
+    # IMPORTANT: We must check attenuation BEFORE retracting to ensure atomicity.
+    # If the new assertion would be rejected, the old assertion should remain intact.
+
+    # Step 1: Validate the old handle exists (if provided)
+    old_handle_info =
+      case old_handle do
+        nil ->
+          {:ok, nil}
+
+        handle ->
+          case Map.fetch(state.outbound_assertions, handle) do
+            {:ok, {old_ref, _assertion}} -> {:ok, {handle, old_ref}}
+            :error -> {:error, :not_found}
+          end
+      end
+
+    # Step 2: Check attenuation on the new assertion BEFORE modifying state
+    # This ensures we don't retract the old assertion if the new one would be rejected
+    attenuation_result =
+      case new_assertion do
+        nil ->
+          {:ok, nil}
+
+        assertion ->
+          attenuation = Ref.attenuation(ref)
+
+          case Rewrite.apply_attenuation(assertion, attenuation || []) do
+            {:ok, rewritten} -> {:ok, rewritten}
+            :rejected -> {:error, :attenuation_rejected}
+          end
+      end
+
+    # Step 3: Now apply the operations only if all validations passed
+    case {old_handle_info, attenuation_result} do
+      {{:error, reason}, _} ->
+        # Old handle not found
+        {:reply, {:error, reason}, state}
+
+      {_, {:error, reason}} ->
+        # Attenuation rejected - do NOT retract the old assertion
+        {:reply, {:error, reason}, state}
+
+      {{:ok, old_info}, {:ok, rewritten_assertion}} ->
+        # All validations passed - now perform the atomic update
+
+        # Step 3a: Retract old assertion (if handle provided)
+        state =
+          case old_info do
+            nil ->
+              state
+
+            {handle, old_ref} ->
+              new_state = untrack_assertion_handle(state, handle)
+              event = Event.retract(old_ref, handle)
+              deliver_to_ref(new_state, old_ref, event, :async)
+          end
+
+        # Step 3b: Assert new value (if provided)
+        case rewritten_assertion do
+          nil ->
+            # Just retraction, no new assertion
+            {:reply, :ok, state}
+
+          rewritten ->
+            # Generate new handle
+            new_handle = Handle.new(state.id, state.next_handle_id)
+            state = %{state | next_handle_id: state.next_handle_id + 1}
+
+            # Use underlying ref for delivery
+            underlying_ref = Ref.without_attenuation(ref)
+
+            # Track the new assertion
+            state =
+              track_assertion_handle(
+                state,
+                state.root_facet_id,
+                new_handle,
+                underlying_ref,
+                rewritten
+              )
+
+            # Create and deliver the assert event
+            event = Event.assert(underlying_ref, rewritten, new_handle)
+            state = deliver_to_ref(state, underlying_ref, event, :async)
+
+            {:reply, {:ok, new_handle}, state}
+        end
     end
   end
 

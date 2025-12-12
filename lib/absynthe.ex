@@ -440,6 +440,74 @@ defmodule Absynthe do
   end
 
   @doc """
+  Atomically updates an assertion within a turn by retracting the old value and asserting a new one.
+
+  This is the key operation for maintaining consistent state in the Syndicated Actor Model.
+  Instead of manually tracking handles and doing separate retract/assert operations,
+  `update_value/4` provides atomic state-change notification (SCN) semantics within a turn.
+
+  The function returns both the updated turn and the new handle (if a new assertion was made).
+
+  ## Parameters
+
+  - `turn` - The current turn
+  - `old_handle` - The handle to retract (or `nil` if this is a new assertion)
+  - `target` - The entity ref to assert to
+  - `new_value` - The new value to assert (or `nil` to just retract)
+
+  ## Examples
+
+      # Initial assertion (no previous handle) - returns {turn, new_handle}
+      {turn, handle} = Absynthe.update_value(turn, nil, dataspace_ref, {:status, :online})
+
+      # Update to new value - returns {turn, new_handle}
+      {turn, new_handle} = Absynthe.update_value(turn, handle, dataspace_ref, {:status, :busy})
+
+      # Retract completely - returns {turn, nil}
+      {turn, nil} = Absynthe.update_value(turn, handle, dataspace_ref, nil)
+
+  ## Returns
+
+  A tuple `{updated_turn, new_handle}` where:
+  - `updated_turn` has the retract and/or assert actions queued
+  - `new_handle` is the handle for the new assertion (or `nil` if only retracting)
+
+  ## Atomicity
+
+  Both the retraction and assertion are added to the same turn, ensuring they
+  are committed together atomically. This prevents intermediate states where
+  the old value is gone but the new value hasn't appeared yet.
+  """
+  @spec update_value(
+          Turn.t(),
+          Absynthe.Assertions.Handle.t() | nil,
+          Absynthe.Core.Ref.t(),
+          Value.t() | nil
+        ) :: {Turn.t(), Absynthe.Assertions.Handle.t() | nil}
+  def update_value(%Turn{} = turn, old_handle, target, new_value) do
+    # Step 1: Retract old assertion if handle provided
+    turn =
+      case old_handle do
+        nil -> turn
+        handle -> retract_value(turn, target, handle)
+      end
+
+    # Step 2: Assert new value if provided
+    case new_value do
+      nil ->
+        {turn, nil}
+
+      value ->
+        new_handle =
+          Absynthe.Assertions.Handle.new(Turn.actor_id(turn), :erlang.unique_integer([:positive]))
+
+        action = Absynthe.Protocol.Event.assert(target, value, new_handle)
+        turn = Turn.add_action(turn, action)
+        {turn, new_handle}
+    end
+  end
+
+  @doc """
   Creates a message action within a turn.
 
   Use this within a turn to send a message to an entity. Unlike assertions,
