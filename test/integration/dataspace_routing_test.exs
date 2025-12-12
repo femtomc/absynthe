@@ -273,6 +273,120 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
     end
   end
 
+  describe "observer active_handles tracking" do
+    test "observer tracks active handles for existing matching assertions" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # First publish some assertions
+      h1 = Handle.new(:test_actor, 1)
+      person1 = Value.record(Value.symbol("Person"), [Value.string("Alice"), Value.integer(30)])
+      {dataspace, turn} = Entity.on_publish(dataspace, person1, h1, turn)
+
+      h2 = Handle.new(:test_actor, 2)
+      person2 = Value.record(Value.symbol("Person"), [Value.string("Bob"), Value.integer(25)])
+      {dataspace, turn} = Entity.on_publish(dataspace, person2, h2, turn)
+
+      # Create an Observe assertion for Person records
+      pattern = Value.record(Value.symbol("Person"), [Value.symbol("_"), Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer_actor, entity_id: :observer_entity}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 100)
+
+      {updated_dataspace, _turn} =
+        Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # The observer should now track both h1 and h2 as active handles
+      observer_id = {:observer, observe_handle}
+      observer = Map.get(updated_dataspace.observers, observer_id)
+
+      assert observer != nil
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 2
+      assert Absynthe.Dataspace.Observer.matches?(observer, h1)
+      assert Absynthe.Dataspace.Observer.matches?(observer, h2)
+    end
+
+    test "observer tracks new assertion handles as they arrive" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # First set up observer
+      pattern = Value.record(Value.symbol("Message"), [Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Check observer starts with no active handles
+      observer_id = {:observer, observe_handle}
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 0
+
+      # Now publish a matching assertion
+      turn = Turn.new(:test_actor, :test_facet)
+      message = Value.record(Value.symbol("Message"), [Value.string("hello")])
+      msg_handle = Handle.new(:test_actor, 2)
+      {dataspace, _turn} = Entity.on_publish(dataspace, message, msg_handle, turn)
+
+      # Observer should now track the new handle
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 1
+      assert Absynthe.Dataspace.Observer.matches?(observer, msg_handle)
+    end
+
+    test "observer removes handles on retraction" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Publish assertion first
+      message = Value.record(Value.symbol("Msg"), [Value.integer(1)])
+      msg_handle = Handle.new(:test_actor, 1)
+      {dataspace, turn} = Entity.on_publish(dataspace, message, msg_handle, turn)
+
+      # Set up observer
+      pattern = Value.record(Value.symbol("Msg"), [Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 100)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Observer should track the message handle
+      observer_id = {:observer, observe_handle}
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 1
+      assert Absynthe.Dataspace.Observer.matches?(observer, msg_handle)
+
+      # Fresh turn for retraction
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Retract the message
+      {dataspace, _turn} = Entity.on_retract(dataspace, msg_handle, turn)
+
+      # Observer should no longer track the handle
+      observer = Map.get(dataspace.observers, observer_id)
+      assert Absynthe.Dataspace.Observer.match_count(observer) == 0
+      refute Absynthe.Dataspace.Observer.matches?(observer, msg_handle)
+    end
+  end
+
   describe "observer capture bindings" do
     test "observer notifications include capture bindings" do
       dataspace = Dataspace.new()

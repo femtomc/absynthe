@@ -323,13 +323,22 @@ defmodule Absynthe.Dataspace.Dataspace do
     # Compile the pattern for efficient matching
     compiled = Pattern.compile(pattern)
 
-    # Create the observer
-    observer = Observer.new(handle, compiled, entity_ref)
+    # Generate observer_id first, then create observer with consistent ID
     observer_id = generate_observer_id(handle)
+    observer = Observer.new(observer_id, compiled, entity_ref)
 
     # Add observer to skeleton and get existing matches
     # Skeleton is ETS-based, so it's mutated in place
-    existing_matches = Skeleton.add_observer(dataspace.skeleton, handle, entity_ref, compiled)
+    # Returns [{assertion_handle, assertion_value, captures}]
+    # Pass observer_id (not handle) so skeleton returns consistent IDs
+    existing_matches =
+      Skeleton.add_observer(dataspace.skeleton, observer_id, entity_ref, compiled)
+
+    # Track existing matches in the observer's active_handles
+    observer =
+      Enum.reduce(existing_matches, observer, fn {assertion_handle, _value, _captures}, obs ->
+        Observer.add_match(obs, assertion_handle)
+      end)
 
     # Notify observer of existing assertions
     turn = notify_observer_of_existing(turn, entity_ref, existing_matches)
@@ -347,7 +356,8 @@ defmodule Absynthe.Dataspace.Dataspace do
   defp handle_observe_retraction(%__MODULE__{} = dataspace, observer_id, handle, turn) do
     # Remove observer from skeleton
     # Skeleton is ETS-based, so it's mutated in place
-    Skeleton.remove_observer(dataspace.skeleton, handle)
+    # Use observer_id (not handle) for consistency with add_observer
+    Skeleton.remove_observer(dataspace.skeleton, observer_id)
 
     # Clean up observer tracking
     updated_dataspace = %__MODULE__{
@@ -366,12 +376,26 @@ defmodule Absynthe.Dataspace.Dataspace do
       {:new, bag} ->
         # First occurrence - add to skeleton and notify observers
         # Skeleton is ETS-based, so it's mutated in place
+        # Returns [{observer_id, observer_ref, assertion_value, captures}]
         observer_matches = Skeleton.add_assertion(dataspace.skeleton, handle, assertion)
+
+        # Update observers' active_handles with the new assertion handle
+        observers =
+          Enum.reduce(observer_matches, dataspace.observers, fn
+            {observer_id, _observer_ref, _value, _captures}, obs_map ->
+              case Map.get(obs_map, observer_id) do
+                nil ->
+                  obs_map
+
+                observer ->
+                  Map.put(obs_map, observer_id, Observer.add_match(observer, handle))
+              end
+          end)
 
         # Notify all matching observers
         turn = notify_observers_of_publish(turn, observer_matches, assertion, handle)
 
-        updated_dataspace = %__MODULE__{dataspace | bag: bag}
+        updated_dataspace = %__MODULE__{dataspace | bag: bag, observers: observers}
         {updated_dataspace, turn}
 
       {:existing, bag} ->
@@ -386,12 +410,26 @@ defmodule Absynthe.Dataspace.Dataspace do
       {:removed, bag} ->
         # Last occurrence - remove from skeleton and notify observers
         # Skeleton is ETS-based, so it's mutated in place
-        observer_refs = Skeleton.remove_assertion(dataspace.skeleton, handle)
+        # Returns [{observer_id, observer_ref}]
+        observer_info = Skeleton.remove_assertion(dataspace.skeleton, handle)
+
+        # Remove the assertion handle from each observer's active_handles
+        observers =
+          Enum.reduce(observer_info, dataspace.observers, fn
+            {observer_id, _observer_ref}, obs_map ->
+              case Map.get(obs_map, observer_id) do
+                nil ->
+                  obs_map
+
+                observer ->
+                  Map.put(obs_map, observer_id, Observer.remove_match(observer, handle))
+              end
+          end)
 
         # Notify all observers that were watching this assertion
-        turn = notify_observers_of_retract(turn, observer_refs, handle)
+        turn = notify_observers_of_retract(turn, observer_info, handle)
 
-        updated_dataspace = %__MODULE__{dataspace | bag: bag}
+        updated_dataspace = %__MODULE__{dataspace | bag: bag, observers: observers}
         {updated_dataspace, turn}
 
       {:decremented, bag} ->
@@ -419,15 +457,18 @@ defmodule Absynthe.Dataspace.Dataspace do
   defp notify_observers_of_publish(turn, observer_matches, assertion, handle) do
     # For each observer that matches this assertion, send a publish notification
     # with captured bindings from pattern matching
-    Enum.reduce(observer_matches, turn, fn {observer_ref, _assertion, captures}, turn_acc ->
+    # observer_matches is [{observer_id, observer_ref, value, captures}]
+    Enum.reduce(observer_matches, turn, fn {_observer_id, observer_ref, _value, captures},
+                                           turn_acc ->
       action = Event.assert(observer_ref, assertion, handle, captures)
       Turn.add_action(turn_acc, action)
     end)
   end
 
-  defp notify_observers_of_retract(turn, observer_refs, handle) do
+  defp notify_observers_of_retract(turn, observer_info, handle) do
     # For each observer that was watching this assertion, send a retract notification
-    Enum.reduce(observer_refs, turn, fn observer_ref, turn_acc ->
+    # observer_info is [{observer_id, observer_ref}]
+    Enum.reduce(observer_info, turn, fn {_observer_id, observer_ref}, turn_acc ->
       action = Event.retract(observer_ref, handle)
       Turn.add_action(turn_acc, action)
     end)

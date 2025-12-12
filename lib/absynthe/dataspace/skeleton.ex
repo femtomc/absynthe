@@ -177,7 +177,7 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   """
   @spec add_assertion(t(), Handle.t(), Value.t()) ::
-          [{observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
+          [{observer_id :: term(), observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
   def add_assertion(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
     # Store the full assertion
     :ets.insert(skeleton.assertions, {handle, value})
@@ -228,16 +228,20 @@ defmodule Absynthe.Dataspace.Skeleton do
       notifications = Absynthe.Dataspace.Skeleton.remove_assertion(skeleton, handle)
 
   """
-  @spec remove_assertion(t(), Handle.t()) :: [observer_ref :: term()]
+  @spec remove_assertion(t(), Handle.t()) :: [{observer_id :: term(), observer_ref :: term()}]
   def remove_assertion(%__MODULE__{} = skeleton, %Handle{} = handle) do
     # Get the assertion value before removing and find matching observers
-    {value_for_cleanup, observer_refs} =
+    {value_for_cleanup, observer_info} =
       case :ets.lookup(skeleton.assertions, handle) do
         [{^handle, value}] ->
           matches = find_matching_observers(skeleton, handle, value)
-          # Extract just observer refs for retraction notifications
-          refs = Enum.map(matches, fn {observer_ref, _value, _captures} -> observer_ref end)
-          {value, refs}
+          # Extract observer_id and observer_ref pairs for retraction notifications
+          info =
+            Enum.map(matches, fn {observer_id, observer_ref, _value, _captures} ->
+              {observer_id, observer_ref}
+            end)
+
+          {value, info}
 
         [] ->
           {nil, []}
@@ -255,7 +259,7 @@ defmodule Absynthe.Dataspace.Skeleton do
       cleanup_handle_from_index(skeleton, handle)
     end
 
-    observer_refs
+    observer_info
   end
 
   @doc """
@@ -560,13 +564,13 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   # Find observers that match a given assertion
   @spec find_matching_observers(t(), Handle.t(), Value.t()) ::
-          [{observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
+          [{observer_id :: term(), observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
   defp find_matching_observers(%__MODULE__{} = skeleton, _handle, value) do
     :ets.tab2list(skeleton.observers)
-    |> Enum.flat_map(fn {_observer_id, {pattern, observer_ref}} ->
+    |> Enum.flat_map(fn {observer_id, {pattern, observer_ref}} ->
       case Pattern.match(pattern, value) do
         {:ok, captures} ->
-          [{observer_ref, value, captures}]
+          [{observer_id, observer_ref, value, captures}]
 
         :no_match ->
           []
