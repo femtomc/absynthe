@@ -188,6 +188,88 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
 
       refute Dataspace.has_assertion?(dataspace, {:string, "temp"})
     end
+
+    test "dataspace sync responds with synced message" do
+      # Test that dataspace.on_sync sends a message (not another sync)
+      dataspace = Dataspace.new()
+      turn = Turn.new(:ds_sync_test, :test_facet)
+      peer_ref = %Ref{actor_id: :ds_sync_test, entity_id: 42, attenuation: nil}
+
+      {_dataspace, updated_turn} = Entity.on_sync(dataspace, peer_ref, turn)
+
+      # The turn should contain exactly one message action to the peer
+      # with {:symbol, "synced"} as the body
+      [action] = Turn.actions(updated_turn)
+      assert %Event.Message{ref: ^peer_ref, body: {:symbol, "synced"}} = action
+    end
+  end
+
+  describe "sync ordering guarantees" do
+    test "default entity sync responds with synced message" do
+      {:ok, actor} = Actor.start_link(id: :default_sync_test)
+
+      # Create a collector to receive the sync response
+      collector = %CollectorEntity{}
+      {:ok, collector_ref} = Actor.spawn_entity(actor, :root, collector)
+
+      # Use Entity.Default which relies on the default on_sync callback
+      # that sends the synced message to the peer
+      default_entity = %Entity.Default{
+        on_message: fn entity, _msg, turn ->
+          {entity, turn}
+        end
+      }
+
+      {:ok, default_ref} = Actor.spawn_entity(actor, :root, default_entity)
+
+      # Sync with default entity, expecting response at collector
+      Actor.sync(actor, default_ref, collector_ref)
+
+      Process.sleep(50)
+
+      # Collector should have received the synced message from default behavior
+      state = :sys.get_state(actor)
+      {_facet_id, updated_collector} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      assert [{:message, {:symbol, "synced"}}] = updated_collector.received
+
+      GenServer.stop(actor)
+    end
+
+    test "sync creates happens-before relationship" do
+      # This test verifies that when we sync, all prior events are processed
+      # before the sync response is received
+      {:ok, actor} = Actor.start_link(id: :ordering_test)
+
+      # Create a collector that tracks events in order
+      collector = %CollectorEntity{}
+      {:ok, collector_ref} = Actor.spawn_entity(actor, :root, collector)
+
+      # Create a responder entity
+      responder = %CollectorEntity{}
+      {:ok, responder_ref} = Actor.spawn_entity(actor, :root, responder)
+
+      # Send multiple messages, then sync
+      Actor.send_message(actor, responder_ref, {:string, "msg1"})
+      Actor.send_message(actor, responder_ref, {:string, "msg2"})
+      Actor.sync(actor, responder_ref, collector_ref)
+
+      Process.sleep(50)
+
+      # Responder should have received all messages
+      state = :sys.get_state(actor)
+      {_facet_id, updated_responder} = Map.get(state.entities, Ref.entity_id(responder_ref))
+
+      # Messages are prepended, so most recent first
+      assert [{:message, {:string, "msg2"}}, {:message, {:string, "msg1"}}] =
+               updated_responder.received
+
+      # Collector should have received the sync response
+      {_facet_id, updated_collector} = Map.get(state.entities, Ref.entity_id(collector_ref))
+      assert [{:message, {:symbol, "synced"}}] = updated_collector.received
+
+      GenServer.stop(actor)
+    end
   end
 
   describe "cross-actor messaging" do

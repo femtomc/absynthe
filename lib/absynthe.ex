@@ -119,7 +119,7 @@ defmodule Absynthe do
         end
         def on_publish(entity, _assertion, _handle, turn), do: {entity, turn}
         def on_retract(entity, _handle, turn), do: {entity, turn}
-        def on_sync(entity, _peer, turn), do: {entity, turn}
+        # on_sync uses default: sends {:symbol, "synced"} to peer
       end
 
       {:ok, actor} = Absynthe.start_actor(id: :counter_actor)

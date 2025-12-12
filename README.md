@@ -60,7 +60,7 @@ defimpl Absynthe.Core.Entity, for: Counter do
 
   def on_publish(entity, _assertion, _handle, turn), do: {entity, turn}
   def on_retract(entity, _handle, turn), do: {entity, turn}
-  def on_sync(entity, _peer, turn), do: {entity, turn}
+  # on_sync uses default behavior: sends {:symbol, "synced"} message to peer
 end
 
 {:ok, actor} = Absynthe.start_actor(id: :counter_actor)
@@ -89,7 +89,7 @@ defmodule PresenceObserver do
     end
 
     def on_message(entity, _msg, turn), do: {entity, turn}
-    def on_sync(entity, _peer, turn), do: {entity, turn}
+    # on_sync uses default behavior: sends {:symbol, "synced"} message to peer
   end
 end
 

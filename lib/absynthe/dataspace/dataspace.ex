@@ -583,9 +583,10 @@ defimpl Absynthe.Core.Entity, for: Absynthe.Dataspace.Dataspace do
   @doc """
   Called when a synchronization barrier is reached.
 
-  The dataspace queues a sync response to be sent to the peer after the
-  current turn commits. This ensures the peer knows all prior assertions
-  have been processed.
+  The dataspace responds by sending a `Synced` message to the peer after
+  all prior operations have been processed. This creates a happens-before
+  relationship: once the peer receives the `Synced` message, it knows that
+  the dataspace has processed the sync request within its turn.
 
   ## Parameters
 
@@ -597,13 +598,13 @@ defimpl Absynthe.Core.Entity, for: Absynthe.Dataspace.Dataspace do
 
   A tuple of `{dataspace, updated_turn}`.
 
-  The turn will contain a sync action to notify the peer.
+  The turn will contain a message action to notify the peer with `{:symbol, "synced"}`.
   """
   def on_sync(dataspace, peer_ref, turn) do
-    # Create a sync response to the peer
+    # Respond to the peer with a Synced message
     # This is sent after the turn commits, ensuring the peer knows
-    # all prior operations have completed
-    action = Event.sync(peer_ref, peer_ref)
+    # all prior operations have been processed
+    action = Event.message(peer_ref, {:symbol, "synced"})
     turn = Turn.add_action(turn, action)
 
     {dataspace, turn}

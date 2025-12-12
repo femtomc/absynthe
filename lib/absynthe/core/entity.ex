@@ -171,8 +171,9 @@ defprotocol Absynthe.Core.Entity do
   Called when a synchronization barrier is reached.
 
   Synchronization allows entities to coordinate their actions and ensure that
-  certain operations have completed before proceeding. This is useful for
-  implementing barriers and coordination patterns.
+  certain operations have completed before proceeding. The default behavior
+  is to respond with a `{:symbol, "synced"}` message to the peer, creating a
+  happens-before relationship.
 
   ## Parameters
 
@@ -184,10 +185,18 @@ defprotocol Absynthe.Core.Entity do
 
   A tuple of `{updated_entity, updated_turn}`.
 
+  ## Default Behavior
+
+  The default implementation responds to `peer_ref` with a `{:symbol, "synced"}`
+  message. Override this if you need custom sync behavior, such as forwarding
+  the sync request to another entity.
+
   ## Example
 
       def on_sync(entity, peer_ref, turn) do
-        IO.puts("Synchronized with \#{inspect(peer_ref)}")
+        # Default: respond with Synced message
+        action = Event.message(peer_ref, {:symbol, "synced"})
+        turn = Turn.add_action(turn, action)
         {entity, turn}
       end
   """
@@ -198,9 +207,11 @@ defimpl Absynthe.Core.Entity, for: Any do
   @moduledoc """
   Default fallback implementation for the Entity protocol.
 
-  Provides no-op implementations for all callbacks, returning the entity
-  and turn unchanged. This allows any struct to be used as an entity
-  even if it doesn't implement specific event handlers.
+  Provides default implementations for all callbacks. Most callbacks are no-ops
+  that return the entity and turn unchanged, but `on_sync/3` sends a
+  `{:symbol, "synced"}` message to the peer to implement the standard sync
+  protocol. This allows any struct to be used as an entity even if it doesn't
+  implement specific event handlers.
   """
 
   @doc """
@@ -231,11 +242,16 @@ defimpl Absynthe.Core.Entity, for: Any do
   end
 
   @doc """
-  Default no-op implementation for `on_sync`.
+  Default implementation for `on_sync`.
 
-  Returns the entity and turn unchanged.
+  Responds to the peer with a `Synced` message. This is the standard sync
+  protocol response that creates a happens-before relationship: the peer
+  knows that the entity has processed the sync request when it receives
+  the `{:symbol, "synced"}` message.
   """
-  def on_sync(entity, _peer_ref, turn) do
+  def on_sync(entity, peer_ref, turn) do
+    action = Absynthe.Protocol.Event.message(peer_ref, {:symbol, "synced"})
+    turn = Absynthe.Core.Turn.add_action(turn, action)
     {entity, turn}
   end
 end
@@ -265,7 +281,7 @@ defmodule Absynthe.Core.Entity.Default do
   - `on_publish` - Function called for publication events. Defaults to no-op.
   - `on_retract` - Function called for retraction events. Defaults to no-op.
   - `on_message` - Function called for message events. Defaults to no-op.
-  - `on_sync` - Function called for synchronization events. Defaults to no-op.
+  - `on_sync` - Function called for synchronization events. Defaults to sending a `{:symbol, "synced"}` message to the peer.
 
   Each function should have the signature:
   - `on_publish`: `(entity, assertion, handle, turn) -> {entity, turn}`
@@ -308,6 +324,9 @@ defmodule Absynthe.Core.Entity.Default do
       if entity.on_sync do
         entity.on_sync.(entity, peer_ref, turn)
       else
+        # Default: respond with Synced message
+        action = Absynthe.Protocol.Event.message(peer_ref, {:symbol, "synced"})
+        turn = Absynthe.Core.Turn.add_action(turn, action)
         {entity, turn}
       end
     end
