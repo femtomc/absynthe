@@ -170,6 +170,7 @@ defmodule Absynthe.Core.Actor do
   alias Absynthe.Core.Ref
   alias Absynthe.Core.Entity
   alias Absynthe.Core.Turn
+  alias Absynthe.Core.Rewrite
   alias Absynthe.Protocol.Event
   alias Absynthe.Assertions.Handle
 
@@ -754,30 +755,69 @@ defmodule Absynthe.Core.Actor do
   defp deliver_event_impl(state, ref, event, sender_pid) do
     entity_id = Ref.entity_id(ref)
 
-    case Map.fetch(state.entities, entity_id) do
-      {:ok, {facet_id, entity}} ->
-        # Track inbound assertions from remote actors for crash cleanup
-        state = maybe_track_inbound_assertion(state, event, ref, sender_pid)
+    # Apply attenuation to the event (may rewrite or reject)
+    case apply_event_attenuation(ref, event) do
+      {:ok, rewritten_event} ->
+        case Map.fetch(state.entities, entity_id) do
+          {:ok, {facet_id, entity}} ->
+            # Track inbound assertions from remote actors for crash cleanup
+            state = maybe_track_inbound_assertion(state, rewritten_event, ref, sender_pid)
 
-        # Execute a turn for this event
-        result = execute_turn(state, facet_id, entity_id, entity, event)
+            # Execute a turn for this event
+            result = execute_turn(state, facet_id, entity_id, entity, rewritten_event)
 
-        case result do
-          {:ok, _updated_entity, new_state} ->
-            # Entity state is already updated in execute_turn before action processing
-            new_state
+            case result do
+              {:ok, _updated_entity, new_state} ->
+                # Entity state is already updated in execute_turn before action processing
+                new_state
 
-          {:error, reason} ->
-            Logger.error("Turn failed for entity #{entity_id}: #{inspect(reason)}")
-            # On error, state remains unchanged (rollback)
+              {:error, reason} ->
+                Logger.error("Turn failed for entity #{entity_id}: #{inspect(reason)}")
+                # On error, state remains unchanged (rollback)
+                state
+            end
+
+          :error ->
+            Logger.warning("Entity #{entity_id} not found for event: #{inspect(event)}")
             state
         end
 
-      :error ->
-        Logger.warning("Entity #{entity_id} not found for event: #{inspect(event)}")
+      :rejected ->
+        # Event rejected by attenuation - drop silently
+        Logger.debug("Event rejected by attenuation on ref #{inspect(ref)}")
         state
     end
   end
+
+  # Apply attenuation to an event, potentially rewriting the value
+  # Returns {:ok, event} (possibly rewritten) or :rejected
+  defp apply_event_attenuation(ref, %Assert{assertion: assertion} = event) do
+    attenuation = Ref.attenuation(ref)
+
+    case Rewrite.apply_attenuation(assertion, attenuation || []) do
+      {:ok, rewritten_assertion} ->
+        {:ok, %Assert{event | assertion: rewritten_assertion}}
+
+      :rejected ->
+        :rejected
+    end
+  end
+
+  defp apply_event_attenuation(ref, %Message{body: body} = event) do
+    attenuation = Ref.attenuation(ref)
+
+    case Rewrite.apply_attenuation(body, attenuation || []) do
+      {:ok, rewritten_body} ->
+        {:ok, %Message{event | body: rewritten_body}}
+
+      :rejected ->
+        :rejected
+    end
+  end
+
+  # Retract and Sync events pass through - they don't carry values that need filtering
+  defp apply_event_attenuation(_ref, %Retract{} = event), do: {:ok, event}
+  defp apply_event_attenuation(_ref, %Sync{} = event), do: {:ok, event}
 
   @doc false
   defp execute_turn(state, facet_id, entity_id, entity, event) do

@@ -16,7 +16,7 @@ defmodule Absynthe.Core.Ref do
   A Ref contains:
   - `actor_id` - Identifies which actor owns the entity
   - `entity_id` - Identifies the entity within that actor
-  - `attenuation` - Optional capability attenuation (reserved for future use)
+  - `attenuation` - Optional capability attenuation chain (list of caveats)
 
   Refs implement structural equality and can be used as map keys, stored in
   sets, and compared for ordering.
@@ -50,13 +50,33 @@ defmodule Absynthe.Core.Ref do
       # Assert a fact about an entity
       Absynthe.Core.Actor.assert(ref, {:status, :online})
 
-  ## Capability Attenuation (Future)
+  ## Capability Attenuation
 
-  The `attenuation` field is reserved for future capability attenuation
-  features, where a Ref can be restricted to only allow certain operations
-  or only access certain aspects of an entity. Currently, this field is
-  always `nil` and is not used by the system.
+  The `attenuation` field contains a list of caveats that restrict how the
+  Ref can be used. When assertions or messages are sent through an attenuated
+  Ref, the attenuation chain filters and/or transforms the values.
+
+  Attenuation provides two key security properties:
+  - **Filtering**: Only values matching the caveat patterns are allowed
+  - **Transformation**: Values can be rewritten to hide sensitive information
+
+  See `Absynthe.Core.Caveat` for details on caveat types and the attenuation
+  mechanism.
+
+  ## Examples with Attenuation
+
+      # Create an attenuated ref that only allows Person records
+      alias Absynthe.Core.{Ref, Caveat}
+
+      ref = Ref.new(:actor_123, :entity_456)
+      pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$"}]}}
+      template = {:ref, 0}
+      {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.rewrite(pattern, template))
+
+      # The attenuated ref will only deliver values matching the pattern
   """
+
+  alias Absynthe.Core.Caveat
 
   @typedoc """
   A reference to an entity within the actor system.
@@ -67,7 +87,7 @@ defmodule Absynthe.Core.Ref do
   @type t :: %__MODULE__{
           actor_id: term(),
           entity_id: term(),
-          attenuation: term() | nil
+          attenuation: Caveat.attenuation() | nil
         }
 
   @enforce_keys [:actor_id, :entity_id]
@@ -262,5 +282,90 @@ defmodule Absynthe.Core.Ref do
   @spec without_attenuation(t()) :: t()
   def without_attenuation(%__MODULE__{} = ref) do
     %__MODULE__{ref | attenuation: nil}
+  end
+
+  @doc """
+  Attenuates a Ref by adding a caveat to its attenuation chain.
+
+  This is the primary way to restrict a capability. The new caveat is added
+  to the front of the attenuation chain, meaning it will be applied first
+  when values flow through this Ref.
+
+  Attenuation is monotonic: you can only add restrictions, never remove them.
+  An attenuated Ref will never have more authority than its unattenuated
+  parent.
+
+  ## Parameters
+
+  - `ref` - The Ref to attenuate
+  - `caveat` - The caveat to add (see `Absynthe.Core.Caveat`)
+
+  ## Returns
+
+  - `{:ok, attenuated_ref}` - Successfully attenuated
+  - `{:error, reason}` - Caveat validation failed
+
+  ## Examples
+
+      # Allow only Person records
+      iex> ref = Absynthe.Core.Ref.new(:actor, :entity)
+      iex> pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$"}]}}
+      iex> {:ok, attenuated} = Absynthe.Core.Ref.attenuate(ref, {:rewrite, pattern, {:ref, 0}})
+      iex> Absynthe.Core.Ref.attenuated?(attenuated)
+      true
+
+      # Attenuate an already-attenuated ref (caveats compose)
+      iex> {:ok, double_attenuated} = Absynthe.Core.Ref.attenuate(attenuated, another_caveat)
+
+      # Invalid caveat
+      iex> Absynthe.Core.Ref.attenuate(ref, {:rewrite, {:symbol, "$"}, {:ref, 5}})
+      {:error, {:capture_out_of_range, 5, 1}}
+  """
+  @spec attenuate(t(), Caveat.t()) :: {:ok, t()} | {:error, term()}
+  def attenuate(%__MODULE__{} = ref, caveat) do
+    case Caveat.validate(caveat) do
+      :ok ->
+        # Compose the new caveat with existing attenuation
+        new_attenuation = Absynthe.Core.Rewrite.compose([caveat], ref.attenuation)
+        {:ok, %__MODULE__{ref | attenuation: new_attenuation}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc """
+  Attenuates a Ref by adding a caveat, raising on invalid caveats.
+
+  Like `attenuate/2` but raises an `ArgumentError` if the caveat is invalid.
+  Use this when you're confident the caveat is valid (e.g., when constructing
+  caveats from literals).
+
+  ## Parameters
+
+  - `ref` - The Ref to attenuate
+  - `caveat` - The caveat to add
+
+  ## Returns
+
+  The attenuated Ref.
+
+  ## Raises
+
+  - `ArgumentError` if the caveat is invalid
+
+  ## Examples
+
+      iex> ref = Absynthe.Core.Ref.new(:actor, :entity)
+      iex> attenuated = Absynthe.Core.Ref.attenuate!(ref, Absynthe.Core.Caveat.passthrough())
+      iex> Absynthe.Core.Ref.attenuated?(attenuated)
+      true
+  """
+  @spec attenuate!(t(), Caveat.t()) :: t()
+  def attenuate!(%__MODULE__{} = ref, caveat) do
+    case attenuate(ref, caveat) do
+      {:ok, attenuated_ref} -> attenuated_ref
+      {:error, reason} -> raise ArgumentError, "Invalid caveat: #{inspect(reason)}"
+    end
   end
 end
