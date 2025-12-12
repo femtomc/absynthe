@@ -107,6 +107,7 @@ defmodule Absynthe.Relay.Relay do
           recv_buffer: binary(),
           local_handles: %{Handle.t() => non_neg_integer()},
           wire_handles: %{non_neg_integer() => Handle.t()},
+          handle_to_oid: %{Handle.t() => non_neg_integer()},
           next_wire_handle: non_neg_integer(),
           pending_syncs: %{non_neg_integer() => Ref.t()},
           next_sync_id: non_neg_integer(),
@@ -198,6 +199,7 @@ defmodule Absynthe.Relay.Relay do
       recv_buffer: Framing.new_state(),
       local_handles: %{},
       wire_handles: %{},
+      handle_to_oid: %{},
       next_wire_handle: 0,
       pending_syncs: %{},
       next_sync_id: 0,
@@ -533,10 +535,12 @@ defmodule Absynthe.Relay.Relay do
     wire_handle = state.next_wire_handle
     state = %{state | next_wire_handle: wire_handle + 1}
 
+    # Track handle -> wire_handle, wire_handle -> handle, and handle -> oid
     state = %{
       state
       | local_handles: Map.put(state.local_handles, handle, wire_handle),
-        wire_handles: Map.put(state.wire_handles, wire_handle, handle)
+        wire_handles: Map.put(state.wire_handles, wire_handle, handle),
+        handle_to_oid: Map.put(state.handle_to_oid, handle, oid)
     }
 
     # Send assert packet
@@ -556,22 +560,36 @@ defmodule Absynthe.Relay.Relay do
         state
 
       wire_handle ->
-        # Clean up mapping
-        state = %{
-          state
-          | local_handles: Map.delete(state.local_handles, handle),
-            wire_handles: Map.delete(state.wire_handles, wire_handle)
-        }
+        # Look up the OID that this assertion was originally made to
+        case Map.fetch(state.handle_to_oid, handle) do
+          {:ok, oid} ->
+            # Clean up all mappings
+            state = %{
+              state
+              | local_handles: Map.delete(state.local_handles, handle),
+                wire_handles: Map.delete(state.wire_handles, wire_handle),
+                handle_to_oid: Map.delete(state.handle_to_oid, handle)
+            }
 
-        # Get the OID from the proxy entity's handle
-        # For now, assume OID 0 (the dataspace)
-        oid = 0
-        event = Packet.event(oid, Packet.retract(wire_handle))
-        turn = Packet.turn([event])
+            event = Packet.event(oid, Packet.retract(wire_handle))
+            turn = Packet.turn([event])
 
-        case do_send_packet(state, turn) do
-          {:ok, state} -> state
-          {:error, _reason} -> state
+            case do_send_packet(state, turn) do
+              {:ok, state} -> state
+              {:error, _reason} -> state
+            end
+
+          :error ->
+            Logger.error(
+              "Relay: missing OID mapping for handle #{inspect(handle)}, dropping retract"
+            )
+
+            # Clean up handle mappings but don't send a retract with wrong OID
+            %{
+              state
+              | local_handles: Map.delete(state.local_handles, handle),
+                wire_handles: Map.delete(state.wire_handles, wire_handle)
+            }
         end
     end
   end
