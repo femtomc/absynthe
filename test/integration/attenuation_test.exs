@@ -10,17 +10,19 @@ defmodule Absynthe.Integration.AttenuationTest do
 
   alias Absynthe.Core.{Actor, Ref, Caveat}
 
-  # A simple entity that records all received messages and assertions
+  # A simple entity that reports received messages to a test process
   defmodule RecordingEntity do
-    defstruct received: []
+    defstruct test_pid: nil
 
     defimpl Absynthe.Core.Entity do
       def on_message(entity, message, turn) do
-        {%{entity | received: [{:message, message} | entity.received]}, turn}
+        send(entity.test_pid, {:received_message, message})
+        {entity, turn}
       end
 
       def on_publish(entity, assertion, _handle, turn) do
-        {%{entity | received: [{:assert, assertion} | entity.received]}, turn}
+        send(entity.test_pid, {:received_assert, assertion})
+        {entity, turn}
       end
 
       def on_retract(entity, _handle, turn) do
@@ -37,7 +39,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "passthrough caveat allows all messages" do
       {:ok, actor} = Actor.start_link(id: :passthrough_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate with passthrough
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.passthrough())
@@ -46,8 +48,9 @@ defmodule Absynthe.Integration.AttenuationTest do
       Actor.send_message(actor, attenuated_ref, {:integer, 42})
       Actor.send_message(actor, attenuated_ref, {:string, "hello"})
 
-      # Give time for async delivery
-      Process.sleep(50)
+      # Verify both messages were received
+      assert_receive {:received_message, {:integer, 42}}, 100
+      assert_receive {:received_message, {:string, "hello"}}, 100
 
       GenServer.stop(actor)
     end
@@ -55,7 +58,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "reject caveat blocks all messages" do
       {:ok, actor} = Actor.start_link(id: :reject_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate with reject
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.reject())
@@ -63,8 +66,8 @@ defmodule Absynthe.Integration.AttenuationTest do
       # Send message through attenuated ref (should be rejected)
       Actor.send_message(actor, attenuated_ref, {:integer, 42})
 
-      # Give time for (non-)delivery
-      Process.sleep(50)
+      # Verify message was NOT received
+      refute_receive {:received_message, _}, 100
 
       GenServer.stop(actor)
     end
@@ -72,13 +75,13 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "pattern-matching caveat filters messages" do
       {:ok, actor} = Actor.start_link(id: :pattern_filter_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
-      # Attenuate to only allow Person records
+      # Attenuate to only allow Person records, extract the name
       pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$"}]}}
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.rewrite(pattern, {:ref, 0}))
 
-      # Send matching message (Person record) - should pass
+      # Send matching message (Person record) - should pass, delivers the name
       person_msg = {:record, {{:symbol, "Person"}, [{:string, "Alice"}]}}
       Actor.send_message(actor, attenuated_ref, person_msg)
 
@@ -86,7 +89,9 @@ defmodule Absynthe.Integration.AttenuationTest do
       animal_msg = {:record, {{:symbol, "Animal"}, [{:string, "Dog"}]}}
       Actor.send_message(actor, attenuated_ref, animal_msg)
 
-      Process.sleep(50)
+      # Verify only the Person name was received (extracted by template)
+      assert_receive {:received_message, {:string, "Alice"}}, 100
+      refute_receive {:received_message, _}, 100
 
       GenServer.stop(actor)
     end
@@ -96,7 +101,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "passthrough caveat allows all assertions" do
       {:ok, actor} = Actor.start_link(id: :assert_passthrough_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate with passthrough
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.passthrough())
@@ -104,23 +109,50 @@ defmodule Absynthe.Integration.AttenuationTest do
       # Assert through attenuated ref
       {:ok, _handle} = Actor.assert(actor, attenuated_ref, {:integer, 42})
 
-      Process.sleep(50)
+      # Verify assertion was received
+      assert_receive {:received_assert, {:integer, 42}}, 100
 
       GenServer.stop(actor)
     end
 
-    test "reject caveat blocks all assertions" do
+    test "reject caveat blocks all assertions and returns error" do
       {:ok, actor} = Actor.start_link(id: :assert_reject_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate with reject
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.reject())
 
-      # Assert through attenuated ref (should be rejected)
-      {:ok, _handle} = Actor.assert(actor, attenuated_ref, {:integer, 42})
+      # Assert through attenuated ref (should be rejected with error)
+      assert {:error, :attenuation_rejected} =
+               Actor.assert(actor, attenuated_ref, {:integer, 42})
 
-      Process.sleep(50)
+      # Verify assertion was NOT received
+      refute_receive {:received_assert, _}, 100
+
+      GenServer.stop(actor)
+    end
+
+    test "pattern caveat blocks non-matching assertions and returns error" do
+      {:ok, actor} = Actor.start_link(id: :assert_pattern_test)
+
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
+
+      # Attenuate to only allow Person records
+      pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$"}]}}
+      {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.rewrite(pattern, {:ref, 0}))
+
+      # Assert matching value - should succeed
+      person = {:record, {{:symbol, "Person"}, [{:string, "Bob"}]}}
+      {:ok, _handle} = Actor.assert(actor, attenuated_ref, person)
+
+      # Assert non-matching value - should fail
+      animal = {:record, {{:symbol, "Animal"}, [{:string, "Cat"}]}}
+      assert {:error, :attenuation_rejected} = Actor.assert(actor, attenuated_ref, animal)
+
+      # Verify only the Person name was received (extracted by template)
+      assert_receive {:received_assert, {:string, "Bob"}}, 100
+      refute_receive {:received_assert, _}, 100
 
       GenServer.stop(actor)
     end
@@ -130,7 +162,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "caveat can transform values" do
       {:ok, actor} = Actor.start_link(id: :transform_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate to wrap all values in a Wrapped record
       caveat =
@@ -144,7 +176,9 @@ defmodule Absynthe.Integration.AttenuationTest do
       # Send a simple integer - it should be wrapped
       Actor.send_message(actor, attenuated_ref, {:integer, 42})
 
-      Process.sleep(50)
+      # Verify the wrapped value was received
+      expected = {:record, {{:symbol, "Wrapped"}, [{:integer, 42}]}}
+      assert_receive {:received_message, ^expected}, 100
 
       GenServer.stop(actor)
     end
@@ -152,7 +186,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "caveat can extract fields from records" do
       {:ok, actor} = Actor.start_link(id: :extract_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate to extract name from Person records
       pattern = {:record, {{:symbol, "Person"}, [{:symbol, "$name"}, {:symbol, "_"}]}}
@@ -164,7 +198,8 @@ defmodule Absynthe.Integration.AttenuationTest do
       person = {:record, {{:symbol, "Person"}, [{:string, "Alice"}, {:integer, 30}]}}
       Actor.send_message(actor, attenuated_ref, person)
 
-      Process.sleep(50)
+      # Verify only the name was received (extracted by template)
+      assert_receive {:received_message, {:string, "Alice"}}, 100
 
       GenServer.stop(actor)
     end
@@ -188,7 +223,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "composed caveats apply in order" do
       {:ok, actor} = Actor.start_link(id: :compose_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # First caveat: passthrough
       {:ok, ref1} = Ref.attenuate(ref, Caveat.passthrough())
@@ -199,7 +234,26 @@ defmodule Absynthe.Integration.AttenuationTest do
       # Should still allow messages
       Actor.send_message(actor, ref2, {:integer, 42})
 
-      Process.sleep(50)
+      assert_receive {:received_message, {:integer, 42}}, 100
+
+      GenServer.stop(actor)
+    end
+
+    test "composed reject blocks even with passthrough inner" do
+      {:ok, actor} = Actor.start_link(id: :compose_reject_test)
+
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
+
+      # First caveat: passthrough
+      {:ok, ref1} = Ref.attenuate(ref, Caveat.passthrough())
+
+      # Second caveat (outer): reject
+      {:ok, ref2} = Ref.attenuate(ref1, Caveat.reject())
+
+      # Should block messages due to outer reject
+      Actor.send_message(actor, ref2, {:integer, 42})
+
+      refute_receive {:received_message, _}, 100
 
       GenServer.stop(actor)
     end
@@ -209,7 +263,7 @@ defmodule Absynthe.Integration.AttenuationTest do
     test "unattenuated ref has no filtering" do
       {:ok, actor} = Actor.start_link(id: :unattenuated_test)
 
-      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %RecordingEntity{test_pid: self()})
 
       # No attenuation
       assert Ref.attenuation(ref) == nil
@@ -219,7 +273,8 @@ defmodule Absynthe.Integration.AttenuationTest do
       Actor.send_message(actor, ref, {:integer, 42})
       Actor.send_message(actor, ref, {:string, "hello"})
 
-      Process.sleep(50)
+      assert_receive {:received_message, {:integer, 42}}, 100
+      assert_receive {:received_message, {:string, "hello"}}, 100
 
       GenServer.stop(actor)
     end
@@ -248,11 +303,12 @@ defmodule Absynthe.Integration.AttenuationTest do
 
   describe "cross-actor attenuation" do
     test "attenuation applies to remote delivery" do
-      {:ok, sender} = Actor.start_link(id: :attenuation_sender)
-      {:ok, receiver} = Actor.start_link(id: :attenuation_receiver)
+      # Must register names for cross-actor routing to work
+      {:ok, sender} = Actor.start_link(id: :attenuation_sender, name: :attenuation_sender)
+      {:ok, receiver} = Actor.start_link(id: :attenuation_receiver, name: :attenuation_receiver)
 
       # Spawn entity in receiver
-      {:ok, ref} = Actor.spawn_entity(receiver, :root, %RecordingEntity{})
+      {:ok, ref} = Actor.spawn_entity(receiver, :root, %RecordingEntity{test_pid: self()})
 
       # Attenuate the ref
       {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.passthrough())
@@ -260,7 +316,27 @@ defmodule Absynthe.Integration.AttenuationTest do
       # Send from sender through attenuated ref to receiver
       Actor.send_message(sender, attenuated_ref, {:string, "cross-actor"})
 
-      Process.sleep(50)
+      assert_receive {:received_message, {:string, "cross-actor"}}, 100
+
+      GenServer.stop(sender)
+      GenServer.stop(receiver)
+    end
+
+    test "cross-actor reject caveat blocks messages" do
+      # Must register names for cross-actor routing to work
+      {:ok, sender} = Actor.start_link(id: :cross_reject_sender, name: :cross_reject_sender)
+      {:ok, receiver} = Actor.start_link(id: :cross_reject_receiver, name: :cross_reject_receiver)
+
+      # Spawn entity in receiver
+      {:ok, ref} = Actor.spawn_entity(receiver, :root, %RecordingEntity{test_pid: self()})
+
+      # Attenuate with reject
+      {:ok, attenuated_ref} = Ref.attenuate(ref, Caveat.reject())
+
+      # Send from sender - should be rejected
+      Actor.send_message(sender, attenuated_ref, {:string, "should-not-arrive"})
+
+      refute_receive {:received_message, _}, 100
 
       GenServer.stop(sender)
       GenServer.stop(receiver)
