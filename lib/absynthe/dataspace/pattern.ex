@@ -79,7 +79,6 @@ defmodule Absynthe.Dataspace.Pattern do
   defstruct constraints: [], captures: [], original: nil
 
   @wildcard {:symbol, "_"}
-  @capture {:symbol, "$"}
 
   @doc """
   Compiles a pattern into an efficient matching structure.
@@ -291,8 +290,8 @@ defmodule Absynthe.Dataspace.Pattern do
     {[], []}
   end
 
-  defp compile_pattern(@capture, path) do
-    # Capture: no constraints, add current path to captures
+  defp compile_pattern({:symbol, "$" <> _}, path) do
+    # Capture (either "$" or "$name"): no constraints, add current path to captures
     {[], [Enum.reverse(path)]}
   end
 
