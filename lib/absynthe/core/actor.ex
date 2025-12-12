@@ -202,7 +202,14 @@ defmodule Absynthe.Core.Actor do
           entities: %{entity_id() => {facet_id(), term()}},
           outbound_assertions: %{Handle.t() => {Ref.t(), term()}},
           # Maps each facet to its owned assertion handles for automatic cleanup
-          facet_handles: %{facet_id() => MapSet.t(Handle.t())}
+          facet_handles: %{facet_id() => MapSet.t(Handle.t())},
+          # Tracks inbound assertions from remote actors for crash cleanup
+          # Maps handle -> {ref, assertion, owner_pid}
+          inbound_assertions: %{Handle.t() => {Ref.t(), term(), pid()}},
+          # Maps owner_pid -> MapSet of handles from that owner
+          owner_handles: %{pid() => MapSet.t(Handle.t())},
+          # Maps pid -> monitor_ref for demonitoring when no longer needed
+          pid_monitors: %{pid() => reference()}
         }
 
   @typedoc """
@@ -490,7 +497,11 @@ defmodule Absynthe.Core.Actor do
       facets: %{root_facet_id => root_facet},
       entities: %{},
       outbound_assertions: %{},
-      facet_handles: %{root_facet_id => MapSet.new()}
+      facet_handles: %{root_facet_id => MapSet.new()},
+      # Crash cleanup tracking
+      inbound_assertions: %{},
+      owner_handles: %{},
+      pid_monitors: %{}
     }
 
     Logger.debug("Actor #{inspect(actor_id)} initialized with root facet #{root_facet_id}")
@@ -574,7 +585,15 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_cast({:deliver, ref, event}, state) do
-    new_state = deliver_event_impl(state, ref, event)
+    # Local delivery (no sender tracking needed - same actor owns the assertion)
+    new_state = deliver_event_impl(state, ref, event, nil)
+    {:noreply, new_state}
+  end
+
+  @impl GenServer
+  def handle_cast({:deliver_from, ref, event, sender_pid}, state) do
+    # Remote delivery with sender tracking for crash cleanup
+    new_state = deliver_event_impl(state, ref, event, sender_pid)
     {:noreply, new_state}
   end
 
@@ -731,11 +750,15 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc false
-  defp deliver_event_impl(state, ref, event) do
+  # sender_pid is nil for local deliveries, or the PID of the remote actor for remote deliveries
+  defp deliver_event_impl(state, ref, event, sender_pid) do
     entity_id = Ref.entity_id(ref)
 
     case Map.fetch(state.entities, entity_id) do
       {:ok, {facet_id, entity}} ->
+        # Track inbound assertions from remote actors for crash cleanup
+        state = maybe_track_inbound_assertion(state, event, ref, sender_pid)
+
         # Execute a turn for this event
         result = execute_turn(state, facet_id, entity_id, entity, event)
 
@@ -943,7 +966,8 @@ defmodule Absynthe.Core.Actor do
         case mode do
           :sync ->
             # Synchronous local delivery for internal operations (facet teardown)
-            deliver_event_impl(state, ref, event)
+            # nil sender_pid - we own these assertions, no crash tracking needed
+            deliver_event_impl(state, ref, event, nil)
 
           :async ->
             # Async local delivery for client-initiated operations
@@ -952,12 +976,13 @@ defmodule Absynthe.Core.Actor do
         end
 
       false ->
-        # Remote delivery - always async via cast
+        # Remote delivery - always async via cast, include sender PID for crash tracking
         remote_actor_id = Ref.actor_id(ref)
 
         case resolve_actor(remote_actor_id) do
           {:ok, actor_pid} ->
-            GenServer.cast(actor_pid, {:deliver, ref, event})
+            # Use :deliver_from to include sender PID for crash cleanup
+            GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
             state
 
           :error ->
@@ -975,16 +1000,17 @@ defmodule Absynthe.Core.Actor do
     case Ref.local?(ref, state.id) do
       true ->
         # Local delivery - process directly
-        deliver_event_impl(state, ref, event)
+        # nil sender_pid - we own these assertions, no crash tracking needed
+        deliver_event_impl(state, ref, event, nil)
 
       false ->
-        # Remote delivery - send to remote actor
-        # For now, attempt to find actor by ID if it's a PID or registered name
+        # Remote delivery - send to remote actor with sender PID for crash tracking
         remote_actor_id = Ref.actor_id(ref)
 
         case resolve_actor(remote_actor_id) do
           {:ok, actor_pid} ->
-            GenServer.cast(actor_pid, {:deliver, ref, event})
+            # Use :deliver_from to include sender PID for crash cleanup
+            GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
             state
 
           :error ->
@@ -995,6 +1021,111 @@ defmodule Absynthe.Core.Actor do
             state
         end
     end
+  end
+
+  # Track inbound assertions from remote actors for crash cleanup
+  # Only tracks assertions (not retractions or other events), and only from remote actors
+  defp maybe_track_inbound_assertion(
+         state,
+         %Assert{handle: handle, assertion: assertion},
+         ref,
+         sender_pid
+       )
+       when is_pid(sender_pid) do
+    # Monitor the sender if not already monitored
+    state =
+      if Map.has_key?(state.pid_monitors, sender_pid) do
+        state
+      else
+        monitor_ref = Process.monitor(sender_pid)
+        %{state | pid_monitors: Map.put(state.pid_monitors, sender_pid, monitor_ref)}
+      end
+
+    # Track the inbound assertion
+    state = %{
+      state
+      | inbound_assertions:
+          Map.put(state.inbound_assertions, handle, {ref, assertion, sender_pid})
+    }
+
+    # Track the handle for this owner
+    owner_handles = Map.get(state.owner_handles, sender_pid, MapSet.new())
+    owner_handles = MapSet.put(owner_handles, handle)
+    %{state | owner_handles: Map.put(state.owner_handles, sender_pid, owner_handles)}
+  end
+
+  # Track inbound retractions from remote actors - remove from tracking
+  defp maybe_track_inbound_assertion(state, %Retract{handle: handle}, _ref, sender_pid)
+       when is_pid(sender_pid) do
+    case Map.get(state.inbound_assertions, handle) do
+      nil ->
+        # Not tracking this handle, nothing to do
+        state
+
+      {_ref, _assertion, owner_pid} ->
+        # Remove from inbound_assertions
+        state = %{state | inbound_assertions: Map.delete(state.inbound_assertions, handle)}
+
+        # Remove from owner_handles
+        owner_handles = Map.get(state.owner_handles, owner_pid, MapSet.new())
+        owner_handles = MapSet.delete(owner_handles, handle)
+
+        if MapSet.size(owner_handles) == 0 do
+          # No more handles from this owner - demonitor and stop tracking
+          case Map.get(state.pid_monitors, owner_pid) do
+            nil ->
+              :ok
+
+            monitor_ref ->
+              Process.demonitor(monitor_ref, [:flush])
+          end
+
+          state
+          |> Map.put(:owner_handles, Map.delete(state.owner_handles, owner_pid))
+          |> Map.put(:pid_monitors, Map.delete(state.pid_monitors, owner_pid))
+        else
+          %{state | owner_handles: Map.put(state.owner_handles, owner_pid, owner_handles)}
+        end
+    end
+  end
+
+  # For local deliveries (nil sender_pid) or other event types, no tracking needed
+  defp maybe_track_inbound_assertion(state, _event, _ref, _sender_pid), do: state
+
+  # Handle a crashed owner - retract all their assertions
+  defp handle_owner_crash(state, owner_pid) do
+    handles = Map.get(state.owner_handles, owner_pid, MapSet.new())
+
+    Logger.debug(
+      "Actor #{inspect(state.id)}: Owner #{inspect(owner_pid)} crashed, retracting #{MapSet.size(handles)} assertions"
+    )
+
+    # For each handle, deliver a retraction event to the entity that holds the assertion
+    state =
+      Enum.reduce(handles, state, fn handle, acc_state ->
+        case Map.get(acc_state.inbound_assertions, handle) do
+          nil ->
+            # Already retracted, skip
+            acc_state
+
+          {ref, _assertion, _owner_pid} ->
+            # Deliver retraction to the entity (local delivery, synchronous)
+            event = Event.retract(ref, handle)
+            deliver_event_impl(acc_state, ref, event, nil)
+        end
+      end)
+
+    # Clean up tracking state
+    state = %{state | owner_handles: Map.delete(state.owner_handles, owner_pid)}
+    state = %{state | pid_monitors: Map.delete(state.pid_monitors, owner_pid)}
+
+    # Clean up inbound_assertions for this owner
+    inbound_assertions =
+      Enum.reduce(handles, state.inbound_assertions, fn handle, acc ->
+        Map.delete(acc, handle)
+      end)
+
+    %{state | inbound_assertions: inbound_assertions}
   end
 
   # Resolve an actor ID to a PID
@@ -1010,6 +1141,13 @@ defmodule Absynthe.Core.Actor do
   end
 
   defp resolve_actor(_), do: :error
+
+  # Handle monitored process DOWN - auto-retract crashed actor's assertions
+  @impl GenServer
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    new_state = handle_owner_crash(state, pid)
+    {:noreply, new_state}
+  end
 
   # Cleanup on termination
   @impl GenServer
@@ -1029,7 +1167,8 @@ defmodule Absynthe.Core.Actor do
 
         case resolve_actor(remote_actor_id) do
           {:ok, actor_pid} ->
-            GenServer.cast(actor_pid, {:deliver, ref, event})
+            # Use :deliver_from so receiver can untrack the assertion before DOWN arrives
+            GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
 
           :error ->
             :ok

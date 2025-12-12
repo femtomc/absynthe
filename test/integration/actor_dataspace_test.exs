@@ -283,4 +283,185 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
       GenServer.stop(actor2)
     end
   end
+
+  describe "crash cleanup" do
+    test "assertions are auto-retracted when asserting actor crashes" do
+      # Start two actors
+      {:ok, receiver} = Actor.start_link(id: :crash_receiver, name: :crash_receiver)
+
+      # Start asserter - unlink from test process so we can kill it without crashing the test
+      {:ok, asserter} = Actor.start_link(id: :crash_asserter, name: :crash_asserter)
+      Process.unlink(asserter)
+
+      # Create collector in receiver
+      collector = %CollectorEntity{}
+      {:ok, collector_ref} = Actor.spawn_entity(receiver, :root, collector)
+
+      # Create a cross-actor ref pointing to receiver's collector
+      cross_actor_ref = %Ref{actor_id: :crash_receiver, entity_id: Ref.entity_id(collector_ref)}
+
+      # Assert from asserter to receiver
+      {:ok, handle} = Actor.assert(asserter, cross_actor_ref, {:string, "will-be-orphaned"})
+
+      # Give time for assertion to arrive
+      Process.sleep(100)
+
+      # Verify assertion was received
+      state = :sys.get_state(receiver)
+      {_fid, collector_state} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      asserts =
+        Enum.filter(collector_state.received, fn
+          {:assert, _, _} -> true
+          _ -> false
+        end)
+
+      assert length(asserts) == 1
+      assert [{:assert, {:string, "will-be-orphaned"}, ^handle}] = asserts
+
+      # Kill the asserter abruptly (simulating a crash, not normal termination)
+      Process.exit(asserter, :kill)
+
+      # Give time for DOWN message to be processed
+      Process.sleep(100)
+
+      # Verify retraction was auto-generated
+      state = :sys.get_state(receiver)
+      {_fid, collector_state} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      retracts =
+        Enum.filter(collector_state.received, fn
+          {:retract, _} -> true
+          _ -> false
+        end)
+
+      assert length(retracts) == 1
+      assert [{:retract, ^handle}] = retracts
+
+      GenServer.stop(receiver)
+    end
+
+    test "multiple assertions from crashed actor are all retracted" do
+      {:ok, receiver} = Actor.start_link(id: :multi_crash_receiver, name: :multi_crash_receiver)
+      {:ok, asserter} = Actor.start_link(id: :multi_crash_asserter, name: :multi_crash_asserter)
+      Process.unlink(asserter)
+
+      # Create collector in receiver
+      collector = %CollectorEntity{}
+      {:ok, collector_ref} = Actor.spawn_entity(receiver, :root, collector)
+      cross_ref = %Ref{actor_id: :multi_crash_receiver, entity_id: Ref.entity_id(collector_ref)}
+
+      # Make multiple assertions
+      {:ok, h1} = Actor.assert(asserter, cross_ref, {:string, "first"})
+      {:ok, h2} = Actor.assert(asserter, cross_ref, {:string, "second"})
+      {:ok, h3} = Actor.assert(asserter, cross_ref, {:string, "third"})
+
+      Process.sleep(100)
+
+      # Verify all assertions received
+      state = :sys.get_state(receiver)
+      {_fid, collector_state} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      asserts =
+        Enum.filter(collector_state.received, fn
+          {:assert, _, _} -> true
+          _ -> false
+        end)
+
+      assert length(asserts) == 3
+
+      # Kill the asserter
+      Process.exit(asserter, :kill)
+      Process.sleep(100)
+
+      # Verify all assertions were retracted
+      state = :sys.get_state(receiver)
+      {_fid, collector_state} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      retracts =
+        Enum.filter(collector_state.received, fn
+          {:retract, _} -> true
+          _ -> false
+        end)
+
+      assert length(retracts) == 3
+
+      # Verify the correct handles were retracted
+      retracted_handles = Enum.map(retracts, fn {:retract, h} -> h end) |> MapSet.new()
+      assert MapSet.member?(retracted_handles, h1)
+      assert MapSet.member?(retracted_handles, h2)
+      assert MapSet.member?(retracted_handles, h3)
+
+      GenServer.stop(receiver)
+    end
+
+    test "dataspace assertions are cleaned up on actor crash" do
+      # This tests that assertions to a dataspace are properly retracted
+      # when the asserting actor crashes
+
+      {:ok, ds_actor} = Actor.start_link(id: :ds_crash_cleanup, name: :ds_crash_cleanup)
+      {:ok, asserter} = Actor.start_link(id: :ds_asserter_crash, name: :ds_asserter_crash)
+      Process.unlink(asserter)
+
+      # Create dataspace entity
+      dataspace = Dataspace.new()
+      {:ok, ds_ref} = Actor.spawn_entity(ds_actor, :root, dataspace)
+      ds_cross_ref = %Ref{actor_id: :ds_crash_cleanup, entity_id: Ref.entity_id(ds_ref)}
+
+      # Assert to dataspace
+      {:ok, _h} = Actor.assert(asserter, ds_cross_ref, {:string, "crashable-assertion"})
+
+      Process.sleep(100)
+
+      # Verify assertion is in dataspace
+      state = :sys.get_state(ds_actor)
+      {_fid, ds_state} = Map.get(state.entities, Ref.entity_id(ds_ref))
+      assert Dataspace.has_assertion?(ds_state, {:string, "crashable-assertion"})
+
+      # Kill the asserter
+      Process.exit(asserter, :kill)
+      Process.sleep(100)
+
+      # Verify assertion was removed from dataspace
+      state = :sys.get_state(ds_actor)
+      {_fid, ds_state} = Map.get(state.entities, Ref.entity_id(ds_ref))
+      refute Dataspace.has_assertion?(ds_state, {:string, "crashable-assertion"})
+
+      GenServer.stop(ds_actor)
+    end
+
+    test "normal termination sends retractions without double-retract" do
+      # This verifies that normal termination (GenServer.stop) doesn't cause
+      # double retractions due to both terminate/2 and DOWN monitoring
+
+      {:ok, receiver} = Actor.start_link(id: :no_double_receiver, name: :no_double_receiver)
+      {:ok, asserter} = Actor.start_link(id: :no_double_asserter, name: :no_double_asserter)
+
+      collector = %CollectorEntity{}
+      {:ok, collector_ref} = Actor.spawn_entity(receiver, :root, collector)
+      cross_ref = %Ref{actor_id: :no_double_receiver, entity_id: Ref.entity_id(collector_ref)}
+
+      {:ok, handle} = Actor.assert(asserter, cross_ref, {:string, "normal-term"})
+      Process.sleep(100)
+
+      # Stop asserter normally
+      GenServer.stop(asserter)
+      Process.sleep(100)
+
+      # Verify exactly one retraction
+      state = :sys.get_state(receiver)
+      {_fid, collector_state} = Map.get(state.entities, Ref.entity_id(collector_ref))
+
+      retracts =
+        Enum.filter(collector_state.received, fn
+          {:retract, _} -> true
+          _ -> false
+        end)
+
+      assert length(retracts) == 1
+      assert [{:retract, ^handle}] = retracts
+
+      GenServer.stop(receiver)
+    end
+  end
 end

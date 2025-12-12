@@ -4,17 +4,31 @@
   <img src="assets/logo.png" alt="Absynthe Logo" width="400" height="400">
 </p>
 
-An implementation of [Tony Garnock-Jones' Syndicated Actor Model](https://syndicate-lang.org/) for Elixir.
+Syndicated Actor Model (SAM) for Elixir. Absynthe follows Tony Garnock-Jones' work on [Syndicate](https://syndicate-lang.org/about/) and the [Synit](https://synit.org/) documentation: actors exchange persistent assertions via shared dataspaces, reason with patterns, and run in atomic turns.
 
-## What is the Syndicated Actor Model?
+## Why Absynthe?
 
-The Syndicated Actor Model (SAM) extends traditional actors with:
+- Implements SAM semantics on the BEAM: assertions, Observe subscriptions, turns, and fate-sharing facets.
+- Preserves data format with binary and text encoders/decoders for interop and debugging.
+- Turn-based execution keeps entity state updates and outbound effects atomic.
+- Dataspaces with compiled patterns and handles (reference-counted assertions) for predictable coordination.
+- Optional reactive dataflow cells for derived state inside an actor.
 
-- **Assertions** - Persistent facts that remain until retracted (vs ephemeral messages)
-- **Dataspaces** - Shared tuple spaces where actors publish and observe assertions
-- **Pattern matching** - Subscribe to assertions matching patterns with wildcards/captures
-- **Turns** - Atomic transactions ensuring all-or-nothing updates
-- **Facets** - Scoped conversations with fate-sharing (parent dies, children die)
+## Project status
+
+- Experimental/alpha; APIs may change.
+- Single-node only; dataspaces are local entities, no distribution or persistence yet.
+- Best for learning/experimentation with SAM concepts; see `test/` and `examples/` for coverage of current behavior.
+
+## Syndicate primer (concepts & mapping)
+
+- `Actor` (GenServer) hosts entities and processes events inside *turns*.
+- `Entity` implements `Absynthe.Core.Entity` callbacks: `on_message/3`, `on_publish/4`, `on_retract/3`, `on_sync/3`.
+- `Assertion` is a persistent fact; identified by a `Absynthe.Assertions.Handle`. Assertions remain until fully retracted.
+- `Dataspace` routes assertions to observers. Subscriptions are `Observe` assertions with a pattern and an observer `Ref`.
+- `Facet` is a conversational scope; create via `Absynthe.create_facet/3`, terminate via `Absynthe.terminate_facet/2` (fate-sharing).
+- `Turn` is the atomic unit of execution; handlers add actions and the actor commits or discards them together.
+- `Preserves` is the data model: tagged tuples with records, sets, sequences, and embedded refs. Patterns use `wildcard/0` and `capture/1`.
 
 ## Installation
 
@@ -28,11 +42,9 @@ def deps do
 end
 ```
 
-## Quick Start
+## Quick start
 
-### 1. Define an Entity
-
-Entities are the computational objects within actors. They implement the `Entity` protocol:
+### Messages inside one actor
 
 ```elixir
 defmodule Counter do
@@ -50,221 +62,154 @@ defimpl Absynthe.Core.Entity, for: Counter do
     {counter, turn}
   end
 
-  # Required callbacks
   def on_publish(entity, _assertion, _handle, turn), do: {entity, turn}
   def on_retract(entity, _handle, turn), do: {entity, turn}
   def on_sync(entity, _peer, turn), do: {entity, turn}
 end
-```
 
-### 2. Start an Actor and Spawn Entities
-
-```elixir
-# Start an actor
 {:ok, actor} = Absynthe.start_actor(id: :counter_actor)
+{:ok, counter_ref} = Absynthe.spawn_entity(actor, :root, %Counter{})
 
-# Spawn a counter entity in the root facet
-{:ok, counter_ref} = Absynthe.spawn_entity(actor, :root, %Counter{count: 0})
-
-# Send messages
 Absynthe.send_to(actor, counter_ref, {:add, 5})
 Absynthe.send_to(actor, counter_ref, {:add, 3})
 Absynthe.send_to(actor, counter_ref, :get)
-# Output:
-# Counter: 0 + 5 = 5
-# Counter: 5 + 3 = 8
-# Counter value: 8
 ```
 
-### 3. Using Dataspaces
-
-Dataspaces are shared spaces where actors publish and subscribe to assertions:
+### Dataspace presence (assert/observe)
 
 ```elixir
 defmodule PresenceObserver do
   defstruct users: []
+
+  defimpl Absynthe.Core.Entity do
+    def on_publish(observer, {:record, {{:symbol, "Online"}, [{:string, name}]}}, _h, turn) do
+      IO.puts("Online: #{name}")
+      {%{observer | users: [name | observer.users]}, turn}
+    end
+
+    def on_retract(observer, _handle, turn) do
+      IO.puts("Someone went offline")
+      {observer, turn}
+    end
+
+    def on_message(entity, _msg, turn), do: {entity, turn}
+    def on_sync(entity, _peer, turn), do: {entity, turn}
+  end
 end
 
-defimpl Absynthe.Core.Entity, for: PresenceObserver do
-  def on_publish(observer, {:record, {{:symbol, "Online"}, [{:string, username}]}}, _handle, turn) do
-    IO.puts("User came online: #{username}")
-    {%{observer | users: [username | observer.users]}, turn}
-  end
-
-  def on_retract(observer, _handle, turn) do
-    IO.puts("A user went offline")
-    {observer, turn}
-  end
-
-  def on_message(entity, _msg, turn), do: {entity, turn}
-  def on_sync(entity, _peer, turn), do: {entity, turn}
-end
-
-# Create dataspace and observer
 {:ok, actor} = Absynthe.start_actor(id: :presence)
 dataspace = Absynthe.new_dataspace()
 {:ok, ds_ref} = Absynthe.spawn_entity(actor, :root, dataspace)
 {:ok, obs_ref} = Absynthe.spawn_entity(actor, :root, %PresenceObserver{})
 
-# Subscribe observer to Online records
-observe_assertion = Absynthe.observe(
-  Absynthe.record(:Online, [Absynthe.wildcard()]),
-  obs_ref
-)
-{:ok, _} = Absynthe.assert_to(actor, ds_ref, observe_assertion)
+# Subscribe to Online records
+observe = Absynthe.observe(Absynthe.record(:Online, [Absynthe.wildcard()]), obs_ref)
+{:ok, _} = Absynthe.assert_to(actor, ds_ref, observe)
 
-# Publish presence
-online = Absynthe.record(:Online, ["alice"])
-{:ok, handle} = Absynthe.assert_to(actor, ds_ref, online)
-# Output: User came online: alice
-
-# Retract when going offline
-Absynthe.retract_from(actor, handle)
-# Output: A user went offline
+# Publish/retract presence
+{:ok, handle} = Absynthe.assert_to(actor, ds_ref, Absynthe.record(:Online, ["alice"]))
+:ok = Absynthe.retract_from(actor, handle)
 ```
 
-## Core Concepts
+See `examples/presence.exs` and `examples/ping_pong.exs` for runnable versions (use `MIX_ENV=test mix run ...` to avoid protocol consolidation).
 
-### Preserves Values
+## Working in entity callbacks
 
-Absynthe uses Preserves as its data format. Values are tagged tuples:
+Entity callbacks receive a `Turn`. Use the helpers to queue work that will commit atomically:
 
 ```elixir
-# Atomic types
-{:boolean, true}
-{:integer, 42}
-{:double, 3.14}
-{:string, "hello"}
-{:symbol, "MySymbol"}
-{:binary, <<1, 2, 3>>}
+defimpl Absynthe.Core.Entity, for: MySession do
+  alias Absynthe.Protocol.Event
+  alias Absynthe.Core.Turn
 
-# Compound types
-{:sequence, [{:integer, 1}, {:integer, 2}]}
-{:set, MapSet.new([{:integer, 1}, {:integer, 2}])}
-{:dictionary, %{{:symbol, "key"} => {:string, "value"}}}
-{:record, {{:symbol, "Person"}, [{:string, "Alice"}, {:integer, 30}]}}
+  def on_message(state, {:ping, reply_to}, turn) do
+    turn = Absynthe.send_message(turn, reply_to, :pong)
+    {state, turn}
+  end
 
-# Embedded references (for entity refs)
-{:embedded, some_ref}
+  def on_message(%{dataspace: ds, last_handle: handle} = state, :leave, turn) do
+    # Retract a prior assertion you stored
+    turn = Absynthe.retract_value(turn, ds, handle)
+    {state, turn}
+  end
+end
 ```
 
-Helper functions make construction easier:
+From outside an actor, use the high-level API (`assert_to/3`, `retract_from/2`, `send_to/3`) and keep the returned handles if you need to retract later.
+
+## Patterns and Observe assertions
+
+Patterns are Preserves values with wildcards and captures:
 
 ```elixir
-Absynthe.symbol(:Person)           # {:symbol, "Person"}
-Absynthe.record(:Person, ["Alice", 30])  # Full record with auto-conversion
-```
-
-### Encoding/Decoding
-
-```elixir
-# Binary format (compact, for wire)
-binary = Absynthe.encode!({:integer, 42})
-{:integer, 42} = Absynthe.decode!(binary)
-
-# Text format (human readable)
-text = Absynthe.encode!({:string, "hello"}, :text)
-# => "\"hello\""
-```
-
-### Actors and Entities
-
-- **Actor**: A GenServer process hosting entities
-- **Entity**: A struct implementing `Absynthe.Core.Entity` protocol
-- **Ref**: A capability/reference to send messages to an entity
-
-```elixir
-{:ok, actor} = Absynthe.start_actor(id: :my_actor, name: MyApp.Actor)
-{:ok, ref} = Absynthe.spawn_entity(actor, :root, %MyEntity{})
-```
-
-### Facets (Conversations)
-
-Facets provide scoped lifetimes with fate-sharing:
-
-```elixir
-# Create a child facet
-:ok = Absynthe.create_facet(actor, :root, :session_123)
-
-# Spawn entities in the facet
-{:ok, ref} = Absynthe.spawn_entity(actor, :session_123, entity)
-
-# Terminate facet (kills all entities in it)
-:ok = Absynthe.terminate_facet(actor, :session_123)
-```
-
-### Pattern Matching
-
-Use patterns to subscribe to specific assertions:
-
-```elixir
-# Match any Person record
-Absynthe.record(:Person, [Absynthe.wildcard(), Absynthe.wildcard()])
-
-# Capture the name field
 Absynthe.record(:Person, [Absynthe.capture(:name), Absynthe.wildcard()])
 ```
 
-### Reactive Dataflow
+Subscriptions are assertions of the form:
 
-Fields are reactive cells that automatically propagate changes:
+```elixir
+observe = Absynthe.observe(pattern, observer_ref)
+{:ok, _handle} = Absynthe.assert_to(actor, dataspace_ref, observe)
+```
+
+The dataspace compiles patterns for fast routing and reference-counts assertions so repeated asserts/retracts behave predictably.
+
+## Preserves cheat sheet
+
+```elixir
+{:integer, 42}
+{:string, "hi"}
+{:boolean, true}
+{:symbol, "Online"}
+{:sequence, [{:integer, 1}, {:integer, 2}]}
+{:record, {{:symbol, "Person"}, [{:string, "Alice"}, {:integer, 30}]}}
+{:embedded, ref} # for entity refs/capabilities
+
+Absynthe.record(:Person, ["Alice", 30])   # helper
+Absynthe.encode!({:integer, 42})          # binary format
+Absynthe.encode!({:string, "hello"}, :text) # readable text format
+Absynthe.decode!(binary)
+```
+
+## Reactive dataflow (optional)
+
+`Absynthe.Dataflow.Field` provides reactive cells that integrate with turns:
 
 ```elixir
 alias Absynthe.Dataflow.Field
+alias Absynthe.Core.Turn
 
-# Simple fields
-x = Field.new(10)
-y = Field.new(20)
+x = Field.new(2)
+y = Field.new(3)
+sum = Field.computed(fn -> Field.get(x) + Field.get(y) end)
 
-# Computed field (auto-updates when dependencies change)
-sum = Field.computed(fn ->
-  Field.get(x) + Field.get(y)
-end)
-
-Field.get(sum)  # => 30
-
-# Update via turn
-turn = Absynthe.Core.Turn.new(:actor, :facet)
-turn = Field.set(x, 15, turn)
+turn = Turn.new(:actor, :facet) |> Field.set(x, 10)
 Field.commit_field_updates(turn)
-
-Field.get(sum)  # => 35 (automatically recomputed)
+Field.get(sum) # => 13
 ```
 
-## Architecture
+## Running and testing
 
-```
-Absynthe
-├── Core
-│   ├── Actor      - GenServer-based actor process
-│   ├── Entity     - Protocol for message/assertion handling
-│   ├── Turn       - Atomic transaction context
-│   ├── Facet      - Scoped conversation management
-│   └── Ref        - Entity references/capabilities
-├── Dataspace
-│   ├── Dataspace  - Assertion routing entity
-│   ├── Skeleton   - ETS-based pattern index
-│   ├── Pattern    - Pattern compilation
-│   └── Observer   - Subscription handling
-├── Dataflow
-│   ├── Field      - Reactive cells
-│   └── Registry   - ETS-based field storage
-├── Preserves
-│   ├── Value      - Tagged union types
-│   ├── Compare    - Total ordering
-│   ├── Pattern    - Pattern matching
-│   └── Encoder/Decoder - Binary & text formats
-└── Protocol
-    └── Event      - Assert/Retract/Message/Sync
-```
+- Run the examples: `MIX_ENV=test mix run examples/ping_pong.exs` or `examples/presence.exs`.
+- Interactive shell: `iex -S mix` (compile once with `MIX_ENV=test` if you need dynamic protocol implementations).
+- Test suite: `mix test`.
+
+## Architecture (high level)
+
+- `Absynthe.Core.*`: Actor, Entity protocol, Ref, Facet, Turn (transaction boundary).
+- `Absynthe.Dataspace.*`: Dataspace entity, pattern compiler, observer skeleton.
+- `Absynthe.Assertions.*`: Handles and reference-counted assertion bag.
+- `Absynthe.Preserves.*`: Data model, encoders/decoders, pattern matching.
+- `Absynthe.Dataflow.*`: Reactive fields and registry.
 
 ## References
 
-- [Syndicate Lang](https://syndicate-lang.org/) - Official project site
-- [PhD Dissertation](https://syndicate-lang.org/tonyg-dissertation/html/) - Tony Garnock-Jones' thesis
-- [Preserves Spec](https://preserves.gitlab.io/preserves/preserves.html) - Data format specification
-- [syndicate-rs](https://git.syndicate-lang.org/syndicate-lang/syndicate-rs) - Rust implementation
+- [Synit](https://synit.org/) – overview of the Syndicated Interaction Toolkit.
+- [Syndicate](https://syndicate-lang.org/about/) – background on the Syndicated Actor Model.
+- [Tony Garnock-Jones' dissertation](https://syndicate-lang.org/tonyg-dissertation/html/).
+- [Preserves specification](https://preserves.gitlab.io/preserves/preserves.html).
+- [syndicate-rs](https://git.syndicate-lang.org/syndicate-lang/syndicate-rs) – Rust implementation.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License – see `LICENSE`.
