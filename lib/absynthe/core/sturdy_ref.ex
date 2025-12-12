@@ -263,8 +263,11 @@ defmodule Absynthe.Core.SturdyRef do
   def materialize(%__MODULE__{} = sref, key, resolver) when is_function(resolver, 1) do
     with :ok <- validate(sref, key),
          {:ok, {actor_id, entity_id}} <- resolver.(sref.oid) do
-      # Build attenuation from caveats
-      attenuation = if sref.caveats == [], do: nil, else: sref.caveats
+      # Build attenuation from caveats.
+      # SturdyRef stores caveats in signature-chain order (oldest first: [c1, c2, c3])
+      # but Ref.attenuate uses outer-first order (newest first: [c3, c2, c1]).
+      # Reverse to match Ref.attenuate semantics so outer caveats apply first.
+      attenuation = if sref.caveats == [], do: nil, else: Enum.reverse(sref.caveats)
       ref = Absynthe.Core.Ref.new(actor_id, entity_id, attenuation)
       {:ok, ref}
     end

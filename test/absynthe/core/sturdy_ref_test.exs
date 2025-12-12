@@ -219,6 +219,28 @@ defmodule Absynthe.Core.SturdyRefTest do
       assert ref.attenuation == [Caveat.passthrough()]
     end
 
+    test "materializes with outer-first caveat order (newest caveat applied first)" do
+      key = test_key()
+      {:ok, sref} = SturdyRef.mint({:symbol, "my-entity"}, key)
+
+      # Add caveats in order: c1 (first/oldest), then c2 (second/newest)
+      c1 = Caveat.passthrough()
+      c2 = Caveat.reject()
+
+      {:ok, a1} = SturdyRef.attenuate(sref, c1, key)
+      {:ok, a2} = SturdyRef.attenuate(a1, c2, key)
+
+      # SturdyRef stores in signature-chain order (oldest first)
+      assert a2.caveats == [c1, c2]
+
+      resolver = fn {:symbol, "my-entity"} -> {:ok, {:my_actor, :my_entity}} end
+      {:ok, ref} = SturdyRef.materialize(a2, key, resolver)
+
+      # Materialized Ref should have outer-first order (newest first)
+      # This matches Ref.attenuate semantics where outer caveats apply first
+      assert ref.attenuation == [c2, c1]
+    end
+
     test "rejects invalid SturdyRef" do
       key = test_key()
       {:ok, sref} = SturdyRef.mint({:symbol, "my-entity"}, key)
