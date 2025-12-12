@@ -52,15 +52,20 @@ defmodule Absynthe.Protocol.Event do
     An assertion represents a fact that is published to an entity and persists
     until explicitly retracted. The handle uniquely identifies this assertion
     for later retraction.
+
+    When an observer's pattern includes captures (e.g., `$age` or `{:capture, :age}`),
+    the captured values are included in the `captures` field as a list in the order
+    they appear in the pattern.
     """
 
     @enforce_keys [:ref, :assertion, :handle]
-    defstruct [:ref, :assertion, :handle]
+    defstruct [:ref, :assertion, :handle, captures: []]
 
     @type t :: %__MODULE__{
             ref: Absynthe.Core.Ref.t(),
             assertion: Absynthe.Preserves.Value.t(),
-            handle: Absynthe.Assertions.Handle.t()
+            handle: Absynthe.Assertions.Handle.t(),
+            captures: [Absynthe.Preserves.Value.t()]
           }
   end
 
@@ -127,6 +132,7 @@ defmodule Absynthe.Protocol.Event do
     - `ref` - The target entity reference
     - `assertion` - The Preserves value to assert
     - `handle` - Unique handle for later retraction
+    - `captures` - (optional) List of captured values from pattern matching
 
   ## Examples
 
@@ -135,17 +141,25 @@ defmodule Absynthe.Protocol.Event do
       iex> event = Absynthe.Protocol.Event.assert(ref, {:string, "test"}, handle)
       iex> Absynthe.Protocol.Event.assert?(event)
       true
+
+      # With captures
+      iex> captures = [{:integer, 30}]
+      iex> event = Absynthe.Protocol.Event.assert(ref, assertion, handle, captures)
+      iex> event.captures
+      [{:integer, 30}]
   """
   @spec assert(
           Absynthe.Core.Ref.t(),
           Absynthe.Preserves.Value.t(),
-          Absynthe.Assertions.Handle.t()
+          Absynthe.Assertions.Handle.t(),
+          [Absynthe.Preserves.Value.t()]
         ) :: Assert.t()
-  def assert(ref, assertion, handle) do
+  def assert(ref, assertion, handle, captures \\ []) do
     %Assert{
       ref: ref,
       assertion: assertion,
-      handle: handle
+      handle: handle,
+      captures: captures
     }
   end
 

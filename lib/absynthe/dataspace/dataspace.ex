@@ -409,17 +409,18 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   defp notify_observer_of_existing(turn, entity_ref, matches) do
     # For each existing assertion that matches the observer's pattern,
-    # send a publish notification to the observer
-    Enum.reduce(matches, turn, fn {handle, assertion, _captures}, turn_acc ->
-      action = Event.assert(entity_ref, assertion, handle)
+    # send a publish notification to the observer with captured bindings
+    Enum.reduce(matches, turn, fn {handle, assertion, captures}, turn_acc ->
+      action = Event.assert(entity_ref, assertion, handle, captures)
       Turn.add_action(turn_acc, action)
     end)
   end
 
   defp notify_observers_of_publish(turn, observer_matches, assertion, handle) do
     # For each observer that matches this assertion, send a publish notification
-    Enum.reduce(observer_matches, turn, fn {observer_ref, _assertion, _captures}, turn_acc ->
-      action = Event.assert(observer_ref, assertion, handle)
+    # with captured bindings from pattern matching
+    Enum.reduce(observer_matches, turn, fn {observer_ref, _assertion, captures}, turn_acc ->
+      action = Event.assert(observer_ref, assertion, handle, captures)
       Turn.add_action(turn_acc, action)
     end)
   end

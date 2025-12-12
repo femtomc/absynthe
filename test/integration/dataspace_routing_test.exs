@@ -272,4 +272,141 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       assert length(results) == 2
     end
   end
+
+  describe "observer capture bindings" do
+    test "observer notifications include capture bindings" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # First publish some assertions with specific values we want to capture
+      h1 = Handle.new(1)
+      person1 = Value.record(Value.symbol("Person"), [Value.string("Alice"), Value.integer(30)])
+      {dataspace, turn} = Entity.on_publish(dataspace, person1, h1, turn)
+
+      h2 = Handle.new(2)
+      person2 = Value.record(Value.symbol("Person"), [Value.string("Bob"), Value.integer(25)])
+      {dataspace, turn} = Entity.on_publish(dataspace, person2, h2, turn)
+
+      # Create an Observe assertion with captures for name and age
+      # Pattern: <Person $name $age> - uses Preserves pattern syntax
+      pattern =
+        Value.record(Value.symbol("Person"), [
+          Value.symbol("$name"),
+          Value.symbol("$age")
+        ])
+
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer_actor, entity_id: :observer_entity}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(100)
+
+      {_dataspace, updated_turn} =
+        Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # The turn should have actions with captured bindings
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      assert_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Assert{}, &1))
+      assert length(assert_actions) == 2
+
+      # Check that each action has captures
+      Enum.each(assert_actions, fn action ->
+        assert is_list(action.captures)
+        assert length(action.captures) == 2
+
+        # Captures should be [name_value, age_value]
+        [name, age] = action.captures
+        assert match?({:string, _}, name)
+        assert match?({:integer, _}, age)
+      end)
+
+      # Verify specific captures match the assertions
+      alice_action = Enum.find(assert_actions, fn a -> a.assertion == person1 end)
+      assert alice_action.captures == [Value.string("Alice"), Value.integer(30)]
+
+      bob_action = Enum.find(assert_actions, fn a -> a.assertion == person2 end)
+      assert bob_action.captures == [Value.string("Bob"), Value.integer(25)]
+    end
+
+    test "new assertion notifications include capture bindings" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # First set up observer with captures using Preserves pattern syntax ($value)
+      pattern =
+        Value.record(Value.symbol("Counter"), [
+          Value.symbol("$value")
+        ])
+
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Create fresh turn for the next operation
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Now publish a matching assertion
+      counter = Value.record(Value.symbol("Counter"), [Value.integer(42)])
+      counter_handle = Handle.new(2)
+      {_dataspace, updated_turn} = Entity.on_publish(dataspace, counter, counter_handle, turn)
+
+      # Turn should have action with captures
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      assert_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Assert{}, &1))
+      assert length(assert_actions) == 1
+
+      [notify_action] = assert_actions
+      assert notify_action.ref == observer_ref
+      assert notify_action.assertion == counter
+      assert notify_action.captures == [Value.integer(42)]
+    end
+
+    test "notifications without captures have empty captures list" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up observer WITHOUT captures (just wildcards)
+      pattern = Value.record(Value.symbol("Simple"), [Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Create fresh turn for the next operation
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Publish a matching assertion
+      simple = Value.record(Value.symbol("Simple"), [Value.string("test")])
+      simple_handle = Handle.new(2)
+      {_dataspace, updated_turn} = Entity.on_publish(dataspace, simple, simple_handle, turn)
+
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      assert_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Assert{}, &1))
+      assert length(assert_actions) == 1
+
+      [notify_action] = assert_actions
+      # No captures because pattern used wildcards, not captures
+      assert notify_action.captures == []
+    end
+  end
 end

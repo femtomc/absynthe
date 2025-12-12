@@ -77,15 +77,16 @@ defmodule Absynthe.Dataspace.Observer do
 
   ## Integration with Turn/Entity
 
-  When notifying observers, the dataspace should construct events and add them
-  as actions to the current turn:
+  When notifying observers, the dataspace constructs events and adds them
+  as actions to the current turn. Captured bindings from pattern matching
+  are included in the Assert event:
 
-      # On assertion match
-      captures = %{age: {:integer, 30}}
+      # On assertion match - captures are included in the event
       event = %Absynthe.Protocol.Event.Assert{
         ref: observer.entity_ref,
         assertion: assertion_value,
-        handle: assertion_handle
+        handle: assertion_handle,
+        captures: [{:integer, 30}]  # captured values in pattern order
       }
       turn = Absynthe.Core.Turn.add_action(turn, event)
 
@@ -95,9 +96,6 @@ defmodule Absynthe.Dataspace.Observer do
         handle: assertion_handle
       }
       turn = Absynthe.Core.Turn.add_action(turn, event)
-
-  Note: The actual notification mechanism may evolve to include capture information
-  in the event structure.
 
   ## Examples
 

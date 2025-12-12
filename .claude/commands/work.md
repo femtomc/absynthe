@@ -21,17 +21,28 @@ You are working on the absynthe project. Follow this workflow:
    - Run `mix test` to ensure tests pass
    - Add tests if the change warrants them
 
-## Phase 3: Verify
+## Phase 3: Review Cycle
 
 When you believe the implementation is complete:
 
 1. Run `mix compile` and `mix test` one final time
-2. Run `mix format` to ensure formatting is correct
-3. Review your changes for:
-   - Correctness and edge cases
-   - Code quality and Elixir conventions
-   - Test coverage
-   - Documentation updates if needed
+2. Track which files you modified during implementation
+3. Request a Codex review by running:
+   ```bash
+   codex review 'Review changes for issue <issue-id>: "<issue title>".
+
+   Files modified:
+   - path/to/file1.ex
+   - path/to/file2.ex
+
+   Check: correctness, edge cases, code quality, test coverage, Elixir conventions.'
+   ```
+
+   Replace the file list with the actual files you modified.
+
+4. Parse the review response:
+   - If review finds **no issues**: Proceed to Phase 4
+   - If review finds **issues**: Address the feedback and repeat Phase 3
 
 ## Phase 4: Close and Complete
 
@@ -47,6 +58,7 @@ When you believe the implementation is complete:
 ## Important Rules
 
 - Work on ONE issue at a time
+- Do not skip the review cycle
 - If you get stuck, add a comment with `bd comment <issue-id> "description of blocker"` and stop
 - If tests fail repeatedly, investigate the root cause before continuing
-- Always run `mix format` before marking work complete
+- Always run `mix format` before requesting review
