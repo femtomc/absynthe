@@ -436,9 +436,9 @@ defmodule Absynthe.Dataspace.Dataspace do
   # Utilities
 
   defp generate_observer_id(handle) do
-    # Use the handle as the observer ID for simplicity
-    # In a more complex implementation, this could be a UUID or sequential ID
-    {:observer, Handle.to_integer(handle)}
+    # Use the handle directly as the observer ID since handles are globally unique
+    # (they include actor_id + local counter)
+    {:observer, handle}
   end
 end
 

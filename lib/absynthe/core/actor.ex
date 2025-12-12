@@ -511,8 +511,8 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_call({:assert, ref, assertion}, _from, state) do
-    # Generate a new handle for this assertion
-    handle = Handle.new(state.next_handle_id)
+    # Generate a new handle for this assertion (namespaced by actor_id for global uniqueness)
+    handle = Handle.new(state.id, state.next_handle_id)
     new_state = %{state | next_handle_id: state.next_handle_id + 1}
 
     # Track the assertion handle with the root facet

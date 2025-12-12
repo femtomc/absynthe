@@ -19,7 +19,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
     test "assertions are stored in bag and retrievable" do
       dataspace = Dataspace.new()
       turn = Turn.new(:test_actor, :test_facet)
-      handle = Handle.new(1)
+      handle = Handle.new(:test_actor, 1)
       assertion = Value.string("hello world")
 
       # Publish assertion to dataspace
@@ -34,8 +34,8 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       dataspace = Dataspace.new()
       turn = Turn.new(:test_actor, :test_facet)
 
-      h1 = Handle.new(1)
-      h2 = Handle.new(2)
+      h1 = Handle.new(:test_actor, 1)
+      h2 = Handle.new(:test_actor, 2)
       a1 = Value.string("first")
       a2 = Value.integer(42)
 
@@ -50,7 +50,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
     test "retracting removes assertion from bag" do
       dataspace = Dataspace.new()
       turn = Turn.new(:test_actor, :test_facet)
-      handle = Handle.new(1)
+      handle = Handle.new(:test_actor, 1)
       assertion = Value.string("temporary")
 
       # Add and then retract
@@ -66,8 +66,8 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       assertion = Value.symbol("shared")
-      h1 = Handle.new(1)
-      h2 = Handle.new(2)
+      h1 = Handle.new(:test_actor, 1)
+      h2 = Handle.new(:test_actor, 2)
 
       # Publish same assertion twice with different handles
       {dataspace, turn} = Entity.on_publish(dataspace, assertion, h1, turn)
@@ -91,11 +91,11 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       # First publish some assertions
-      h1 = Handle.new(1)
+      h1 = Handle.new(:test_actor, 1)
       person1 = Value.record(Value.symbol("Person"), [Value.string("Alice"), Value.integer(30)])
       {dataspace, turn} = Entity.on_publish(dataspace, person1, h1, turn)
 
-      h2 = Handle.new(2)
+      h2 = Handle.new(:test_actor, 2)
       person2 = Value.record(Value.symbol("Person"), [Value.string("Bob"), Value.integer(25)])
       {dataspace, turn} = Entity.on_publish(dataspace, person2, h2, turn)
 
@@ -110,7 +110,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(100)
+      observe_handle = Handle.new(:test_actor, 100)
 
       {_dataspace, updated_turn} =
         Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
@@ -137,7 +137,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(1)
+      observe_handle = Handle.new(:test_actor, 1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # Create fresh turn for the next operation
@@ -145,7 +145,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
 
       # Now publish a matching assertion
       message = Value.record(Value.symbol("Message"), [Value.string("hello")])
-      msg_handle = Handle.new(2)
+      msg_handle = Handle.new(:test_actor, 2)
       {_dataspace, updated_turn} = Entity.on_publish(dataspace, message, msg_handle, turn)
 
       # Turn should have action to notify observer
@@ -165,7 +165,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
 
       # Publish assertion first
       message = Value.record(Value.symbol("Msg"), [Value.integer(1)])
-      msg_handle = Handle.new(1)
+      msg_handle = Handle.new(:test_actor, 1)
       {dataspace, turn} = Entity.on_publish(dataspace, message, msg_handle, turn)
 
       # Set up observer
@@ -178,7 +178,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(100)
+      observe_handle = Handle.new(:test_actor, 100)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # Fresh turn for retraction
@@ -213,7 +213,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(1)
+      observe_handle = Handle.new(:test_actor, 1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # Remove observer
@@ -224,7 +224,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       {_dataspace, updated_turn} =
-        Entity.on_publish(dataspace, Value.string("test"), Handle.new(2), turn)
+        Entity.on_publish(dataspace, Value.string("test"), Handle.new(:test_actor, 2), turn)
 
       {_committed, actions} = Turn.commit(updated_turn)
 
@@ -244,7 +244,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
         Entity.on_publish(
           dataspace,
           Value.record(Value.symbol("User"), [Value.string("alice"), Value.integer(30)]),
-          Handle.new(1),
+          Handle.new(:test_actor, 1),
           turn
         )
 
@@ -252,7 +252,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
         Entity.on_publish(
           dataspace,
           Value.record(Value.symbol("User"), [Value.string("bob"), Value.integer(25)]),
-          Handle.new(2),
+          Handle.new(:test_actor, 2),
           turn
         )
 
@@ -260,7 +260,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
         Entity.on_publish(
           dataspace,
           Value.record(Value.symbol("Other"), [Value.string("x")]),
-          Handle.new(3),
+          Handle.new(:test_actor, 3),
           turn
         )
 
@@ -279,11 +279,11 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       # First publish some assertions with specific values we want to capture
-      h1 = Handle.new(1)
+      h1 = Handle.new(:test_actor, 1)
       person1 = Value.record(Value.symbol("Person"), [Value.string("Alice"), Value.integer(30)])
       {dataspace, turn} = Entity.on_publish(dataspace, person1, h1, turn)
 
-      h2 = Handle.new(2)
+      h2 = Handle.new(:test_actor, 2)
       person2 = Value.record(Value.symbol("Person"), [Value.string("Bob"), Value.integer(25)])
       {dataspace, turn} = Entity.on_publish(dataspace, person2, h2, turn)
 
@@ -303,7 +303,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(100)
+      observe_handle = Handle.new(:test_actor, 100)
 
       {_dataspace, updated_turn} =
         Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
@@ -351,7 +351,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(1)
+      observe_handle = Handle.new(:test_actor, 1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # Create fresh turn for the next operation
@@ -359,7 +359,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
 
       # Now publish a matching assertion
       counter = Value.record(Value.symbol("Counter"), [Value.integer(42)])
-      counter_handle = Handle.new(2)
+      counter_handle = Handle.new(:test_actor, 2)
       {_dataspace, updated_turn} = Entity.on_publish(dataspace, counter, counter_handle, turn)
 
       # Turn should have action with captures
@@ -388,7 +388,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
           [pattern, {:embedded, observer_ref}]
         )
 
-      observe_handle = Handle.new(1)
+      observe_handle = Handle.new(:test_actor, 1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # Create fresh turn for the next operation
@@ -396,7 +396,7 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
 
       # Publish a matching assertion
       simple = Value.record(Value.symbol("Simple"), [Value.string("test")])
-      simple_handle = Handle.new(2)
+      simple_handle = Handle.new(:test_actor, 2)
       {_dataspace, updated_turn} = Entity.on_publish(dataspace, simple, simple_handle, turn)
 
       {_committed, actions} = Turn.commit(updated_turn)

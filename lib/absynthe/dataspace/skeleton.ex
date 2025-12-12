@@ -64,7 +64,7 @@ defmodule Absynthe.Dataspace.Skeleton do
       skeleton = Absynthe.Dataspace.Skeleton.new()
 
       # Add an assertion
-      handle = Absynthe.Assertions.Handle.new(1)
+      handle = Absynthe.Assertions.Handle.new(:my_actor, 1)
       value = Absynthe.Preserves.Value.record(
         Absynthe.Preserves.Value.symbol("Person"),
         [
@@ -168,7 +168,7 @@ defmodule Absynthe.Dataspace.Skeleton do
   ## Examples
 
       skeleton = Absynthe.Dataspace.Skeleton.new()
-      handle = Absynthe.Assertions.Handle.new(1)
+      handle = Absynthe.Assertions.Handle.new(:my_actor, 1)
       value = Absynthe.Preserves.Value.record(
         Absynthe.Preserves.Value.symbol("User"),
         [Absynthe.Preserves.Value.string("alice")]
@@ -223,7 +223,7 @@ defmodule Absynthe.Dataspace.Skeleton do
   ## Examples
 
       skeleton = Absynthe.Dataspace.Skeleton.new()
-      handle = Absynthe.Assertions.Handle.new(1)
+      handle = Absynthe.Assertions.Handle.new(:my_actor, 1)
       # ... add assertion ...
       notifications = Absynthe.Dataspace.Skeleton.remove_assertion(skeleton, handle)
 
