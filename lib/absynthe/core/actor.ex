@@ -523,22 +523,43 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_call({:assert, ref, assertion}, _from, state) do
-    # Generate a new handle for this assertion (namespaced by actor_id for global uniqueness)
-    handle = Handle.new(state.id, state.next_handle_id)
-    new_state = %{state | next_handle_id: state.next_handle_id + 1}
+    # Check attenuation BEFORE tracking - reject if attenuation fails
+    attenuation = Ref.attenuation(ref)
 
-    # Track the assertion handle with the root facet
-    # (client-initiated assertions don't have a specific facet context)
-    new_state = track_assertion_handle(new_state, state.root_facet_id, handle, ref, assertion)
+    case Rewrite.apply_attenuation(assertion, attenuation || []) do
+      {:ok, rewritten_assertion} ->
+        # Generate a new handle for this assertion (namespaced by actor_id for global uniqueness)
+        handle = Handle.new(state.id, state.next_handle_id)
+        new_state = %{state | next_handle_id: state.next_handle_id + 1}
 
-    # Create the assert event
-    event = Event.assert(ref, assertion, handle)
+        # Use the underlying ref (without attenuation) for delivery since we already applied it
+        # This prevents double-checking attenuation at deliver_event_impl
+        underlying_ref = Ref.without_attenuation(ref)
 
-    # Deliver asynchronously to align with documented behavior
-    # deliver_to_ref handles both local and remote delivery
-    new_state = deliver_to_ref(new_state, ref, event, :async)
+        # Track the assertion handle with the root facet
+        # (client-initiated assertions don't have a specific facet context)
+        # Track with the underlying ref and REWRITTEN assertion for consistency
+        new_state =
+          track_assertion_handle(
+            new_state,
+            state.root_facet_id,
+            handle,
+            underlying_ref,
+            rewritten_assertion
+          )
 
-    {:reply, {:ok, handle}, new_state}
+        # Create the assert event with rewritten assertion and underlying ref
+        event = Event.assert(underlying_ref, rewritten_assertion, handle)
+
+        # Deliver asynchronously to align with documented behavior
+        # deliver_to_ref handles both local and remote delivery
+        new_state = deliver_to_ref(new_state, underlying_ref, event, :async)
+
+        {:reply, {:ok, handle}, new_state}
+
+      :rejected ->
+        {:reply, {:error, :attenuation_rejected}, state}
+    end
   end
 
   @impl GenServer
@@ -586,8 +607,8 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_cast({:deliver, ref, event}, state) do
-    # Local delivery (no sender tracking needed - same actor owns the assertion)
-    new_state = deliver_event_impl(state, ref, event, nil)
+    # Route to correct actor - may be local or remote
+    new_state = deliver_action_to_ref(state, ref, event)
     {:noreply, new_state}
   end
 
