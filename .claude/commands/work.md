@@ -29,44 +29,52 @@ When you believe the implementation is complete:
 2. Track which files you modified during implementation
 3. Request a Codex review by running:
    ```bash
-   codex review 'Review changes for issue <issue-id>: "<issue title>".
+   codex exec --dangerously-bypass-approvals-and-sandbox 'You are reviewing code changes for issue <issue-id>: "<issue title>".
 
    Files modified:
    - path/to/file1.ex
    - path/to/file2.ex
 
-   Be critical and thorough:
-   - Look for bugs, logic errors, and incorrect assumptions
-   - Question whether the approach is correct for the problem domain
-   - Identify missing edge cases in tests (boundary conditions, error paths, concurrency)
-   - Check for performance issues (unnecessary allocations, N+2 queries, inefficient algorithms)
-   - Verify consistency with existing patterns in the codebase
-   - Point out any untested code paths or missing test coverage
-   - Challenge if the implementation matches specifications/semantics
-   - Look for potential race conditions or process interaction issues'
+   Your task:
+   1. Run `git diff HEAD~1` to see the changes
+   2. Read the modified files to understand the full context
+   3. Be critical and thorough in your review:
+      - Look for bugs, logic errors, and incorrect assumptions
+      - Question whether the approach is correct for the problem domain
+      - Identify missing edge cases in tests (boundary conditions, error paths, concurrency)
+      - Check for performance issues (unnecessary allocations, N+2 queries, inefficient algorithms)
+      - Verify consistency with existing patterns in the codebase
+      - Point out any untested code paths or missing test coverage
+      - Challenge if the implementation matches specifications/semantics
+      - Look for potential race conditions or process interaction issues
+   4. Write your review summary to the issue:
+      - If you find issues: `bd comment <issue-id> "REVIEW: [issues found]\n\n<your detailed review>"`
+      - If no issues: `bd comment <issue-id> "REVIEW: LGTM\n\n<brief summary of what was reviewed>"`'
    ```
 
    **Key principle**: Encourage Codex to be **skeptical and critical**, not just verify correctness.
 
-   **Bad example** (too passive):
-   ```bash
-   codex review 'Check if this code is correct.'
-   ```
-
    **Good example** (encourages critical thinking):
    ```bash
-   codex review 'Review set pattern matching fix.
+   codex exec --dangerously-bypass-approvals-and-sandbox 'You are reviewing code changes for issue absynthe-xyz: "Fix set pattern matching".
 
-   Be critical:
+   Files modified:
+   - lib/absynthe/dataspace/pattern.ex
+   - test/absynthe/dataspace/pattern_test.exs
+
+   Be especially critical about:
    - Is using sorted order correct for unordered sets?
    - Are we missing size mismatch checks?
    - What happens with nested sets or duplicate elements?
-   - Is sorting on every extraction a performance issue?'
+   - Is sorting on every extraction a performance issue?
+
+   Write your findings to the issue with `bd comment absynthe-xyz "REVIEW: ..."`'
    ```
 
-4. Parse the review response:
-   - If review finds **no issues**: Proceed to Phase 4
+4. Check the review:
+   - Run `bd show <issue-id>` to see the review comment
    - If review finds **issues**: Address the feedback and repeat Phase 3
+   - If review says **LGTM**: Proceed to Phase 4
 
 ## Phase 4: Close and Complete
 
