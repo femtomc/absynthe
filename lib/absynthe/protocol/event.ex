@@ -2,13 +2,14 @@ defmodule Absynthe.Protocol.Event do
   @moduledoc """
   Event types for the Syndicated Actor Model.
 
-  This module defines the four fundamental event types that actors exchange
+  This module defines the fundamental event types that actors exchange
   in the Syndicated Actor Model:
 
   - `Assert` - publish an assertion to a ref
   - `Retract` - remove a previously published assertion
   - `Message` - send a one-shot message to a ref
   - `Sync` - synchronization barrier for consistency
+  - `Spawn` - spawn a new entity within a turn
 
   ## Events Overview
 
@@ -27,6 +28,11 @@ defmodule Absynthe.Protocol.Event do
   ### Sync
   A synchronization barrier that ensures all pending events have been
   processed. The peer ref is notified when synchronization is complete.
+
+  ### Spawn
+  Spawns a new entity transactionally within a turn. The spawn is committed
+  atomically with all other turn actions, enabling reliable creation of new
+  entities within conversations.
 
   ## Examples
 
@@ -122,7 +128,35 @@ defmodule Absynthe.Protocol.Event do
           }
   end
 
-  @type t :: Assert.t() | Retract.t() | Message.t() | Sync.t()
+  defmodule Spawn do
+    @moduledoc """
+    Spawn a new entity within a turn.
+
+    This event allows entities to spawn new entities transactionally as part of
+    a turn's execution. The spawn is committed atomically with all other turn
+    actions, enabling reliable creation of new entities within conversations.
+
+    ## Fields
+
+    - `facet_id` - The facet to spawn the entity in
+    - `entity` - The entity to spawn (must implement Absynthe.Core.Entity protocol)
+    - `callback` - Optional callback function to receive the spawned entity ref.
+      The callback is invoked synchronously during turn commit. If the callback
+      raises an error, it will be logged but will not prevent the spawn from
+      completing.
+    """
+
+    @enforce_keys [:facet_id, :entity]
+    defstruct [:facet_id, :entity, :callback]
+
+    @type t :: %__MODULE__{
+            facet_id: term(),
+            entity: term(),
+            callback: (Absynthe.Core.Ref.t() -> any()) | nil
+          }
+  end
+
+  @type t :: Assert.t() | Retract.t() | Message.t() | Sync.t() | Spawn.t()
 
   @doc """
   Creates an Assert event.
@@ -303,10 +337,59 @@ defmodule Absynthe.Protocol.Event do
   def sync?(_), do: false
 
   @doc """
+  Creates a Spawn event.
+
+  ## Parameters
+
+    - `facet_id` - The facet to spawn the entity in
+    - `entity` - The entity to spawn
+    - `callback` - (optional) Callback function to receive the spawned ref
+
+  ## Examples
+
+      iex> entity = %MyEntity{}
+      iex> event = Absynthe.Protocol.Event.spawn(:root, entity)
+      iex> Absynthe.Protocol.Event.spawn?(event)
+      true
+
+      # With callback
+      iex> callback = fn ref -> IO.puts("Spawned: \#{inspect(ref)}") end
+      iex> event = Absynthe.Protocol.Event.spawn(:root, entity, callback)
+      iex> event.callback
+      #Function<...>
+  """
+  @spec spawn(term(), term(), (Absynthe.Core.Ref.t() -> any()) | nil) :: Spawn.t()
+  def spawn(facet_id, entity, callback \\ nil) do
+    %Spawn{
+      facet_id: facet_id,
+      entity: entity,
+      callback: callback
+    }
+  end
+
+  @doc """
+  Returns true if the event is a Spawn event.
+
+  ## Examples
+
+      iex> event = %Absynthe.Protocol.Event.Spawn{facet_id: :root, entity: %{}}
+      iex> Absynthe.Protocol.Event.spawn?(event)
+      true
+
+      iex> event = %Absynthe.Protocol.Event.Message{ref: ref, body: value}
+      iex> Absynthe.Protocol.Event.spawn?(event)
+      false
+  """
+  @spec spawn?(t()) :: boolean()
+  def spawn?(%Spawn{}), do: true
+  def spawn?(_), do: false
+
+  @doc """
   Extracts the target ref from any event type.
 
-  All event types have a `ref` field that identifies the target entity.
-  This function provides a convenient way to access it.
+  Most event types have a `ref` field that identifies the target entity.
+  This function provides a convenient way to access it. Returns `nil` for
+  Spawn events which don't have a target ref (they operate on facets).
 
   ## Examples
 
@@ -314,10 +397,15 @@ defmodule Absynthe.Protocol.Event do
       iex> event = Absynthe.Protocol.Event.message(ref, {:string, "test"})
       iex> Absynthe.Protocol.Event.target_ref(event)
       %Absynthe.Core.Ref{actor_id: 1, entity_id: 2}
+
+      iex> event = %Absynthe.Protocol.Event.Spawn{facet_id: :root, entity: %{}}
+      iex> Absynthe.Protocol.Event.target_ref(event)
+      nil
   """
-  @spec target_ref(t()) :: Absynthe.Core.Ref.t()
+  @spec target_ref(t()) :: Absynthe.Core.Ref.t() | nil
   def target_ref(%Assert{ref: ref}), do: ref
   def target_ref(%Retract{ref: ref}), do: ref
   def target_ref(%Message{ref: ref}), do: ref
   def target_ref(%Sync{ref: ref}), do: ref
+  def target_ref(%Spawn{}), do: nil
 end

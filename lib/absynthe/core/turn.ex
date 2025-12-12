@@ -35,6 +35,7 @@ defmodule Absynthe.Core.Turn do
   - `Absynthe.Protocol.Event.Retract` - Remove an assertion
   - `Absynthe.Protocol.Event.Message` - Send a message
   - `Absynthe.Protocol.Event.Sync` - Synchronization barrier
+  - `Absynthe.Protocol.Event.Spawn` - Spawn a new entity
 
   ## Examples
 

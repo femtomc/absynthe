@@ -803,7 +803,6 @@ defmodule Absynthe.Core.Actor do
     facet_id = Turn.facet_id(turn)
 
     # Process each pending action
-    # TODO: Implement full action processing for spawn, assert, retract, message, sync
     Enum.reduce(actions, state, fn action, acc_state ->
       process_action(acc_state, action, facet_id)
     end)
@@ -855,6 +854,37 @@ defmodule Absynthe.Core.Actor do
   # Handle Sync actions - deliver to target entity
   defp process_action(state, %Sync{ref: ref} = event, _facet_id) do
     deliver_action_to_ref(state, ref, event)
+  end
+
+  # Handle Spawn actions - spawn entity in the specified facet
+  # Spawn failures raise an error to abort the entire turn, maintaining atomicity
+  defp process_action(
+         state,
+         %Event.Spawn{facet_id: facet_id, entity: entity, callback: callback},
+         _turn_facet_id
+       ) do
+    case spawn_entity_impl(state, facet_id, entity) do
+      {:ok, ref, new_state} ->
+        # Invoke callback if provided, with error handling
+        # Callback errors are logged but don't prevent the spawn from completing
+        if callback do
+          try do
+            callback.(ref)
+          rescue
+            error ->
+              Logger.error(
+                "Spawn callback raised error: #{inspect(error)}\n#{Exception.format_stacktrace()}"
+              )
+          end
+        end
+
+        new_state
+
+      {:error, reason} ->
+        # Spawn failure aborts the turn to maintain atomicity
+        # The try/rescue in deliver_event_impl will catch this and log it
+        raise "Failed to spawn entity in facet #{facet_id}: #{inspect(reason)}"
+    end
   end
 
   defp process_action(state, action, _facet_id) do
