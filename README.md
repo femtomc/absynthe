@@ -200,7 +200,7 @@ Field.get(sum) # => 13
 
 ## References
 
-- [Synit](https://synit.org/) – overview of the Syndicated Interaction Toolkit.
+- [Synit](https://synit.org/) – the Synit book provided an overview of several Syndicate concepts
 - [Syndicate](https://syndicate-lang.org/about/) – background on the Syndicated Actor Model.
 - [Tony Garnock-Jones' dissertation](https://syndicate-lang.org/tonyg-dissertation/html/).
 - [Preserves specification](https://preserves.gitlab.io/preserves/preserves.html).
