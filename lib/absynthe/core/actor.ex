@@ -519,11 +519,13 @@ defmodule Absynthe.Core.Actor do
     # (client-initiated assertions don't have a specific facet context)
     new_state = track_assertion_handle(new_state, state.root_facet_id, handle, ref, assertion)
 
-    # Create and deliver the assert event
+    # Create the assert event
     event = Event.assert(ref, assertion, handle)
 
-    # Deliver to local or remote actor
-    new_state = deliver_to_ref(new_state, ref, event)
+    # Deliver asynchronously to align with documented behavior
+    # deliver_to_ref handles both local and remote delivery
+    new_state = deliver_to_ref(new_state, ref, event, :async)
+
     {:reply, {:ok, handle}, new_state}
   end
 
@@ -534,11 +536,13 @@ defmodule Absynthe.Core.Actor do
         # Remove from tracking (outbound_assertions and facet_handles)
         new_state = untrack_assertion_handle(state, handle)
 
-        # Create and deliver the retract event
+        # Create the retract event
         event = Event.retract(ref, handle)
 
-        # Deliver to local or remote actor
-        new_state = deliver_to_ref(new_state, ref, event)
+        # Deliver asynchronously to align with documented behavior
+        # deliver_to_ref handles both local and remote delivery
+        new_state = deliver_to_ref(new_state, ref, event, :async)
+
         {:reply, :ok, new_state}
 
       :error ->
@@ -926,15 +930,29 @@ defmodule Absynthe.Core.Actor do
   end
 
   # Deliver an event to a target ref (local or remote)
-  # Used by handle_call for assertions/retractions initiated by the actor
+  # Used for internal operations like facet teardown that require synchronous local delivery
   defp deliver_to_ref(state, ref, event) do
+    deliver_to_ref(state, ref, event, :sync)
+  end
+
+  # Deliver an event to a target ref with specified mode
+  # - mode: :sync for synchronous local delivery (teardown), :async for async (client ops)
+  defp deliver_to_ref(state, ref, event, mode) do
     case Ref.local?(ref, state.id) do
       true ->
-        # Local delivery - process directly
-        deliver_event_impl(state, ref, event)
+        case mode do
+          :sync ->
+            # Synchronous local delivery for internal operations (facet teardown)
+            deliver_event_impl(state, ref, event)
+
+          :async ->
+            # Async local delivery for client-initiated operations
+            GenServer.cast(self(), {:deliver, ref, event})
+            state
+        end
 
       false ->
-        # Remote delivery - send to remote actor
+        # Remote delivery - always async via cast
         remote_actor_id = Ref.actor_id(ref)
 
         case resolve_actor(remote_actor_id) do
