@@ -4,7 +4,7 @@
   <img src="assets/logo.png" alt="Absynthe Logo" width="400" height="400">
 </p>
 
-An implementation of [Tony Garnock-Jones' Syndicated Actor Model](https://syndicate-lang.org/) for Elixir, with full support for the [Preserves](https://preserves.gitlab.io/preserves/preserves.html) data format.
+An implementation of [Tony Garnock-Jones' Syndicated Actor Model](https://syndicate-lang.org/) for Elixir.
 
 ## What is the Syndicated Actor Model?
 
