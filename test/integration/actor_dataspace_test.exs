@@ -122,7 +122,8 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
       {_facet_id, updated_collector} = Map.get(state.entities, Ref.entity_id(collector_ref))
 
       # Collector should have received both assert and retract (most recent first)
-      assert [{:retract, ^handle}, {:assert, {:string, "temp"}, ^handle}] = updated_collector.received
+      assert [{:retract, ^handle}, {:assert, {:string, "temp"}, ^handle}] =
+               updated_collector.received
 
       GenServer.stop(actor)
     end
@@ -275,7 +276,8 @@ defmodule Absynthe.Integration.ActorDataspaceTest do
       {_facet_id, updated_collector} = Map.get(state2.entities, Ref.entity_id(collector_ref))
 
       # Should have retract first (most recent), then assert
-      assert [{:retract, ^handle}, {:assert, {:string, "temp"}, ^handle}] = updated_collector.received
+      assert [{:retract, ^handle}, {:assert, {:string, "temp"}, ^handle}] =
+               updated_collector.received
 
       GenServer.stop(actor1)
       GenServer.stop(actor2)

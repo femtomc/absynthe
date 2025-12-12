@@ -107,23 +107,29 @@ defmodule Absynthe.Dataflow.Registry do
   Stores or updates a field in the registry.
   """
   def put_field(field, owner_pid \\ self()) do
-    with_retry(fn ->
-      :ets.insert(@fields_table, {field.id, field})
-      :ets.insert(@owners_table, {{owner_pid, field.id}, true})
+    with_retry(
+      fn ->
+        :ets.insert(@fields_table, {field.id, field})
+        :ets.insert(@owners_table, {{owner_pid, field.id}, true})
+        field
+      end,
       field
-    end, field)
+    )
   end
 
   @doc """
   Retrieves a field by ID.
   """
   def get_field(field_id) do
-    with_retry(fn ->
-      case :ets.lookup(@fields_table, field_id) do
-        [{^field_id, field}] -> field
-        [] -> nil
-      end
-    end, nil)
+    with_retry(
+      fn ->
+        case :ets.lookup(@fields_table, field_id) do
+          [{^field_id, field}] -> field
+          [] -> nil
+        end
+      end,
+      nil
+    )
   end
 
   @doc """
@@ -133,17 +139,20 @@ defmodule Absynthe.Dataflow.Registry do
   Returns the updated field or nil if not found.
   """
   def update_field(field_id, update_fn) when is_function(update_fn, 1) do
-    with_retry(fn ->
-      case :ets.lookup(@fields_table, field_id) do
-        [{^field_id, field}] ->
-          new_field = update_fn.(field)
-          :ets.insert(@fields_table, {field_id, new_field})
-          new_field
+    with_retry(
+      fn ->
+        case :ets.lookup(@fields_table, field_id) do
+          [{^field_id, field}] ->
+            new_field = update_fn.(field)
+            :ets.insert(@fields_table, {field_id, new_field})
+            new_field
 
-        [] ->
-          nil
-      end
-    end, nil)
+          [] ->
+            nil
+        end
+      end,
+      nil
+    )
   end
 
   @doc """
@@ -153,36 +162,44 @@ defmodule Absynthe.Dataflow.Registry do
   Returns true if update succeeded, false if field not found.
   """
   def update_field_attrs(field_id, updates) when is_list(updates) do
-    with_retry(fn ->
-      case :ets.lookup(@fields_table, field_id) do
-        [{^field_id, field}] ->
-          new_field = Enum.reduce(updates, field, fn {key, value}, acc ->
-            Map.put(acc, key, value)
-          end)
-          :ets.insert(@fields_table, {field_id, new_field})
-          true
+    with_retry(
+      fn ->
+        case :ets.lookup(@fields_table, field_id) do
+          [{^field_id, field}] ->
+            new_field =
+              Enum.reduce(updates, field, fn {key, value}, acc ->
+                Map.put(acc, key, value)
+              end)
 
-        [] ->
-          false
-      end
-    end, false)
+            :ets.insert(@fields_table, {field_id, new_field})
+            true
+
+          [] ->
+            false
+        end
+      end,
+      false
+    )
   end
 
   @doc """
   Cleans up all fields owned by the specified process.
   """
   def cleanup(owner_pid \\ self()) do
-    with_retry(fn ->
-      owned = :ets.match(@owners_table, {{owner_pid, :"$1"}, :_})
-      field_ids = List.flatten(owned)
+    with_retry(
+      fn ->
+        owned = :ets.match(@owners_table, {{owner_pid, :"$1"}, :_})
+        field_ids = List.flatten(owned)
 
-      Enum.each(field_ids, fn field_id ->
-        :ets.delete(@fields_table, field_id)
-        :ets.delete(@owners_table, {owner_pid, field_id})
-      end)
+        Enum.each(field_ids, fn field_id ->
+          :ets.delete(@fields_table, field_id)
+          :ets.delete(@owners_table, {owner_pid, field_id})
+        end)
 
+        :ok
+      end,
       :ok
-    end, :ok)
+    )
   end
 
   @doc """
@@ -191,16 +208,19 @@ defmodule Absynthe.Dataflow.Registry do
   This is used when reassigning ownership to a different process.
   """
   def remove_ownership(field_id) do
-    with_retry(fn ->
-      # Find all owners for this field and remove their entries
-      owners = :ets.match(@owners_table, {{:"$1", field_id}, :_})
+    with_retry(
+      fn ->
+        # Find all owners for this field and remove their entries
+        owners = :ets.match(@owners_table, {{:"$1", field_id}, :_})
 
-      Enum.each(List.flatten(owners), fn owner_pid ->
-        :ets.delete(@owners_table, {owner_pid, field_id})
-      end)
+        Enum.each(List.flatten(owners), fn owner_pid ->
+          :ets.delete(@owners_table, {owner_pid, field_id})
+        end)
 
+        :ok
+      end,
       :ok
-    end, :ok)
+    )
   end
 
   @doc """
@@ -209,19 +229,25 @@ defmodule Absynthe.Dataflow.Registry do
   Associates the field with the specified owner process for cleanup tracking.
   """
   def add_ownership(field_id, owner_pid) do
-    with_retry(fn ->
-      :ets.insert(@owners_table, {{owner_pid, field_id}, true})
+    with_retry(
+      fn ->
+        :ets.insert(@owners_table, {{owner_pid, field_id}, true})
+        :ok
+      end,
       :ok
-    end, :ok)
+    )
   end
 
   @doc """
   Returns all field IDs (for debugging/testing).
   """
   def all_field_ids do
-    with_retry(fn ->
-      :ets.select(@fields_table, [{{:"$1", :_}, [], [:"$1"]}])
-    end, [])
+    with_retry(
+      fn ->
+        :ets.select(@fields_table, [{{:"$1", :_}, [], [:"$1"]}])
+      end,
+      []
+    )
   end
 
   # Helper to retry ETS operations if tables are recreated

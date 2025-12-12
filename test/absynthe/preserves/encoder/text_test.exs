@@ -6,10 +6,12 @@ defmodule Absynthe.Preserves.Encoder.TextTest do
   describe "canonical ordering" do
     test "dictionary keys sorted by binary repr" do
       # Construct dictionary directly with Map - integer 2 sorts before string "10" in binary repr
-      dict = {:dictionary, %{
-        Value.string("10") => Value.string("str"),
-        Value.integer(2) => Value.string("int")
-      }}
+      dict =
+        {:dictionary,
+         %{
+           Value.string("10") => Value.string("str"),
+           Value.integer(2) => Value.string("int")
+         }}
 
       assert "{2: \"int\" \"10\": \"str\"}" == Encoder.Text.encode!(dict)
     end

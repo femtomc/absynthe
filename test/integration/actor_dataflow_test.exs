@@ -54,9 +54,10 @@ defmodule Absynthe.Integration.ActorDataflowTest do
       # Create source field and computed field
       source = Field.new(10)
 
-      doubled = Field.computed(fn ->
-        Field.get(source) * 2
-      end)
+      doubled =
+        Field.computed(fn ->
+          Field.get(source) * 2
+        end)
 
       # Initial computation
       assert Field.get(doubled) == 20
@@ -109,9 +110,10 @@ defmodule Absynthe.Integration.ActorDataflowTest do
       source = Field.new(1)
 
       # Create initial computed
-      computed1 = Field.computed(fn ->
-        Field.get(source) * 10
-      end)
+      computed1 =
+        Field.computed(fn ->
+          Field.get(source) * 10
+        end)
 
       # Trigger initial computation
       assert Field.get(computed1) == 10
@@ -121,9 +123,10 @@ defmodule Absynthe.Integration.ActorDataflowTest do
       turn = Field.set(source, 2, turn)
 
       # Now add another dependent AFTER the set but BEFORE commit
-      computed2 = Field.computed(fn ->
-        Field.get(source) * 100
-      end)
+      computed2 =
+        Field.computed(fn ->
+          Field.get(source) * 100
+        end)
 
       # Trigger computation of computed2 to establish dependency
       assert Field.get(computed2) == 100
@@ -144,10 +147,11 @@ defmodule Absynthe.Integration.ActorDataflowTest do
       # This is done by having a mutable reference that we set after creation
       self_ref = Field.new(nil)
 
-      cyclic = Field.computed(fn ->
-        ref = Field.get(self_ref)
-        if ref, do: Field.get(ref), else: 0
-      end)
+      cyclic =
+        Field.computed(fn ->
+          ref = Field.get(self_ref)
+          if ref, do: Field.get(ref), else: 0
+        end)
 
       # Initial read works (self_ref is nil, so no cycle yet)
       assert Field.get(cyclic) == 0

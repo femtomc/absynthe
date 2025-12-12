@@ -113,8 +113,11 @@ defmodule Absynthe.Preserves.Decoder.Text do
     case parse_value(input, 0) do
       {:ok, value, rest, pos} ->
         case skip_whitespace_and_comments(rest, pos) do
-          {"", _pos} -> {:ok, value}
-          {remaining, pos} -> {:error, "Unexpected content after value: #{inspect(remaining)}", pos}
+          {"", _pos} ->
+            {:ok, value}
+
+          {remaining, pos} ->
+            {:error, "Unexpected content after value: #{inspect(remaining)}", pos}
         end
 
       {:error, reason, pos} ->
@@ -430,14 +433,30 @@ defmodule Absynthe.Preserves.Decoder.Text do
 
   defp parse_escape(input, pos) do
     case input do
-      <<"n" <> rest::binary>> -> {:ok, "\n", rest, pos + 1}
-      <<"r" <> rest::binary>> -> {:ok, "\r", rest, pos + 1}
-      <<"t" <> rest::binary>> -> {:ok, "\t", rest, pos + 1}
-      <<"\\" <> rest::binary>> -> {:ok, "\\", rest, pos + 1}
-      <<"\"" <> rest::binary>> -> {:ok, "\"", rest, pos + 1}
-      <<"/" <> rest::binary>> -> {:ok, "/", rest, pos + 1}
-      <<"b" <> rest::binary>> -> {:ok, "\b", rest, pos + 1}
-      <<"f" <> rest::binary>> -> {:ok, "\f", rest, pos + 1}
+      <<"n" <> rest::binary>> ->
+        {:ok, "\n", rest, pos + 1}
+
+      <<"r" <> rest::binary>> ->
+        {:ok, "\r", rest, pos + 1}
+
+      <<"t" <> rest::binary>> ->
+        {:ok, "\t", rest, pos + 1}
+
+      <<"\\" <> rest::binary>> ->
+        {:ok, "\\", rest, pos + 1}
+
+      <<"\"" <> rest::binary>> ->
+        {:ok, "\"", rest, pos + 1}
+
+      <<"/" <> rest::binary>> ->
+        {:ok, "/", rest, pos + 1}
+
+      <<"b" <> rest::binary>> ->
+        {:ok, "\b", rest, pos + 1}
+
+      <<"f" <> rest::binary>> ->
+        {:ok, "\f", rest, pos + 1}
+
       <<"u", hex::binary-size(4), rest::binary>> ->
         case Integer.parse(hex, 16) do
           {codepoint, ""} -> {:ok, <<codepoint::utf8>>, rest, pos + 5}

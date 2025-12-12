@@ -332,7 +332,6 @@ defmodule Absynthe.Preserves.Compare do
       is_nan(a) and is_nan(b) -> :eq
       is_nan(a) -> :gt
       is_nan(b) -> :lt
-
       # Infinity handling
       is_neg_infinity(a) and is_neg_infinity(b) -> :eq
       is_neg_infinity(a) -> :lt
@@ -340,11 +339,9 @@ defmodule Absynthe.Preserves.Compare do
       is_pos_infinity(a) and is_pos_infinity(b) -> :eq
       is_pos_infinity(a) -> :gt
       is_pos_infinity(b) -> :lt
-
       # Zero sign handling: -0.0 < +0.0
       is_negative_zero(a) and is_positive_zero(b) -> :lt
       is_positive_zero(a) and is_negative_zero(b) -> :gt
-
       # Regular comparison
       a < b -> :lt
       a > b -> :gt
@@ -457,8 +454,12 @@ defmodule Absynthe.Preserves.Compare do
     arity_b = length(fields_b)
 
     cond do
-      arity_a < arity_b -> :lt
-      arity_a > arity_b -> :gt
+      arity_a < arity_b ->
+        :lt
+
+      arity_a > arity_b ->
+        :gt
+
       true ->
         # Same arity, compare labels
         case compare(label_a, label_b) do
@@ -472,6 +473,7 @@ defmodule Absynthe.Preserves.Compare do
   defp compare_sequences([], []), do: :eq
   defp compare_sequences([], _), do: :lt
   defp compare_sequences(_, []), do: :gt
+
   defp compare_sequences([a | rest_a], [b | rest_b]) do
     case compare(a, b) do
       :eq -> compare_sequences(rest_a, rest_b)
@@ -503,6 +505,7 @@ defmodule Absynthe.Preserves.Compare do
   defp compare_pair_sequences([], []), do: :eq
   defp compare_pair_sequences([], _), do: :lt
   defp compare_pair_sequences(_, []), do: :gt
+
   defp compare_pair_sequences([{k1, v1} | rest_a], [{k2, v2} | rest_b]) do
     case compare(k1, k2) do
       :eq ->
@@ -510,7 +513,9 @@ defmodule Absynthe.Preserves.Compare do
           :eq -> compare_pair_sequences(rest_a, rest_b)
           result -> result
         end
-      result -> result
+
+      result ->
+        result
     end
   end
 

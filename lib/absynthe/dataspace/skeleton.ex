@@ -402,6 +402,7 @@ defmodule Absynthe.Dataspace.Skeleton do
       constraints
       |> Enum.map(fn {path, expected} ->
         lookup_key = {path, expected}
+
         case :ets.lookup(skeleton.path_index, lookup_key) do
           [{^lookup_key, handle_set}] -> {MapSet.size(handle_set), handle_set}
           [] -> {0, MapSet.new()}

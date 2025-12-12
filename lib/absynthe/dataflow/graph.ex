@@ -883,7 +883,8 @@ defmodule Absynthe.Dataflow.Graph do
   - `{:ok, sorted_list}` - Successfully sorted field IDs
   - `{:error, {:cycle, path}}` - Detected a dependency cycle
   """
-  @spec topological_sort(t(), [field_id()]) :: {:ok, [field_id()]} | {:error, {:cycle, [field_id()]}}
+  @spec topological_sort(t(), [field_id()]) ::
+          {:ok, [field_id()]} | {:error, {:cycle, [field_id()]}}
   def topological_sort(graph, field_ids) do
     # Use Kahn's algorithm for topological sorting
     # Build in-degree map for the subgraph

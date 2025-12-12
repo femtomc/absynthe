@@ -45,7 +45,6 @@ defmodule Absynthe.Protocol.Event do
       Absynthe.Protocol.Event.message?(event) # => false
   """
 
-
   defmodule Assert do
     @moduledoc """
     Assert an assertion to a target ref.

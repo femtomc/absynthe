@@ -312,7 +312,7 @@ defmodule Absynthe.Preserves.Decoder.Binary do
   defp decode_ieee754_double(bits) do
     # Extract sign, exponent, and mantissa
     sign = bits >>> 63
-    exponent = (bits >>> 52) &&& 0x7FF
+    exponent = bits >>> 52 &&& 0x7FF
     mantissa = bits &&& 0xFFFFFFFFFFFFF
 
     cond do

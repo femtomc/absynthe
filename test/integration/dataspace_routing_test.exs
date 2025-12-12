@@ -103,13 +103,17 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       # Pattern matches any Person record
       pattern = Value.record(Value.symbol("Person"), [Value.symbol("_"), Value.symbol("_")])
       observer_ref = %Absynthe.Core.Ref{actor_id: :observer_actor, entity_id: :observer_entity}
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
 
       observe_handle = Handle.new(100)
-      {_dataspace, updated_turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      {_dataspace, updated_turn} =
+        Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
       # The turn should have actions to notify observer of existing matches
       {_committed, actions} = Turn.commit(updated_turn)
@@ -126,10 +130,12 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       # First set up observer
       pattern = Value.record(Value.symbol("Message"), [Value.symbol("_")])
       observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
 
       observe_handle = Handle.new(1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
@@ -165,10 +171,13 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       # Set up observer
       pattern = Value.record(Value.symbol("Msg"), [Value.symbol("_")])
       observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
       observe_handle = Handle.new(100)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
@@ -194,12 +203,16 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       # Set up observer
-      pattern = Value.symbol("_")  # Match anything
+      # Match anything
+      pattern = Value.symbol("_")
       observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
       observe_handle = Handle.new(1)
       {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
 
@@ -209,7 +222,9 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
 
       # Now publish something - should NOT generate observer notification
       turn = Turn.new(:test_actor, :test_facet)
-      {_dataspace, updated_turn} = Entity.on_publish(dataspace, Value.string("test"), Handle.new(2), turn)
+
+      {_dataspace, updated_turn} =
+        Entity.on_publish(dataspace, Value.string("test"), Handle.new(2), turn)
 
       {_committed, actions} = Turn.commit(updated_turn)
 
@@ -225,24 +240,29 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       turn = Turn.new(:test_actor, :test_facet)
 
       # Add some assertions
-      {dataspace, turn} = Entity.on_publish(
-        dataspace,
-        Value.record(Value.symbol("User"), [Value.string("alice"), Value.integer(30)]),
-        Handle.new(1),
-        turn
-      )
-      {dataspace, turn} = Entity.on_publish(
-        dataspace,
-        Value.record(Value.symbol("User"), [Value.string("bob"), Value.integer(25)]),
-        Handle.new(2),
-        turn
-      )
-      {dataspace, _turn} = Entity.on_publish(
-        dataspace,
-        Value.record(Value.symbol("Other"), [Value.string("x")]),
-        Handle.new(3),
-        turn
-      )
+      {dataspace, turn} =
+        Entity.on_publish(
+          dataspace,
+          Value.record(Value.symbol("User"), [Value.string("alice"), Value.integer(30)]),
+          Handle.new(1),
+          turn
+        )
+
+      {dataspace, turn} =
+        Entity.on_publish(
+          dataspace,
+          Value.record(Value.symbol("User"), [Value.string("bob"), Value.integer(25)]),
+          Handle.new(2),
+          turn
+        )
+
+      {dataspace, _turn} =
+        Entity.on_publish(
+          dataspace,
+          Value.record(Value.symbol("Other"), [Value.string("x")]),
+          Handle.new(3),
+          turn
+        )
 
       # Query for User records
       pattern = Value.record(Value.symbol("User"), [Value.symbol("_"), Value.symbol("_")])

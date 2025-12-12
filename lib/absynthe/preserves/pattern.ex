@@ -485,7 +485,11 @@ defmodule Absynthe.Preserves.Pattern do
     end
   end
 
-  defp do_match({:record, {label_pattern, field_patterns}}, {:record, {label_value, field_values}}, bindings) do
+  defp do_match(
+         {:record, {label_pattern, field_patterns}},
+         {:record, {label_value, field_values}},
+         bindings
+       ) do
     if length(field_patterns) != length(field_values) do
       :error
     else
@@ -511,7 +515,8 @@ defmodule Absynthe.Preserves.Pattern do
 
   defp do_match({:dictionary, pattern_map}, {:dictionary, value_map}, bindings) do
     # All pattern keys must exist in value map, and their values must match
-    Enum.reduce_while(pattern_map, {:ok, bindings}, fn {pattern_key, pattern_value}, {:ok, acc_bindings} ->
+    Enum.reduce_while(pattern_map, {:ok, bindings}, fn {pattern_key, pattern_value},
+                                                       {:ok, acc_bindings} ->
       # Find matching key in value map
       case find_matching_key(pattern_key, value_map, acc_bindings) do
         {:ok, _value_key, value_value, new_bindings} ->
@@ -580,13 +585,16 @@ defmodule Absynthe.Preserves.Pattern do
           # Successfully matched this pattern to this value
           # Try to match the rest of the patterns with remaining values
           remaining_values = List.delete(value_items, value)
+
           case match_set(rest_patterns, remaining_values, new_bindings) do
             {:ok, final_bindings} -> {:ok, final_bindings}
-            :error -> nil  # Continue trying other values
+            # Continue trying other values
+            :error -> nil
           end
 
         :error ->
-          nil  # Continue trying other values
+          # Continue trying other values
+          nil
       end
     end)
   end

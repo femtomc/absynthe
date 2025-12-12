@@ -232,7 +232,8 @@ defmodule Absynthe.Dataflow.Field do
       iex> :ok
   """
   @spec reassign_owner(t(), pid()) :: t()
-  def reassign_owner(%__MODULE__{id: field_id} = field, new_owner_pid) when is_pid(new_owner_pid) do
+  def reassign_owner(%__MODULE__{id: field_id} = field, new_owner_pid)
+      when is_pid(new_owner_pid) do
     # Remove old ownership entries for this field
     Registry.remove_ownership(field_id)
     # Add new ownership
@@ -631,9 +632,10 @@ defmodule Absynthe.Dataflow.Field do
   @spec execute_field_update(term(), term()) :: t() | nil
   def execute_field_update(field_id, new_value) do
     # Use atomic update to prevent lost updates from concurrent writers
-    updated_field = Registry.update_field(field_id, fn %__MODULE__{} = field ->
-      %{field | value: new_value, version: field.version + 1}
-    end)
+    updated_field =
+      Registry.update_field(field_id, fn %__MODULE__{} = field ->
+        %{field | value: new_value, version: field.version + 1}
+      end)
 
     case updated_field do
       nil ->
@@ -699,8 +701,8 @@ defmodule Absynthe.Dataflow.Field do
   def add_dependent(%__MODULE__{id: field_id} = field, dependent_id) do
     # Use atomic update to prevent losing dependents from concurrent adds
     case Registry.update_field(field_id, fn %__MODULE__{} = f ->
-      %{f | dependents: MapSet.put(f.dependents, dependent_id)}
-    end) do
+           %{f | dependents: MapSet.put(f.dependents, dependent_id)}
+         end) do
       nil ->
         # Field not found, return original with local update
         %__MODULE__{field | dependents: MapSet.put(field.dependents, dependent_id)}
@@ -738,8 +740,8 @@ defmodule Absynthe.Dataflow.Field do
   def remove_dependent(%__MODULE__{id: field_id} = field, dependent_id) do
     # Use atomic update to prevent losing dependents from concurrent removes
     case Registry.update_field(field_id, fn %__MODULE__{} = f ->
-      %{f | dependents: MapSet.delete(f.dependents, dependent_id)}
-    end) do
+           %{f | dependents: MapSet.delete(f.dependents, dependent_id)}
+         end) do
       nil ->
         # Field not found, return original with local update
         %__MODULE__{field | dependents: MapSet.delete(field.dependents, dependent_id)}
@@ -832,7 +834,8 @@ defmodule Absynthe.Dataflow.Field do
   @spec recompute(t()) :: t()
   def recompute(%__MODULE__{compute: nil} = field), do: field
 
-  def recompute(%__MODULE__{id: field_id, compute: compute_fn} = field) when is_function(compute_fn, 0) do
+  def recompute(%__MODULE__{id: field_id, compute: compute_fn} = field)
+      when is_function(compute_fn, 0) do
     # Check for cycles - if this field is already being computed, we have a cycle
     stack = Process.get(@computing_stack_key, MapSet.new())
 

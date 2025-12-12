@@ -39,5 +39,8 @@ absynthe-*.tar
 .env
 .env.local
 
-# Claude Code session data
-.claude/
+# Claude Code local settings (keep CLAUDE.md, ELIXIR_STYLE.md, commands/)
+.claude/settings.local.json
+
+# MCP config (contains local paths)
+.mcp.json

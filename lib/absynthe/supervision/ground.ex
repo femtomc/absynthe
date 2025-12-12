@@ -276,7 +276,9 @@ defmodule Absynthe.Supervision.Ground do
   @impl Supervisor
   def init(opts) do
     # Extract configuration with defaults
-    actor_supervisor_name = Keyword.get(opts, :actor_supervisor_name, @default_actor_supervisor_name)
+    actor_supervisor_name =
+      Keyword.get(opts, :actor_supervisor_name, @default_actor_supervisor_name)
+
     actor_registry_name = Keyword.get(opts, :actor_registry_name, @default_actor_registry_name)
     entity_registry_name = Keyword.get(opts, :entity_registry_name, @default_entity_registry_name)
 

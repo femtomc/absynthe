@@ -150,8 +150,11 @@ defmodule Absynthe.Registry.ActorRegistry do
     # Note: Registry.register/3 always registers the calling process (self()).
     # The pid parameter is for API consistency but the caller must be the actor.
     case Registry.register(registry, name, nil) do
-      {:ok, _owner} -> :ok
-      {:error, {:already_registered, existing_pid}} -> {:error, {:already_registered, existing_pid}}
+      {:ok, _owner} ->
+        :ok
+
+      {:error, {:already_registered, existing_pid}} ->
+        {:error, {:already_registered, existing_pid}}
     end
   end
 

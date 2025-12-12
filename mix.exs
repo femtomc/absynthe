@@ -59,24 +59,24 @@ defmodule Absynthe.MixProject do
       source_url: @source_url,
       extras: ["README.md"],
       groups_for_modules: [
-        "Core": [
+        Core: [
           Absynthe.Core.Actor,
           Absynthe.Core.Entity,
           Absynthe.Core.Facet,
           Absynthe.Core.Turn,
           Absynthe.Core.Ref
         ],
-        "Dataspace": [
+        Dataspace: [
           Absynthe.Dataspace.Dataspace,
           Absynthe.Dataspace.Skeleton,
           Absynthe.Dataspace.Pattern,
           Absynthe.Dataspace.Observer
         ],
-        "Dataflow": [
+        Dataflow: [
           Absynthe.Dataflow.Field,
           Absynthe.Dataflow.Registry
         ],
-        "Preserves": [
+        Preserves: [
           Absynthe.Preserves,
           Absynthe.Preserves.Value,
           Absynthe.Preserves.Compare,
@@ -86,7 +86,7 @@ defmodule Absynthe.MixProject do
           Absynthe.Preserves.Decoder.Binary,
           Absynthe.Preserves.Decoder.Text
         ],
-        "Protocol": [
+        Protocol: [
           Absynthe.Protocol.Event,
           Absynthe.Assertions.Handle,
           Absynthe.Assertions.Bag

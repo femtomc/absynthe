@@ -85,21 +85,25 @@ defmodule Absynthe.Preserves.PatternTest do
     end
 
     test "extracts variables from record" do
-      pattern = Value.record(
-        Value.symbol("point"),
-        [{:capture, :x}, {:capture, :y}]
-      )
+      pattern =
+        Value.record(
+          Value.symbol("point"),
+          [{:capture, :x}, {:capture, :y}]
+        )
+
       assert Pattern.variables(pattern) == [:x, :y]
     end
 
     test "extracts variables from nested patterns" do
-      pattern = Value.record(
-        {:capture, :label},
-        [
-          Value.sequence([{:capture, :a}, {:capture, :b}]),
-          {:capture, :c}
-        ]
-      )
+      pattern =
+        Value.record(
+          {:capture, :label},
+          [
+            Value.sequence([{:capture, :a}, {:capture, :b}]),
+            {:capture, :c}
+          ]
+        )
+
       vars = Pattern.variables(pattern)
       assert :label in vars
       assert :a in vars
@@ -113,12 +117,15 @@ defmodule Absynthe.Preserves.PatternTest do
     end
 
     test "extracts variables from bind with nested captures" do
-      pattern = Pattern.bind(:point,
-        Value.record(
-          Value.symbol("point"),
-          [{:capture, :x}, {:capture, :y}]
+      pattern =
+        Pattern.bind(
+          :point,
+          Value.record(
+            Value.symbol("point"),
+            [{:capture, :x}, {:capture, :y}]
+          )
         )
-      )
+
       assert Pattern.variables(pattern) == [:point, :x, :y]
     end
   end
@@ -134,7 +141,9 @@ defmodule Absynthe.Preserves.PatternTest do
   describe "match/2 - capture patterns" do
     test "capture matches and binds value" do
       assert {:ok, %{x: {:integer, 42}}} = Pattern.match({:capture, :x}, Value.integer(42))
-      assert {:ok, %{name: {:string, "Alice"}}} = Pattern.match({:capture, :name}, Value.string("Alice"))
+
+      assert {:ok, %{name: {:string, "Alice"}}} =
+               Pattern.match({:capture, :name}, Value.string("Alice"))
     end
 
     test "capture with same variable must match same value" do
@@ -164,16 +173,21 @@ defmodule Absynthe.Preserves.PatternTest do
     end
 
     test "bind works with nested captures" do
-      pattern = Pattern.bind(:point,
+      pattern =
+        Pattern.bind(
+          :point,
+          Value.record(
+            Value.symbol("point"),
+            [{:capture, :x}, {:capture, :y}]
+          )
+        )
+
+      value =
         Value.record(
           Value.symbol("point"),
-          [{:capture, :x}, {:capture, :y}]
+          [Value.integer(10), Value.integer(20)]
         )
-      )
-      value = Value.record(
-        Value.symbol("point"),
-        [Value.integer(10), Value.integer(20)]
-      )
+
       {:ok, bindings} = Pattern.match(pattern, value)
       assert bindings[:point] == value
       assert bindings[:x] == Value.integer(10)
@@ -220,26 +234,35 @@ defmodule Absynthe.Preserves.PatternTest do
     end
 
     test "matches with captures in fields" do
-      pattern = Value.record(
-        Value.symbol("person"),
-        [{:capture, :name}, {:capture, :age}]
-      )
-      value = Value.record(
-        Value.symbol("person"),
-        [Value.string("Alice"), Value.integer(30)]
-      )
-      assert {:ok, %{name: {:string, "Alice"}, age: {:integer, 30}}} = Pattern.match(pattern, value)
+      pattern =
+        Value.record(
+          Value.symbol("person"),
+          [{:capture, :name}, {:capture, :age}]
+        )
+
+      value =
+        Value.record(
+          Value.symbol("person"),
+          [Value.string("Alice"), Value.integer(30)]
+        )
+
+      assert {:ok, %{name: {:string, "Alice"}, age: {:integer, 30}}} =
+               Pattern.match(pattern, value)
     end
 
     test "matches with mixed patterns in fields" do
-      pattern = Value.record(
-        Value.symbol("user"),
-        [{:capture, :id}, Value.string("active"), :_]
-      )
-      value = Value.record(
-        Value.symbol("user"),
-        [Value.integer(123), Value.string("active"), Value.boolean(true)]
-      )
+      pattern =
+        Value.record(
+          Value.symbol("user"),
+          [{:capture, :id}, Value.string("active"), :_]
+        )
+
+      value =
+        Value.record(
+          Value.symbol("user"),
+          [Value.integer(123), Value.string("active"), Value.boolean(true)]
+        )
+
       assert {:ok, %{id: {:integer, 123}}} = Pattern.match(pattern, value)
     end
   end
@@ -304,46 +327,63 @@ defmodule Absynthe.Preserves.PatternTest do
 
   describe "match/2 - dictionary patterns" do
     test "matches when pattern keys are subset of value keys" do
-      pattern = Value.dictionary([
-        {Value.symbol("name"), Value.string("Alice")}
-      ])
-      value = Value.dictionary([
-        {Value.symbol("name"), Value.string("Alice")},
-        {Value.symbol("age"), Value.integer(30)}
-      ])
+      pattern =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Alice")}
+        ])
+
+      value =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Alice")},
+          {Value.symbol("age"), Value.integer(30)}
+        ])
+
       assert {:ok, %{}} = Pattern.match(pattern, value)
     end
 
     test "fails when pattern key not in value" do
-      pattern = Value.dictionary([
-        {Value.symbol("missing"), Value.string("value")}
-      ])
-      value = Value.dictionary([
-        {Value.symbol("name"), Value.string("Alice")}
-      ])
+      pattern =
+        Value.dictionary([
+          {Value.symbol("missing"), Value.string("value")}
+        ])
+
+      value =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Alice")}
+        ])
+
       assert :error = Pattern.match(pattern, value)
     end
 
     test "fails when value doesn't match for existing key" do
-      pattern = Value.dictionary([
-        {Value.symbol("name"), Value.string("Bob")}
-      ])
-      value = Value.dictionary([
-        {Value.symbol("name"), Value.string("Alice")}
-      ])
+      pattern =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Bob")}
+        ])
+
+      value =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Alice")}
+        ])
+
       assert :error = Pattern.match(pattern, value)
     end
 
     test "matches with captures in values" do
-      pattern = Value.dictionary([
-        {Value.symbol("name"), {:capture, :name}},
-        {Value.symbol("age"), {:capture, :age}}
-      ])
-      value = Value.dictionary([
-        {Value.symbol("name"), Value.string("Alice")},
-        {Value.symbol("age"), Value.integer(30)}
-      ])
-      assert {:ok, %{name: {:string, "Alice"}, age: {:integer, 30}}} = Pattern.match(pattern, value)
+      pattern =
+        Value.dictionary([
+          {Value.symbol("name"), {:capture, :name}},
+          {Value.symbol("age"), {:capture, :age}}
+        ])
+
+      value =
+        Value.dictionary([
+          {Value.symbol("name"), Value.string("Alice")},
+          {Value.symbol("age"), Value.integer(30)}
+        ])
+
+      assert {:ok, %{name: {:string, "Alice"}, age: {:integer, 30}}} =
+               Pattern.match(pattern, value)
     end
 
     test "matches empty dictionaries" do
@@ -368,10 +408,12 @@ defmodule Absynthe.Preserves.PatternTest do
 
   describe "matches/2" do
     test "filters values to those matching pattern" do
-      pattern = Value.record(
-        Value.symbol("user"),
-        [:_, Value.string("active")]
-      )
+      pattern =
+        Value.record(
+          Value.symbol("user"),
+          [:_, Value.string("active")]
+        )
+
       values = [
         Value.record(
           Value.symbol("user"),
@@ -390,8 +432,12 @@ defmodule Absynthe.Preserves.PatternTest do
 
       results = Pattern.matches(pattern, values)
       assert length(results) == 2
-      assert Enum.at(results, 0) == Value.record(Value.symbol("user"), [Value.integer(1), Value.string("active")])
-      assert Enum.at(results, 1) == Value.record(Value.symbol("user"), [Value.integer(3), Value.string("active")])
+
+      assert Enum.at(results, 0) ==
+               Value.record(Value.symbol("user"), [Value.integer(1), Value.string("active")])
+
+      assert Enum.at(results, 1) ==
+               Value.record(Value.symbol("user"), [Value.integer(3), Value.string("active")])
     end
 
     test "returns empty list when no matches" do
@@ -422,11 +468,13 @@ defmodule Absynthe.Preserves.PatternTest do
 
     test "finds first matching complex pattern" do
       pattern = Value.record(Value.symbol("ok"), [{:capture, :result}])
+
       values = [
         Value.record(Value.symbol("error"), [Value.string("failed")]),
         Value.record(Value.symbol("ok"), [Value.integer(42)]),
         Value.record(Value.symbol("ok"), [Value.integer(43)])
       ]
+
       assert {:ok, result, bindings} = Pattern.find_match(pattern, values)
       assert result == Value.record(Value.symbol("ok"), [Value.integer(42)])
       assert bindings == %{result: {:integer, 42}}
@@ -435,28 +483,31 @@ defmodule Absynthe.Preserves.PatternTest do
 
   describe "complex nested patterns" do
     test "matches deeply nested structures" do
-      pattern = Value.record(
-        Value.symbol("response"),
-        [
-          {:capture, :status},
-          Value.dictionary([
-            {Value.symbol("data"), Value.sequence([{:capture, :first}, :_])},
-            {Value.symbol("count"), {:capture, :count}}
-          ])
-        ]
-      )
+      pattern =
+        Value.record(
+          Value.symbol("response"),
+          [
+            {:capture, :status},
+            Value.dictionary([
+              {Value.symbol("data"), Value.sequence([{:capture, :first}, :_])},
+              {Value.symbol("count"), {:capture, :count}}
+            ])
+          ]
+        )
 
-      value = Value.record(
-        Value.symbol("response"),
-        [
-          Value.integer(200),
-          Value.dictionary([
-            {Value.symbol("data"), Value.sequence([Value.string("item1"), Value.string("item2")])},
-            {Value.symbol("count"), Value.integer(2)},
-            {Value.symbol("extra"), Value.boolean(true)}
-          ])
-        ]
-      )
+      value =
+        Value.record(
+          Value.symbol("response"),
+          [
+            Value.integer(200),
+            Value.dictionary([
+              {Value.symbol("data"),
+               Value.sequence([Value.string("item1"), Value.string("item2")])},
+              {Value.symbol("count"), Value.integer(2)},
+              {Value.symbol("extra"), Value.boolean(true)}
+            ])
+          ]
+        )
 
       {:ok, bindings} = Pattern.match(pattern, value)
       assert bindings[:status] == Value.integer(200)
@@ -474,10 +525,12 @@ defmodule Absynthe.Preserves.PatternTest do
     end
 
     test "matches with multiple levels of bind" do
-      inner_pattern = Value.record(
-        Value.symbol("inner"),
-        [{:capture, :x}]
-      )
+      inner_pattern =
+        Value.record(
+          Value.symbol("inner"),
+          [{:capture, :x}]
+        )
+
       middle_pattern = Pattern.bind(:middle, inner_pattern)
       outer_pattern = Pattern.bind(:outer, middle_pattern)
 

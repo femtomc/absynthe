@@ -742,8 +742,9 @@ defmodule Absynthe.Core.Actor do
 
       # IMPORTANT: Update entity state BEFORE processing actions.
       # This ensures nested message deliveries see the updated entity state.
-      state_with_updated_entity = %{state |
-        entities: Map.put(state.entities, entity_id, {facet_id, updated_entity})
+      state_with_updated_entity = %{
+        state
+        | entities: Map.put(state.entities, entity_id, {facet_id, updated_entity})
       }
 
       # Commit the turn - execute pending actions (may trigger nested turns)
@@ -829,7 +830,10 @@ defmodule Absynthe.Core.Actor do
             state
 
           :error ->
-            Logger.warning("Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found")
+            Logger.warning(
+              "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
+            )
+
             state
         end
     end
@@ -853,7 +857,10 @@ defmodule Absynthe.Core.Actor do
             state
 
           :error ->
-            Logger.warning("Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found")
+            Logger.warning(
+              "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
+            )
+
             state
         end
     end

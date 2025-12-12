@@ -83,10 +83,11 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
       # Pattern: match any Person record (using Dataspace.Pattern syntax)
       pattern = Value.record(Value.symbol("Person"), [Value.symbol("_"), Value.symbol("_")])
 
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
 
       # Subscribe observer to the dataspace
       {:ok, _observe_handle} = Actor.assert(actor, ds_ref, observe_assertion)
@@ -104,17 +105,20 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
       {_facet_id, updated_observer} = Map.get(state.entities, Ref.entity_id(observer_ref))
 
       # Observer should have received an assert notification for the Person
-      assert_notifications = Enum.filter(updated_observer.received, fn
-        {:assert, assertion, _handle} ->
-          case assertion do
-            {:record, {{:symbol, "Person"}, _}} -> true
-            _ -> false
-          end
-        _ -> false
-      end)
+      assert_notifications =
+        Enum.filter(updated_observer.received, fn
+          {:assert, assertion, _handle} ->
+            case assertion do
+              {:record, {{:symbol, "Person"}, _}} -> true
+              _ -> false
+            end
+
+          _ ->
+            false
+        end)
 
       assert length(assert_notifications) >= 1,
-        "Observer should receive notification for Person assertion, got: #{inspect(updated_observer.received)}"
+             "Observer should receive notification for Person assertion, got: #{inspect(updated_observer.received)}"
 
       GenServer.stop(actor)
     end
@@ -140,10 +144,12 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
 
       # Subscribe to User records
       pattern = Value.record(Value.symbol("User"), [Value.symbol("_")])
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
 
       {:ok, _observe_handle} = Actor.assert(actor, ds_ref, observe_assertion)
       Process.sleep(100)
@@ -152,13 +158,14 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
       state = :sys.get_state(actor)
       {_facet_id, updated_observer} = Map.get(state.entities, Ref.entity_id(observer_ref))
 
-      user_notifications = Enum.filter(updated_observer.received, fn
-        {:assert, {:record, {{:symbol, "User"}, _}}, _handle} -> true
-        _ -> false
-      end)
+      user_notifications =
+        Enum.filter(updated_observer.received, fn
+          {:assert, {:record, {{:symbol, "User"}, _}}, _handle} -> true
+          _ -> false
+        end)
 
       assert length(user_notifications) == 2,
-        "Observer should receive 2 notifications for existing Users, got: #{inspect(updated_observer.received)}"
+             "Observer should receive 2 notifications for existing Users, got: #{inspect(updated_observer.received)}"
 
       GenServer.stop(actor)
     end
@@ -175,10 +182,12 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
 
       # Subscribe observer to Status records
       pattern = Value.record(Value.symbol("Status"), [Value.symbol("_")])
-      observe_assertion = Value.record(
-        Value.symbol("Observe"),
-        [pattern, {:embedded, observer_ref}]
-      )
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
 
       {:ok, _observe_handle} = Actor.assert(actor, ds_ref, observe_assertion)
       Process.sleep(50)
@@ -199,7 +208,7 @@ defmodule Absynthe.Integration.ActorDataspaceRoutingTest do
       retract_notifications = Enum.filter(updated_observer.received, &match?({:retract, _}, &1))
 
       assert length(retract_notifications) >= 1,
-        "Observer should receive retraction notification, got: #{inspect(updated_observer.received)}"
+             "Observer should receive retraction notification, got: #{inspect(updated_observer.received)}"
 
       GenServer.stop(actor)
     end
