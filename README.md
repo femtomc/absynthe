@@ -1,10 +1,10 @@
-# Absynthe
+# absynthe
 
 <p align="center">
   <img src="assets/logo.png" alt="Absynthe Logo" width="400" height="400">
 </p>
 
-Syndicated Actor Model (SAM) for Elixir. Absynthe follows Tony Garnock-Jones' work on [Syndicate](https://syndicate-lang.org/about/) and [Synit](https://synit.org/): actors exchange persistent assertions via shared dataspaces, reason with patterns, and run in atomic turns.
+Syndicated Actor Model (SAM) for Elixir. `absynthe` follows Tony Garnock-Jones' work on [Syndicate](https://syndicate-lang.org/about/) and [Synit](https://synit.org/): actors exchange persistent assertions via shared dataspaces, reason with patterns, and run in atomic turns.
 
 `absynthe` does the following:
 - Implements SAM semantics on the BEAM: assertions, Observe subscriptions, turns, and fate-sharing facets.
