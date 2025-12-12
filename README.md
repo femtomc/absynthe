@@ -1,8 +1,8 @@
+# Absynthe
+
 <p align="center">
   <img src="assets/logo.png" alt="Absynthe Logo" width="400" height="400">
 </p>
-
-# Absynthe
 
 An implementation of [Tony Garnock-Jones' Syndicated Actor Model](https://syndicate-lang.org/) for Elixir, with full support for the [Preserves](https://preserves.gitlab.io/preserves/preserves.html) data format.
 
