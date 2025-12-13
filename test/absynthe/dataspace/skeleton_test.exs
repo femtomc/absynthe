@@ -43,15 +43,17 @@ defmodule Absynthe.Dataspace.SkeletonTest do
 
       # Observer should be indexed in observer_index
       # The constraint is on [:label] with value {:symbol, "Person"}
+      # With :bag tables, entries are stored as {key, observer_id, exact_value} tuples
       index_key = {[:label], :symbol}
+      entries = :ets.lookup(updated_skeleton.observer_index, index_key)
 
-      case :ets.lookup(updated_skeleton.observer_index, index_key) do
-        [{^index_key, entries}] ->
-          assert MapSet.member?(entries, {observer_id, {:symbol, "Person"}})
+      assert length(entries) > 0,
+             "Expected observer to be indexed at #{inspect(index_key)}"
 
-        [] ->
-          flunk("Expected observer to be indexed at #{inspect(index_key)}")
-      end
+      # Check that our observer entry is present
+      assert Enum.any?(entries, fn {_key, obs_id, exact_val} ->
+               obs_id == observer_id and exact_val == {:symbol, "Person"}
+             end)
 
       # Cleanup
       Skeleton.destroy(updated_skeleton)
@@ -87,29 +89,24 @@ defmodule Absynthe.Dataspace.SkeletonTest do
 
       {skeleton, _matches} = Skeleton.add_observer(skeleton, observer_id, observer_ref, pattern)
 
-      # Verify it's indexed
+      # Verify it's indexed - with :bag tables, entries are {key, observer_id, exact_value} tuples
       index_key = {[:label], :symbol}
+      entries_before = :ets.lookup(skeleton.observer_index, index_key)
 
-      case :ets.lookup(skeleton.observer_index, index_key) do
-        [{^index_key, entries}] ->
-          assert MapSet.member?(entries, {observer_id, {:symbol, "User"}})
-
-        [] ->
-          flunk("Expected observer to be indexed")
-      end
+      assert Enum.any?(entries_before, fn {_key, obs_id, exact_val} ->
+               obs_id == observer_id and exact_val == {:symbol, "User"}
+             end),
+             "Expected observer to be indexed"
 
       # Remove observer
       updated_skeleton = Skeleton.remove_observer(skeleton, observer_id)
 
       # Should be removed from index
-      case :ets.lookup(updated_skeleton.observer_index, index_key) do
-        [{^index_key, entries}] ->
-          refute MapSet.member?(entries, {observer_id, {:symbol, "User"}})
+      entries_after = :ets.lookup(updated_skeleton.observer_index, index_key)
 
-        [] ->
-          # Entry was deleted because it became empty - this is fine
-          :ok
-      end
+      refute Enum.any?(entries_after, fn {_key, obs_id, exact_val} ->
+               obs_id == observer_id and exact_val == {:symbol, "User"}
+             end)
 
       # Cleanup
       Skeleton.destroy(updated_skeleton)

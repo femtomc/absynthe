@@ -11,8 +11,9 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   The Skeleton uses four ETS tables with `:read_concurrency` enabled for parallel reads:
 
-  1. **Path Index**: Maps `{path, value_at_path}` tuples to sets of assertion handles.
-     This allows quick lookup of assertions by specific path values.
+  1. **Path Index**: An ETS `:bag` table storing `{{path, value_at_path}, handle}` entries.
+     Multiple handles can share the same key without copying, reducing GC pressure.
+     Lookup returns a list of `{key, handle}` tuples.
 
   2. **Assertion Store**: Maps assertion handles to their full values. This provides
      fast retrieval of complete assertions once handles are identified.
@@ -20,8 +21,9 @@ defmodule Absynthe.Dataspace.Skeleton do
   3. **Observer Registry**: Maps observer IDs to their compiled patterns and observer
      references. This enables efficient notification when matching assertions change.
 
-  4. **Observer Index**: Maps `{path, value_class}` tuples to sets of `{observer_id, exact_value}`
-     pairs. This allows O(matching observers) lookup instead of scanning all observers.
+  4. **Observer Index**: An ETS `:bag` table storing `{{path, value_class}, observer_id, exact_value}`
+     entries. Multiple observers can share the same key without copying.
+     Lookup returns a list of `{key, observer_id, exact_value}` tuples.
 
   ## Indexing Strategy
 
@@ -121,12 +123,12 @@ defmodule Absynthe.Dataspace.Skeleton do
   The Skeleton index structure.
 
   Contains:
-  - `path_index`: ETS table mapping `{path, value}` to `MapSet.t(Handle.t())`
+  - `path_index`: ETS `:bag` table storing `{path_value_key, handle}` entries. Multiple
+    handles can be stored per key without copying MapSets.
   - `assertions`: ETS table mapping `Handle.t()` to `Value.t()`
   - `observers`: ETS table mapping observer ID to `{Pattern.t(), observer_ref}`
-  - `observer_index`: ETS table mapping `{path, value_class}` to `MapSet.t({observer_id, exact_value | nil})`
-    where value_class is an atom like `:symbol`, `:integer`, etc. and exact_value is the
-    constraint value (or nil for wildcard constraints at that path)
+  - `observer_index`: ETS `:bag` table storing `{path_class_key, observer_id, exact_value}`
+    entries. Multiple observers can be indexed per key without copying MapSets.
   - `wildcard_observers`: Set of observer IDs with unconstrained patterns (match everything)
   - `owner`: PID of the process that created the skeleton
   """
@@ -168,10 +170,12 @@ defmodule Absynthe.Dataspace.Skeleton do
   @spec new() :: t()
   def new do
     %__MODULE__{
-      path_index: :ets.new(:path_index, [:set, :public, read_concurrency: true]),
+      # Use :bag for path_index so we can store multiple handles per key without copying
+      path_index: :ets.new(:path_index, [:bag, :public, read_concurrency: true]),
       assertions: :ets.new(:assertions, [:set, :public, read_concurrency: true]),
       observers: :ets.new(:observers, [:set, :public, read_concurrency: true]),
-      observer_index: :ets.new(:observer_index, [:set, :public, read_concurrency: true]),
+      # Use :bag for observer_index so we can store multiple observers per key without copying
+      observer_index: :ets.new(:observer_index, [:bag, :public, read_concurrency: true]),
       wildcard_observers: MapSet.new(),
       owner: self()
     }
@@ -215,20 +219,13 @@ defmodule Absynthe.Dataspace.Skeleton do
     # Store the full assertion
     :ets.insert(skeleton.assertions, {handle, value})
 
-    # Extract and index all paths
+    # Extract and index all paths - using :bag, we simply insert new entries
+    # without needing to read/modify/write MapSets
     paths = extract_paths(value)
 
     Enum.each(paths, fn {path, path_value} ->
-      key = {path, path_value}
-
-      case :ets.lookup(skeleton.path_index, key) do
-        [{^key, handle_set}] ->
-          new_set = MapSet.put(handle_set, handle)
-          :ets.insert(skeleton.path_index, {key, new_set})
-
-        [] ->
-          :ets.insert(skeleton.path_index, {key, MapSet.new([handle])})
-      end
+      # Insert {key, handle} as a bag entry - no MapSet copying needed
+      :ets.insert(skeleton.path_index, {{path, path_value}, handle})
     end)
 
     # Find matching observers and return notifications
@@ -516,15 +513,16 @@ defmodule Absynthe.Dataspace.Skeleton do
   # Finds candidates using the most selective (smallest) index
   defp find_most_selective_candidates(skeleton, constraints) do
     # Look up all constraints and find the one with the smallest result set
+    # With :bag tables, lookup returns a list of {key, handle} tuples
     candidates_by_constraint =
       constraints
       |> Enum.map(fn {path, expected} ->
         lookup_key = {path, expected}
-
-        case :ets.lookup(skeleton.path_index, lookup_key) do
-          [{^lookup_key, handle_set}] -> {MapSet.size(handle_set), handle_set}
-          [] -> {0, MapSet.new()}
-        end
+        # :bag returns all entries with this key as a list of tuples
+        entries = :ets.lookup(skeleton.path_index, lookup_key)
+        # Extract handles from entries
+        handles = Enum.map(entries, fn {_key, handle} -> handle end)
+        {length(handles), handles}
       end)
 
     case candidates_by_constraint do
@@ -534,7 +532,7 @@ defmodule Absynthe.Dataspace.Skeleton do
       results ->
         # Pick the constraint with the smallest non-empty result set
         # If all are empty, return empty list
-        non_empty = Enum.filter(results, fn {size, _set} -> size > 0 end)
+        non_empty = Enum.filter(results, fn {size, _handles} -> size > 0 end)
 
         case non_empty do
           [] ->
@@ -543,8 +541,8 @@ defmodule Absynthe.Dataspace.Skeleton do
 
           _ ->
             # Pick the smallest (most selective)
-            {_size, best_set} = Enum.min_by(non_empty, fn {size, _set} -> size end)
-            MapSet.to_list(best_set)
+            {_size, best_handles} = Enum.min_by(non_empty, fn {size, _handles} -> size end)
+            best_handles
         end
     end
   end
@@ -705,47 +703,21 @@ defmodule Absynthe.Dataspace.Skeleton do
   defp extract_paths(_atomic, _path), do: []
 
   # Removes assertion handle from path index
+  # With :bag tables, we use delete_object to remove specific entries
   defp remove_from_path_index(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
     paths = extract_paths(value)
 
     Enum.each(paths, fn {path, path_value} ->
-      key = {path, path_value}
-
-      case :ets.lookup(skeleton.path_index, key) do
-        [{^key, handle_set}] ->
-          new_set = MapSet.delete(handle_set, handle)
-
-          if MapSet.size(new_set) == 0 do
-            :ets.delete(skeleton.path_index, key)
-          else
-            :ets.insert(skeleton.path_index, {key, new_set})
-          end
-
-        [] ->
-          :ok
-      end
+      # delete_object removes the exact tuple from a :bag table
+      :ets.delete_object(skeleton.path_index, {{path, path_value}, handle})
     end)
   end
 
   # Cleanup handle from entire index (expensive fallback)
+  # With :bag tables, we use match_delete to remove all entries with this handle
   defp cleanup_handle_from_index(%__MODULE__{} = skeleton, %Handle{} = handle) do
-    :ets.foldl(
-      fn {key, handle_set}, _acc ->
-        if MapSet.member?(handle_set, handle) do
-          new_set = MapSet.delete(handle_set, handle)
-
-          if MapSet.size(new_set) == 0 do
-            :ets.delete(skeleton.path_index, key)
-          else
-            :ets.insert(skeleton.path_index, {key, new_set})
-          end
-        end
-
-        :ok
-      end,
-      :ok,
-      skeleton.path_index
-    )
+    # Match pattern: {any_key, this_handle}
+    :ets.match_delete(skeleton.path_index, {:_, handle})
   end
 
   # Find observers that match a given assertion using the observer index.
@@ -791,33 +763,32 @@ defmodule Absynthe.Dataspace.Skeleton do
     # at least one matching constraint and let Pattern.match filter the rest
 
     # Gather observer_ids that have at least one constraint matching our value
+    # With :bag tables, lookup returns a list of {key, observer_id, exact_value} tuples
     path_candidates =
       paths
       |> Enum.reduce(MapSet.new(), fn {path, path_value}, acc ->
         value_class = value_class(path_value)
         index_key = {path, value_class}
 
-        case :ets.lookup(skeleton.observer_index, index_key) do
-          [{^index_key, observer_entries}] ->
-            # Check each observer entry - if exact_value matches (or is nil for any-of-class)
-            matching =
-              observer_entries
-              |> Enum.filter(fn {_observer_id, exact_value} ->
-                exact_value == nil or exact_value == path_value
-              end)
-              |> Enum.map(fn {observer_id, _} -> observer_id end)
+        # :bag returns all entries with this key as a list of tuples
+        entries = :ets.lookup(skeleton.observer_index, index_key)
 
-            MapSet.union(acc, MapSet.new(matching))
+        # Check each observer entry - if exact_value matches (or is nil for any-of-class)
+        matching =
+          entries
+          |> Enum.filter(fn {_key, _observer_id, exact_value} ->
+            exact_value == nil or exact_value == path_value
+          end)
+          |> Enum.map(fn {_key, observer_id, _exact_value} -> observer_id end)
 
-          [] ->
-            acc
-        end
+        MapSet.union(acc, MapSet.new(matching))
       end)
 
     MapSet.union(base_candidates, path_candidates)
   end
 
   # Index an observer by its pattern constraints for efficient lookup
+  # With :bag tables, we simply insert new entries without copying MapSets
   @spec index_observer(t(), term(), Pattern.t()) :: t()
   defp index_observer(%__MODULE__{} = skeleton, observer_id, %Pattern{} = pattern) do
     constraints = Pattern.index_paths(pattern)
@@ -829,21 +800,12 @@ defmodule Absynthe.Dataspace.Skeleton do
 
       _ ->
         # Add observer to index for each constraint
+        # With :bag, we insert {key, observer_id, expected_value} tuples
         Enum.each(constraints, fn {path, expected_value} ->
           value_class = value_class(expected_value)
           index_key = {path, value_class}
-
-          case :ets.lookup(skeleton.observer_index, index_key) do
-            [{^index_key, observer_entries}] ->
-              new_entries = MapSet.put(observer_entries, {observer_id, expected_value})
-              :ets.insert(skeleton.observer_index, {index_key, new_entries})
-
-            [] ->
-              :ets.insert(
-                skeleton.observer_index,
-                {index_key, MapSet.new([{observer_id, expected_value}])}
-              )
-          end
+          # Insert as a bag entry - no MapSet copying needed
+          :ets.insert(skeleton.observer_index, {index_key, observer_id, expected_value})
         end)
 
         skeleton
@@ -851,6 +813,7 @@ defmodule Absynthe.Dataspace.Skeleton do
   end
 
   # Remove an observer from the index
+  # With :bag tables, we use delete_object to remove specific entries
   @spec unindex_observer(t(), term(), Pattern.t()) :: t()
   defp unindex_observer(%__MODULE__{} = skeleton, observer_id, %Pattern{} = pattern) do
     constraints = Pattern.index_paths(pattern)
@@ -861,24 +824,12 @@ defmodule Absynthe.Dataspace.Skeleton do
         %{skeleton | wildcard_observers: MapSet.delete(skeleton.wildcard_observers, observer_id)}
 
       _ ->
-        # Remove from each index entry
+        # Remove from each index entry using delete_object
         Enum.each(constraints, fn {path, expected_value} ->
           value_class = value_class(expected_value)
           index_key = {path, value_class}
-
-          case :ets.lookup(skeleton.observer_index, index_key) do
-            [{^index_key, observer_entries}] ->
-              new_entries = MapSet.delete(observer_entries, {observer_id, expected_value})
-
-              if MapSet.size(new_entries) == 0 do
-                :ets.delete(skeleton.observer_index, index_key)
-              else
-                :ets.insert(skeleton.observer_index, {index_key, new_entries})
-              end
-
-            [] ->
-              :ok
-          end
+          # delete_object removes the exact tuple from the :bag table
+          :ets.delete_object(skeleton.observer_index, {index_key, observer_id, expected_value})
         end)
 
         skeleton

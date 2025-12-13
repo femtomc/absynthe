@@ -104,10 +104,10 @@ defmodule Absynthe.Dataspace.Dataspace do
   ### `Absynthe.Dataspace.Skeleton`
 
   The Skeleton uses four ETS tables for efficient indexing, plus a wildcard observer set:
-  - **path_index**: Maps `{path, value}` to assertion handles
+  - **path_index**: ETS `:bag` storing `{{path, value}, handle}` entries (multiple handles per key)
   - **assertions**: Maps handles to assertion values
   - **observers**: Maps observer IDs to `{pattern, ref}`
-  - **observer_index**: Maps `{path, value_class}` to sets of `{observer_id, exact_value}`
+  - **observer_index**: ETS `:bag` storing `{{path, value_class}, observer_id, exact_value}` entries
   - **wildcard_observers** (in struct): Observer IDs with unconstrained patterns
 
   The module must provide:
