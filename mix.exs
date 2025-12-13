@@ -99,7 +99,8 @@ defmodule Absynthe.MixProject do
   defp deps do
     [
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
-      {:decibel, "~> 0.2.4"}
+      {:decibel, "~> 0.2.4"},
+      {:telemetry, "~> 1.0"}
     ]
   end
 end

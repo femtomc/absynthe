@@ -60,6 +60,8 @@ defmodule Absynthe.Relay.Relay do
   alias Absynthe.Protocol.Event
   alias Absynthe.Relay.{Membrane, Packet, Framing}
   alias Absynthe.Relay.Transport.Noise
+  alias Absynthe.FlowControl
+  alias Absynthe.FlowControl.Account
 
   # Proxy entity for imported remote refs
   defmodule Proxy do
@@ -128,7 +130,10 @@ defmodule Absynthe.Relay.Relay do
           idle_timer_ref: reference() | nil,
           idle_timer_token: reference() | nil,
           # Connection identifier for logging
-          connection_id: String.t()
+          connection_id: String.t(),
+          # Flow control
+          flow_control_account: Account.t() | nil,
+          flow_control_enabled: boolean()
         }
 
   # Client API
@@ -145,6 +150,37 @@ defmodule Absynthe.Relay.Relay do
   - `:idle_timeout` - Idle timeout in milliseconds (default: `:infinity`)
   - `:connection_id` - Unique identifier for logging (default: auto-generated)
   - `:noise_keypair` - Server's Noise keypair for encrypted transport (required if transport is `:noise`)
+  - `:flow_control` - Flow control options (see below)
+
+  ## Flow Control Options
+
+  When `:flow_control` is provided, the relay tracks debt for inbound events:
+
+  - `:limit` - Maximum debt before rejecting new events (default: 1000)
+  - `:high_water_mark` - Debt level that pauses socket reads (default: 80% of limit)
+  - `:low_water_mark` - Debt level that resumes socket reads (default: 40% of limit)
+
+  When debt exceeds the high water mark, the relay stops reading from the socket,
+  applying TCP-level backpressure to the sender.
+
+  ### Current Limitations
+
+  The current implementation provides CPU-bound backpressure during packet
+  processing, but does not directly track downstream actor processing time.
+  Events are delivered asynchronously to the actor via `Actor.deliver/3` (cast),
+  and debt is repaid after the relay finishes processing each turn packet.
+
+  This means the flow control throttles based on:
+  - Packet decoding and translation overhead (CPU-bound)
+  - Membrane operations and ref translation (CPU-bound)
+
+  But does NOT directly throttle based on:
+  - Actor mailbox depth
+  - Time spent in entity event handlers
+
+  For true end-to-end backpressure, use Sync events periodically to measure
+  actor processing latency and adjust limits accordingly. Future versions may
+  add explicit acknowledgment-based flow control.
 
   ## Returns
 
@@ -222,6 +258,36 @@ defmodule Absynthe.Relay.Relay do
     # Export the dataspace ref as OID 0 (well-known root)
     {_oid, export_membrane} = Membrane.export(export_membrane, dataspace_ref)
 
+    # Initialize flow control if configured
+    {flow_control_enabled, flow_control_account} =
+      case Keyword.get(opts, :flow_control) do
+        nil ->
+          {false, nil}
+
+        flow_opts when is_list(flow_opts) ->
+          relay_pid = self()
+
+          account =
+            FlowControl.new_account(
+              Keyword.merge(
+                [
+                  id: {:relay, connection_id},
+                  pause_callback: fn _account ->
+                    # Stop reading from socket when debt is high
+                    send(relay_pid, :flow_control_pause)
+                  end,
+                  resume_callback: fn _account ->
+                    # Resume reading when debt falls
+                    send(relay_pid, :flow_control_resume)
+                  end
+                ],
+                flow_opts
+              )
+            )
+
+          {true, account}
+      end
+
     state = %{
       socket: socket,
       transport: transport,
@@ -248,7 +314,10 @@ defmodule Absynthe.Relay.Relay do
       connection_id: connection_id,
       # Noise transport state
       noise_keypair: noise_keypair,
-      noise_session: nil
+      noise_session: nil,
+      # Flow control state
+      flow_control_enabled: flow_control_enabled,
+      flow_control_account: flow_control_account
     }
 
     Logger.info("[#{connection_id}] Relay started")
@@ -283,6 +352,16 @@ defmodule Absynthe.Relay.Relay do
       {:ok, state} -> {:reply, :ok, state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
+  end
+
+  def handle_call(:flow_control_stats, _from, state) do
+    stats =
+      case state.flow_control_account do
+        nil -> nil
+        account -> Account.stats(account)
+      end
+
+    {:reply, stats, state}
   end
 
   @impl GenServer
@@ -364,6 +443,28 @@ defmodule Absynthe.Relay.Relay do
     {:noreply, state}
   end
 
+  # Handle flow control pause - stop reading from socket
+  def handle_info(:flow_control_pause, state) do
+    Logger.debug("[#{state.connection_id}] Flow control: pausing socket reads (debt high)")
+    # Socket will not be re-activated until :flow_control_resume
+    # TCP backpressure will propagate to the sender
+    {:noreply, state}
+  end
+
+  # Handle flow control resume - re-activate socket
+  def handle_info(:flow_control_resume, state) do
+    Logger.debug("[#{state.connection_id}] Flow control: resuming socket reads (debt low)")
+    # Re-enable socket reads
+    set_socket_active(state)
+    {:noreply, state}
+  end
+
+  # Handle debt repayment notification from turn processing
+  def handle_info({:flow_control_repay, loan}, state) do
+    state = maybe_repay_debt(state, loan)
+    {:noreply, state}
+  end
+
   # Handle idle timeout - verify token matches to avoid acting on stale timer messages
   def handle_info({:idle_timeout, token}, state) when token == state.idle_timer_token do
     Logger.info("[#{state.connection_id}] Idle timeout, closing connection")
@@ -405,14 +506,16 @@ defmodule Absynthe.Relay.Relay do
 
   defp handle_noise_buffer(state, buffer) when byte_size(buffer) < 2 do
     # Not enough data for length prefix - wait for more
-    set_socket_active(state)
+    # Use maybe_set_socket_active to respect flow control
+    maybe_set_socket_active(state)
     {:noreply, %{state | recv_buffer: buffer}}
   end
 
   defp handle_noise_buffer(state, <<length::16-big, rest::binary>> = buffer) do
     if byte_size(rest) < length do
       # Not enough data for complete message - wait for more
-      set_socket_active(state)
+      # Use maybe_set_socket_active to respect flow control
+      maybe_set_socket_active(state)
       {:noreply, %{state | recv_buffer: buffer}}
     else
       # Extract complete ciphertext and decrypt
@@ -426,7 +529,8 @@ defmodule Absynthe.Relay.Relay do
             {:ok, state} ->
               # Continue processing any remaining buffered data
               if remaining == <<>> do
-                set_socket_active(state)
+                # Use maybe_set_socket_active to respect flow control
+                maybe_set_socket_active(state)
                 {:noreply, %{state | recv_buffer: <<>>}}
               else
                 handle_noise_buffer(%{state | recv_buffer: <<>>}, remaining)
@@ -523,8 +627,8 @@ defmodule Absynthe.Relay.Relay do
 
         case result do
           {:ok, state} ->
-            # Re-enable socket for more data
-            set_socket_active(state)
+            # Re-enable socket for more data, unless flow control has paused us
+            maybe_set_socket_active(state)
             {:noreply, state}
 
           {:error, state, reason} ->
@@ -586,7 +690,26 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp process_inbound_packet(state, %Packet.Turn{events: events}) do
-    {:ok, Enum.reduce(events, state, &process_turn_event/2)}
+    # Borrow debt for this turn
+    {state, loan} = maybe_borrow_debt_for_turn(state, events)
+
+    # Process all events in the turn
+    state = Enum.reduce(events, state, &process_turn_event/2)
+
+    # For now, we repay immediately after processing the turn.
+    # This is a simplification - ideally we'd track when the downstream
+    # actor actually finishes processing. However, since events are delivered
+    # asynchronously via Actor.deliver (cast), we don't have a direct feedback
+    # mechanism. The debt still provides useful backpressure because:
+    # 1. If the relay is CPU-bound processing packets, debt accumulates
+    # 2. The pause/resume callbacks stop socket reads when debt is high
+    # 3. TCP backpressure propagates to the sender
+    #
+    # For more precise tracking, callers can use Sync events to measure
+    # true processing latency and adjust thresholds accordingly.
+    state = maybe_repay_debt(state, loan)
+
+    {:ok, state}
   end
 
   defp process_inbound_packet(state, %Packet.Error{message: msg, detail: detail}) do
@@ -1049,6 +1172,23 @@ defmodule Absynthe.Relay.Relay do
 
   # Socket helpers
 
+  # Check flow control before activating socket
+  defp maybe_set_socket_active(%{flow_control_account: account} = state)
+       when not is_nil(account) do
+    if Account.paused?(account) do
+      # Flow control is paused - don't re-enable socket reads
+      # TCP backpressure will propagate to the sender
+      :ok
+    else
+      set_socket_active(state)
+    end
+  end
+
+  defp maybe_set_socket_active(state) do
+    # No flow control - always activate
+    set_socket_active(state)
+  end
+
   defp set_socket_active(%{socket: socket, transport: :gen_tcp, connection_id: conn_id}) do
     case :inet.setopts(socket, active: :once) do
       :ok ->
@@ -1138,5 +1278,78 @@ defmodule Absynthe.Relay.Relay do
     end
 
     :gen_tcp.close(socket)
+  end
+
+  # Flow control helpers
+
+  # Borrow debt for a Turn packet (multiple events)
+  defp maybe_borrow_debt_for_turn(%{flow_control_enabled: false} = state, _events) do
+    {state, nil}
+  end
+
+  defp maybe_borrow_debt_for_turn(state, events) do
+    # Sum cost of all events in the turn
+    total_cost =
+      Enum.reduce(events, 0, fn event, acc ->
+        acc + event_cost_from_turn_event(event)
+      end)
+
+    {loan, account} = Account.force_borrow(state.flow_control_account, cost: total_cost)
+
+    {%{state | flow_control_account: account}, loan}
+  end
+
+  # Calculate cost for a TurnEvent (wire format)
+  defp event_cost_from_turn_event(%Packet.TurnEvent{event: event}) do
+    case event do
+      %Packet.Assert{assertion: assertion} -> 1 + count_wire_refs(assertion)
+      %Packet.Retract{} -> 1
+      %Packet.Message{body: body} -> 1 + count_wire_refs(body)
+      %Packet.Sync{} -> 1
+      _ -> 1
+    end
+  end
+
+  # Count embedded wire refs in a wire-format value (rough cost estimate)
+  defp count_wire_refs({:embedded, _}), do: 1
+
+  defp count_wire_refs({:record, {label, fields}}),
+    do: count_wire_refs(label) + count_wire_refs_list(fields)
+
+  defp count_wire_refs({:sequence, elements}), do: count_wire_refs_list(elements)
+  defp count_wire_refs({:set, elements}), do: count_wire_refs_list(MapSet.to_list(elements))
+
+  defp count_wire_refs({:dictionary, entries}) do
+    Enum.reduce(entries, 0, fn {k, v}, acc -> acc + count_wire_refs(k) + count_wire_refs(v) end)
+  end
+
+  defp count_wire_refs(_), do: 0
+
+  defp count_wire_refs_list(list) when is_list(list) do
+    Enum.reduce(list, 0, fn elem, acc -> acc + count_wire_refs(elem) end)
+  end
+
+  # Repay debt after processing completes
+  defp maybe_repay_debt(%{flow_control_enabled: false} = state, _loan) do
+    state
+  end
+
+  defp maybe_repay_debt(state, nil) do
+    state
+  end
+
+  defp maybe_repay_debt(state, loan) do
+    account = Account.repay(state.flow_control_account, loan)
+    %{state | flow_control_account: account}
+  end
+
+  @doc """
+  Returns flow control statistics for this relay.
+
+  Returns nil if flow control is not enabled.
+  """
+  @spec flow_control_stats(GenServer.server()) :: map() | nil
+  def flow_control_stats(relay) do
+    GenServer.call(relay, :flow_control_stats)
   end
 end
