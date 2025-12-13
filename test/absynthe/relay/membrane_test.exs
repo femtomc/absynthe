@@ -443,5 +443,45 @@ defmodule Absynthe.Relay.MembraneTest do
       assert Ref.attenuated?(with_atten)
       assert Ref.attenuation(with_atten) == [:caveat]
     end
+
+    test "preserves first attenuation when re-exporting with equal-length chain" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      # First export with caveat_a
+      attenuated_a = Ref.with_attenuation(ref, [:caveat_a])
+      {oid, membrane} = Membrane.export(membrane, attenuated_a)
+
+      # Re-export with different but equal-length caveat_b
+      attenuated_b = Ref.with_attenuation(ref, [:caveat_b])
+      {oid2, membrane} = Membrane.export(membrane, attenuated_b)
+
+      # Same OID
+      assert oid == oid2
+
+      # Fail-safe: preserves original attenuation (caveat_a), doesn't merge
+      # This avoids breaking order-sensitive rewrite semantics
+      {:ok, looked_up} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+      assert Ref.attenuation(looked_up) == [:caveat_a]
+    end
+
+    test "updates attenuation when re-exporting with longer chain" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      # First export with one caveat
+      attenuated_short = Ref.with_attenuation(ref, [:caveat_a])
+      {oid, membrane} = Membrane.export(membrane, attenuated_short)
+
+      # Re-export with longer chain (more restrictive)
+      attenuated_long = Ref.with_attenuation(ref, [:caveat_b, :caveat_c])
+      {oid2, membrane} = Membrane.export(membrane, attenuated_long)
+
+      assert oid == oid2
+
+      # Should update to the longer (more restrictive) chain
+      {:ok, looked_up} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+      assert Ref.attenuation(looked_up) == [:caveat_b, :caveat_c]
+    end
   end
 end
