@@ -593,6 +593,47 @@ defmodule Absynthe.Relay.EdgeCaseTest do
       # Clean up (broker may already be dead from cascade)
       if Process.alive?(broker), do: Broker.stop(broker)
     end
+
+    test "relay closes connection when receiving error packet from peer" do
+      # This test verifies that when a relay receives an Error packet,
+      # it closes the connection as per Syndicate protocol spec.
+      # Per the spec: "Receipt of an error packet means the sender has
+      # crashed and will not respond further. The session should be closed."
+
+      socket_path = "/tmp/absynthe_error_packet_#{:erlang.unique_integer([:positive])}.sock"
+
+      # Start broker - trap exits to catch any unexpected crashes
+      Process.flag(:trap_exit, true)
+      {:ok, broker} = Broker.start_link(socket_path: socket_path)
+      Process.sleep(100)
+
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false])
+      Process.sleep(100)
+
+      # Create and send an error packet
+      error_packet = Packet.error("peer crashed", {:symbol, "test_crash"})
+      {:ok, error_bytes} = Framing.encode(error_packet)
+      :ok = :gen_tcp.send(client, error_bytes)
+
+      # Give time for the relay to process the error packet and close
+      Process.sleep(200)
+
+      # The connection should be closed - verify by attempting to receive
+      # The relay should have closed its end after receiving the error packet
+      result = :gen_tcp.recv(client, 0, 500)
+
+      # Connection must be closed (not just timed out)
+      assert result == {:error, :closed},
+             "Expected connection to be closed, got: #{inspect(result)}"
+
+      :gen_tcp.close(client)
+
+      # Critical: verify broker stayed alive (graceful shutdown, no cascade)
+      assert Process.alive?(broker),
+             "Broker should not crash when relay receives peer error packet"
+
+      Broker.stop(broker)
+    end
   end
 
   describe "Packet encoding/decoding edge cases" do

@@ -330,36 +330,59 @@ defmodule Absynthe.Relay.Relay do
         state = %{state | recv_buffer: buffer}
 
         # Process each packet with error handling
-        state =
-          Enum.reduce(packets, state, fn packet, acc_state ->
+        # Use reduce_while to stop early if we receive an Error packet
+        result =
+          Enum.reduce_while(packets, {:ok, state}, fn packet, {:ok, acc_state} ->
             try do
-              process_inbound_packet(acc_state, packet)
+              case process_inbound_packet(acc_state, packet) do
+                {:ok, new_state} -> {:cont, {:ok, new_state}}
+                {:error, new_state, reason} -> {:halt, {:error, new_state, reason}}
+              end
             rescue
               error ->
                 Logger.error("Relay: error processing packet: #{inspect(error)}")
                 Logger.error(Exception.format_stacktrace(__STACKTRACE__))
-                acc_state
+                {:cont, {:ok, acc_state}}
             end
           end)
 
-        # Re-enable socket for more data
-        set_socket_active(state)
+        case result do
+          {:ok, state} ->
+            # Re-enable socket for more data
+            set_socket_active(state)
+            {:noreply, state}
 
-        {:noreply, state}
+          {:error, state, reason} ->
+            # Error packet received - close connection gracefully.
+            # Per Syndicate protocol: receiving an error packet means the peer crashed.
+            # Use {:shutdown, reason} to avoid cascading crashes to linked processes.
+            {:stop, {:shutdown, {:peer_error, reason}}, %{state | closed: true}}
+        end
 
       {:error, reason, packets, _buffer} ->
         # Process any packets that were successfully decoded before the error
-        state =
-          Enum.reduce(packets, state, fn packet, acc_state ->
+        # Use reduce_while to stop early if we receive an Error packet
+        result =
+          Enum.reduce_while(packets, {:ok, state}, fn packet, {:ok, acc_state} ->
             try do
-              process_inbound_packet(acc_state, packet)
+              case process_inbound_packet(acc_state, packet) do
+                {:ok, new_state} -> {:cont, {:ok, new_state}}
+                {:error, new_state, reason} -> {:halt, {:error, new_state, reason}}
+              end
             rescue
               error ->
                 Logger.error("Relay: error processing packet: #{inspect(error)}")
                 Logger.error(Exception.format_stacktrace(__STACKTRACE__))
-                acc_state
+                {:cont, {:ok, acc_state}}
             end
           end)
+
+        # Check if an error packet was received before the decode error
+        state =
+          case result do
+            {:ok, s} -> s
+            {:error, s, _peer_error} -> s
+          end
 
         # Log the decode error and close the connection
         Logger.error("Relay: framing decode error: #{inspect(reason)}, closing connection")
@@ -379,22 +402,23 @@ defmodule Absynthe.Relay.Relay do
 
   defp process_inbound_packet(state, :nop) do
     # Keepalive - no action needed
-    state
+    {:ok, state}
   end
 
   defp process_inbound_packet(state, %Packet.Turn{events: events}) do
-    Enum.reduce(events, state, &process_turn_event/2)
+    {:ok, Enum.reduce(events, state, &process_turn_event/2)}
   end
 
   defp process_inbound_packet(state, %Packet.Error{message: msg, detail: detail}) do
     Logger.error("Relay: received error from peer: #{msg} (#{inspect(detail)})")
-    # The connection should be closed after an error
-    state
+    # Per Syndicate protocol: receiving an error packet means the sender has
+    # crashed and will not respond further. Close the connection.
+    {:error, state, {:peer_error, msg, detail}}
   end
 
   defp process_inbound_packet(state, %Packet.Extension{label: label}) do
     Logger.debug("Relay: ignoring unknown extension: #{inspect(label)}")
-    state
+    {:ok, state}
   end
 
   defp process_turn_event(%Packet.TurnEvent{oid: oid, event: event}, state) do

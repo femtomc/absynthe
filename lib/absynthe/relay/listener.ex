@@ -259,7 +259,10 @@ defmodule Absynthe.Relay.Listener do
         relay_opts
       end
 
-    case Relay.start_link(relay_opts) do
+    # Use start instead of start_link to avoid exit propagation.
+    # The relay is monitored (below), so we'll handle its termination properly.
+    # This prevents cascading crashes when a peer sends an error packet.
+    case GenServer.start(Relay, relay_opts) do
       {:ok, relay_pid} ->
         # Transfer socket ownership to the relay
         Logger.debug(
