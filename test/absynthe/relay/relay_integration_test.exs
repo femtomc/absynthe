@@ -1,7 +1,7 @@
 defmodule Absynthe.Relay.RelayIntegrationTest do
   use ExUnit.Case
 
-  alias Absynthe.Relay.{Broker, Framing, Packet}
+  alias Absynthe.Relay.{Broker, Framing, Membrane}
   alias Absynthe.Relay.Packet.{Turn, TurnEvent, Assert, Retract, Message}
 
   @moduletag :integration

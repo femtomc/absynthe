@@ -108,6 +108,10 @@ defmodule Absynthe.Relay.Relay do
           local_handles: %{Handle.t() => non_neg_integer()},
           wire_handles: %{non_neg_integer() => Handle.t()},
           handle_to_oid: %{Handle.t() => non_neg_integer()},
+          # Track which OIDs were imported for each inbound assertion (for decref on retract)
+          inbound_handle_oids: %{Handle.t() => [non_neg_integer()]},
+          # Track which OIDs were exported for each outbound assertion (for decref on retract)
+          outbound_handle_oids: %{Handle.t() => [non_neg_integer()]},
           next_wire_handle: non_neg_integer(),
           pending_syncs: %{non_neg_integer() => Ref.t()},
           next_sync_id: non_neg_integer(),
@@ -200,6 +204,8 @@ defmodule Absynthe.Relay.Relay do
       local_handles: %{},
       wire_handles: %{},
       handle_to_oid: %{},
+      inbound_handle_oids: %{},
+      outbound_handle_oids: %{},
       next_wire_handle: 0,
       pending_syncs: %{},
       next_sync_id: 0,
@@ -356,7 +362,7 @@ defmodule Absynthe.Relay.Relay do
     # Look up the target ref from our export membrane
     case Membrane.lookup_by_oid(state.export_membrane, oid) do
       {:ok, ref} ->
-        process_event_for_ref(state, ref, event)
+        process_event_for_ref(state, ref, oid, event)
 
       :error ->
         Logger.warning("Relay: received event for unknown OID #{oid}")
@@ -364,18 +370,34 @@ defmodule Absynthe.Relay.Relay do
     end
   end
 
-  defp process_event_for_ref(state, ref, %Packet.Assert{assertion: assertion, handle: wire_handle}) do
+  defp process_event_for_ref(state, ref, _target_oid, %Packet.Assert{
+         assertion: assertion,
+         handle: wire_handle
+       }) do
     # Translate embedded wire refs in the assertion to local refs
-    {translated_assertion, state} = translate_inbound_refs(state, assertion)
+    {translated_assertion, state, oids_referenced} = translate_inbound_refs(state, assertion)
 
     # Create a local handle
     local_handle = Handle.new({:relay, self()}, wire_handle)
 
-    # Track handle mapping
+    # Increment refcount for each OID embedded in the assertion
+    # Note: We do NOT count the target OID - exported OIDs (like OID 0 for dataspace)
+    # remain valid for the lifetime of the relay, not tied to individual assertion lifecycles.
+    # The refcount tracks embedded OIDs which represent transient capabilities.
+    {import_membrane, export_membrane} =
+      Enum.reduce(oids_referenced, {state.import_membrane, state.export_membrane}, fn
+        {:export, oid}, {imp, exp} -> {imp, Membrane.inc_ref(exp, oid)}
+        oid, {imp, exp} -> {Membrane.inc_ref(imp, oid), exp}
+      end)
+
+    # Track handle mapping and OIDs for later decref
     state = %{
       state
       | wire_handles: Map.put(state.wire_handles, wire_handle, local_handle),
-        local_handles: Map.put(state.local_handles, local_handle, wire_handle)
+        local_handles: Map.put(state.local_handles, local_handle, wire_handle),
+        import_membrane: import_membrane,
+        export_membrane: export_membrane,
+        inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced)
     }
 
     # Deliver assertion to the local entity
@@ -388,18 +410,36 @@ defmodule Absynthe.Relay.Relay do
     state
   end
 
-  defp process_event_for_ref(state, ref, %Packet.Retract{handle: wire_handle}) do
+  defp process_event_for_ref(state, ref, _target_oid, %Packet.Retract{handle: wire_handle}) do
     case Map.get(state.wire_handles, wire_handle) do
       nil ->
         Logger.warning("Relay: retract for unknown handle #{wire_handle}")
         state
 
       local_handle ->
+        # Get the OIDs that were referenced by this assertion
+        oids_referenced = Map.get(state.inbound_handle_oids, local_handle, [])
+
+        # Decrement refcount for each OID, potentially GC'ing them
+        {import_membrane, export_membrane} =
+          Enum.reduce(oids_referenced, {state.import_membrane, state.export_membrane}, fn
+            {:export, oid}, {imp, exp} ->
+              {exp, _status} = Membrane.dec_ref(exp, oid)
+              {imp, exp}
+
+            oid, {imp, exp} ->
+              {imp, _status} = Membrane.dec_ref(imp, oid)
+              {imp, exp}
+          end)
+
         # Clean up handle mapping
         state = %{
           state
           | wire_handles: Map.delete(state.wire_handles, wire_handle),
-            local_handles: Map.delete(state.local_handles, local_handle)
+            local_handles: Map.delete(state.local_handles, local_handle),
+            import_membrane: import_membrane,
+            export_membrane: export_membrane,
+            inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle)
         }
 
         # Deliver retraction
@@ -409,9 +449,10 @@ defmodule Absynthe.Relay.Relay do
     end
   end
 
-  defp process_event_for_ref(state, ref, %Packet.Message{body: body}) do
+  defp process_event_for_ref(state, ref, _target_oid, %Packet.Message{body: body}) do
     # Translate embedded wire refs
-    {translated_body, state} = translate_inbound_refs(state, body)
+    # Note: Messages don't need refcount tracking since they're not persisted
+    {translated_body, state, _oids} = translate_inbound_refs(state, body)
 
     # Deliver message
     Actor.deliver(state.actor_pid, ref, Event.message(ref, translated_body))
@@ -419,7 +460,7 @@ defmodule Absynthe.Relay.Relay do
     state
   end
 
-  defp process_event_for_ref(state, ref, %Packet.Sync{}) do
+  defp process_event_for_ref(state, ref, _target_oid, %Packet.Sync{}) do
     # Generate a sync ID to track the response
     sync_id = state.next_sync_id
 
@@ -440,6 +481,7 @@ defmodule Absynthe.Relay.Relay do
   end
 
   # Translate wire refs in a value to local refs
+  # Returns {translated_value, state, imported_oids}
   defp translate_inbound_refs(state, {:embedded, wire_ref_value}) do
     case Packet.decode_wire_ref(wire_ref_value) do
       {:ok, %Packet.WireRef{variant: :mine, oid: oid}} ->
@@ -458,7 +500,8 @@ defmodule Absynthe.Relay.Relay do
           end)
 
         state = %{state | import_membrane: import_membrane}
-        {{:embedded, ref}, state}
+        # Track this OID as imported (for refcounting)
+        {{:embedded, ref}, state, [oid]}
 
       {:ok, %Packet.WireRef{variant: :yours, oid: oid, attenuation: attenuation}} ->
         # Peer is returning a reference we exported to them
@@ -472,75 +515,86 @@ defmodule Absynthe.Relay.Relay do
                 Ref.with_attenuation(ref, attenuation)
               end
 
-            {{:embedded, ref}, state}
+            # Track this OID in export membrane (for refcounting)
+            {{:embedded, ref}, state, [{:export, oid}]}
 
           :error ->
             Logger.warning("Relay: yours ref for unknown OID #{oid}")
-            {{:embedded, nil}, state}
+            {{:embedded, nil}, state, []}
         end
 
       {:error, reason} ->
         Logger.warning("Relay: failed to decode wire ref: #{inspect(reason)}")
-        {{:embedded, nil}, state}
+        {{:embedded, nil}, state, []}
     end
   end
 
   defp translate_inbound_refs(state, {:record, {label, fields}}) do
-    {translated_label, state} = translate_inbound_refs(state, label)
-    {translated_fields, state} = translate_inbound_refs_list(state, fields)
-    {{:record, {translated_label, translated_fields}}, state}
+    {translated_label, state, oids1} = translate_inbound_refs(state, label)
+    {translated_fields, state, oids2} = translate_inbound_refs_list(state, fields)
+    {{:record, {translated_label, translated_fields}}, state, oids1 ++ oids2}
   end
 
   defp translate_inbound_refs(state, {:sequence, elements}) do
-    {translated, state} = translate_inbound_refs_list(state, elements)
-    {{:sequence, translated}, state}
+    {translated, state, oids} = translate_inbound_refs_list(state, elements)
+    {{:sequence, translated}, state, oids}
   end
 
   defp translate_inbound_refs(state, {:set, elements}) do
-    {translated, state} = translate_inbound_refs_list(state, MapSet.to_list(elements))
-    {{:set, MapSet.new(translated)}, state}
+    {translated, state, oids} = translate_inbound_refs_list(state, MapSet.to_list(elements))
+    {{:set, MapSet.new(translated)}, state, oids}
   end
 
   defp translate_inbound_refs(state, {:dictionary, entries}) do
-    {translated, state} =
-      Enum.reduce(entries, {[], state}, fn {k, v}, {acc, s} ->
-        {tk, s} = translate_inbound_refs(s, k)
-        {tv, s} = translate_inbound_refs(s, v)
-        {[{tk, tv} | acc], s}
+    {translated, state, oids} =
+      Enum.reduce(entries, {[], state, []}, fn {k, v}, {acc, s, acc_oids} ->
+        {tk, s, oids_k} = translate_inbound_refs(s, k)
+        {tv, s, oids_v} = translate_inbound_refs(s, v)
+        {[{tk, tv} | acc], s, acc_oids ++ oids_k ++ oids_v}
       end)
 
-    {{:dictionary, Map.new(translated)}, state}
+    {{:dictionary, Map.new(translated)}, state, oids}
   end
 
   # Atomic values pass through unchanged
-  defp translate_inbound_refs(state, value), do: {value, state}
+  defp translate_inbound_refs(state, value), do: {value, state, []}
 
   defp translate_inbound_refs_list(state, list) do
-    {translated, state} =
-      Enum.reduce(list, {[], state}, fn elem, {acc, s} ->
-        {t, s} = translate_inbound_refs(s, elem)
-        {[t | acc], s}
+    {translated, state, oids} =
+      Enum.reduce(list, {[], state, []}, fn elem, {acc, s, acc_oids} ->
+        {t, s, elem_oids} = translate_inbound_refs(s, elem)
+        {[t | acc], s, acc_oids ++ elem_oids}
       end)
 
-    {Enum.reverse(translated), state}
+    {Enum.reverse(translated), state, oids}
   end
 
   # Handle outbound events (local -> peer)
 
   defp handle_outbound_assert(state, oid, assertion, handle) do
     # Translate local refs to wire refs
-    {translated_assertion, state} = translate_outbound_refs(state, assertion)
+    {translated_assertion, state, oids_referenced} = translate_outbound_refs(state, assertion)
 
     # Map local handle to wire handle
     wire_handle = state.next_wire_handle
     state = %{state | next_wire_handle: wire_handle + 1}
 
-    # Track handle -> wire_handle, wire_handle -> handle, and handle -> oid
+    # Increment refcount for each OID referenced in the assertion
+    {export_membrane, import_membrane} =
+      Enum.reduce(oids_referenced, {state.export_membrane, state.import_membrane}, fn
+        {:import, oid}, {exp, imp} -> {exp, Membrane.inc_ref(imp, oid)}
+        oid, {exp, imp} -> {Membrane.inc_ref(exp, oid), imp}
+      end)
+
+    # Track handle -> wire_handle, wire_handle -> handle, handle -> oid, and handle -> oids
     state = %{
       state
       | local_handles: Map.put(state.local_handles, handle, wire_handle),
         wire_handles: Map.put(state.wire_handles, wire_handle, handle),
-        handle_to_oid: Map.put(state.handle_to_oid, handle, oid)
+        handle_to_oid: Map.put(state.handle_to_oid, handle, oid),
+        export_membrane: export_membrane,
+        import_membrane: import_membrane,
+        outbound_handle_oids: Map.put(state.outbound_handle_oids, handle, oids_referenced)
     }
 
     # Send assert packet
@@ -563,12 +617,30 @@ defmodule Absynthe.Relay.Relay do
         # Look up the OID that this assertion was originally made to
         case Map.fetch(state.handle_to_oid, handle) do
           {:ok, oid} ->
+            # Get the OIDs that were referenced by this assertion
+            oids_referenced = Map.get(state.outbound_handle_oids, handle, [])
+
+            # Decrement refcount for each OID, potentially GC'ing them
+            {export_membrane, import_membrane} =
+              Enum.reduce(oids_referenced, {state.export_membrane, state.import_membrane}, fn
+                {:import, oid}, {exp, imp} ->
+                  {imp, _status} = Membrane.dec_ref(imp, oid)
+                  {exp, imp}
+
+                oid, {exp, imp} ->
+                  {exp, _status} = Membrane.dec_ref(exp, oid)
+                  {exp, imp}
+              end)
+
             # Clean up all mappings
             state = %{
               state
               | local_handles: Map.delete(state.local_handles, handle),
                 wire_handles: Map.delete(state.wire_handles, wire_handle),
-                handle_to_oid: Map.delete(state.handle_to_oid, handle)
+                handle_to_oid: Map.delete(state.handle_to_oid, handle),
+                export_membrane: export_membrane,
+                import_membrane: import_membrane,
+                outbound_handle_oids: Map.delete(state.outbound_handle_oids, handle)
             }
 
             event = Packet.event(oid, Packet.retract(wire_handle))
@@ -585,17 +657,20 @@ defmodule Absynthe.Relay.Relay do
             )
 
             # Clean up handle mappings but don't send a retract with wrong OID
+            # Also clean up OID tracking
             %{
               state
               | local_handles: Map.delete(state.local_handles, handle),
-                wire_handles: Map.delete(state.wire_handles, wire_handle)
+                wire_handles: Map.delete(state.wire_handles, wire_handle),
+                outbound_handle_oids: Map.delete(state.outbound_handle_oids, handle)
             }
         end
     end
   end
 
   defp handle_outbound_message(state, oid, message) do
-    {translated_message, state} = translate_outbound_refs(state, message)
+    # Note: Messages don't need refcount tracking since they're transient
+    {translated_message, state, _oids} = translate_outbound_refs(state, message)
 
     event = Packet.event(oid, Packet.message(translated_message))
     turn = Packet.turn([event])
@@ -641,6 +716,7 @@ defmodule Absynthe.Relay.Relay do
   end
 
   # Translate local refs in a value to wire refs
+  # Returns {translated_value, state, exported_oids}
   defp translate_outbound_refs(state, {:embedded, %Ref{} = ref}) do
     # Check if this ref is in our import membrane (peer's export)
     case Membrane.lookup_by_ref(state.import_membrane, ref) do
@@ -648,54 +724,56 @@ defmodule Absynthe.Relay.Relay do
         # Return to sender with attenuation if any
         attenuation = Ref.attenuation(ref) || []
         {:ok, wire_ref} = Packet.encode_wire_ref(Packet.WireRef.yours(oid, attenuation))
-        {{:embedded, wire_ref}, state}
+        # Track this OID reference in import membrane
+        {{:embedded, wire_ref}, state, [{:import, oid}]}
 
       :error ->
         # Export this ref to the peer
         {oid, export_membrane} = Membrane.export(state.export_membrane, ref)
         state = %{state | export_membrane: export_membrane}
         {:ok, wire_ref} = Packet.encode_wire_ref(Packet.WireRef.mine(oid))
-        {{:embedded, wire_ref}, state}
+        # Track this OID as exported
+        {{:embedded, wire_ref}, state, [oid]}
     end
   end
 
   defp translate_outbound_refs(state, {:record, {label, fields}}) do
-    {translated_label, state} = translate_outbound_refs(state, label)
-    {translated_fields, state} = translate_outbound_refs_list(state, fields)
-    {{:record, {translated_label, translated_fields}}, state}
+    {translated_label, state, oids1} = translate_outbound_refs(state, label)
+    {translated_fields, state, oids2} = translate_outbound_refs_list(state, fields)
+    {{:record, {translated_label, translated_fields}}, state, oids1 ++ oids2}
   end
 
   defp translate_outbound_refs(state, {:sequence, elements}) do
-    {translated, state} = translate_outbound_refs_list(state, elements)
-    {{:sequence, translated}, state}
+    {translated, state, oids} = translate_outbound_refs_list(state, elements)
+    {{:sequence, translated}, state, oids}
   end
 
   defp translate_outbound_refs(state, {:set, elements}) do
-    {translated, state} = translate_outbound_refs_list(state, MapSet.to_list(elements))
-    {{:set, MapSet.new(translated)}, state}
+    {translated, state, oids} = translate_outbound_refs_list(state, MapSet.to_list(elements))
+    {{:set, MapSet.new(translated)}, state, oids}
   end
 
   defp translate_outbound_refs(state, {:dictionary, entries}) do
-    {translated, state} =
-      Enum.reduce(entries, {[], state}, fn {k, v}, {acc, s} ->
-        {tk, s} = translate_outbound_refs(s, k)
-        {tv, s} = translate_outbound_refs(s, v)
-        {[{tk, tv} | acc], s}
+    {translated, state, oids} =
+      Enum.reduce(entries, {[], state, []}, fn {k, v}, {acc, s, acc_oids} ->
+        {tk, s, oids_k} = translate_outbound_refs(s, k)
+        {tv, s, oids_v} = translate_outbound_refs(s, v)
+        {[{tk, tv} | acc], s, acc_oids ++ oids_k ++ oids_v}
       end)
 
-    {{:dictionary, Map.new(translated)}, state}
+    {{:dictionary, Map.new(translated)}, state, oids}
   end
 
-  defp translate_outbound_refs(state, value), do: {value, state}
+  defp translate_outbound_refs(state, value), do: {value, state, []}
 
   defp translate_outbound_refs_list(state, list) do
-    {translated, state} =
-      Enum.reduce(list, {[], state}, fn elem, {acc, s} ->
-        {t, s} = translate_outbound_refs(s, elem)
-        {[t | acc], s}
+    {translated, state, oids} =
+      Enum.reduce(list, {[], state, []}, fn elem, {acc, s, acc_oids} ->
+        {t, s, elem_oids} = translate_outbound_refs(s, elem)
+        {[t | acc], s, acc_oids ++ elem_oids}
       end)
 
-    {Enum.reverse(translated), state}
+    {Enum.reverse(translated), state, oids}
   end
 
   # Retract all assertions when relay terminates
