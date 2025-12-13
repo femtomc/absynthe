@@ -328,10 +328,9 @@ defmodule Absynthe.Dataspace.Dataspace do
     observer = Observer.new(observer_id, compiled, entity_ref)
 
     # Add observer to skeleton and get existing matches
-    # Skeleton is ETS-based, so it's mutated in place
-    # Returns [{assertion_handle, assertion_value, captures}]
+    # Returns {updated_skeleton, [{assertion_handle, assertion_value, captures}]}
     # Pass observer_id (not handle) so skeleton returns consistent IDs
-    existing_matches =
+    {updated_skeleton, existing_matches} =
       Skeleton.add_observer(dataspace.skeleton, observer_id, entity_ref, compiled)
 
     # Track existing matches in the observer's active_handles
@@ -343,10 +342,11 @@ defmodule Absynthe.Dataspace.Dataspace do
     # Notify observer of existing assertions
     turn = notify_observer_of_existing(turn, entity_ref, existing_matches)
 
-    # Update dataspace with new observer
+    # Update dataspace with new observer and updated skeleton
     updated_dataspace = %__MODULE__{
       dataspace
-      | observers: Map.put(dataspace.observers, observer_id, observer),
+      | skeleton: updated_skeleton,
+        observers: Map.put(dataspace.observers, observer_id, observer),
         handle_to_observer: Map.put(dataspace.handle_to_observer, handle, observer_id)
     }
 
@@ -355,14 +355,15 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   defp handle_observe_retraction(%__MODULE__{} = dataspace, observer_id, handle, turn) do
     # Remove observer from skeleton
-    # Skeleton is ETS-based, so it's mutated in place
+    # Returns updated skeleton with wildcard_observers updated
     # Use observer_id (not handle) for consistency with add_observer
-    Skeleton.remove_observer(dataspace.skeleton, observer_id)
+    updated_skeleton = Skeleton.remove_observer(dataspace.skeleton, observer_id)
 
     # Clean up observer tracking
     updated_dataspace = %__MODULE__{
       dataspace
-      | observers: Map.delete(dataspace.observers, observer_id),
+      | skeleton: updated_skeleton,
+        observers: Map.delete(dataspace.observers, observer_id),
         handle_to_observer: Map.delete(dataspace.handle_to_observer, handle)
     }
 
