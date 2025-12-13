@@ -61,11 +61,15 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   ### Message Routing
 
-  Messages sent to a dataspace are currently not routed. In a full implementation,
-  they might be:
-  - Broadcast to all entities
-  - Handled specially based on message type
-  - Used for dataspace control operations
+  Messages sent to a dataspace are routed to all observers whose subscription
+  patterns match the message. Unlike assertions, messages are transient:
+  - They are not stored in the dataspace
+  - They are delivered once to all matching observers
+  - Captures from pattern matching are not included in the delivered message
+
+  This implements the Syndicate message semantics where messages are interest-gated
+  broadcasts. An observer must have an active Observe assertion with a matching
+  pattern to receive messages.
 
   ## Observe Assertions
 
@@ -328,6 +332,18 @@ defmodule Absynthe.Dataspace.Dataspace do
     end
   end
 
+  @doc false
+  @spec handle_message(t(), Value.t(), Turn.t()) :: {t(), Turn.t()}
+  def handle_message(dataspace, message, turn) do
+    # Route message to all observers whose patterns match
+    observer_matches = Skeleton.send_message(dataspace.skeleton, message)
+
+    # Notify each matching observer with a message event
+    turn = notify_observers_of_message(turn, observer_matches, message)
+
+    {dataspace, turn}
+  end
+
   # Observe Assertion Handling
 
   defp handle_observe_assertion(%__MODULE__{} = dataspace, pattern, entity_ref, handle, turn) do
@@ -499,6 +515,15 @@ defmodule Absynthe.Dataspace.Dataspace do
     end)
   end
 
+  defp notify_observers_of_message(turn, observer_matches, message) do
+    # For each observer whose pattern matches the message, send a message notification
+    # observer_matches is [{observer_id, observer_ref, captures}]
+    Enum.reduce(observer_matches, turn, fn {_observer_id, observer_ref, _captures}, turn_acc ->
+      action = Event.message(observer_ref, message)
+      Turn.add_action(turn_acc, action)
+    end)
+  end
+
   # Utilities
 
   defp generate_observer_id(handle) do
@@ -568,28 +593,28 @@ defimpl Absynthe.Core.Entity, for: Absynthe.Dataspace.Dataspace do
   @doc """
   Called when a message is sent to the dataspace.
 
-  Currently, messages to the dataspace are not routed and are treated as no-ops.
+  Routes messages to all observers whose subscription patterns match the message.
+  This implements the Syndicate message semantics where messages are transient
+  events delivered to interested parties based on their subscription patterns.
 
-  In a full implementation, messages might be:
-  - Broadcast to all entities
-  - Used for dataspace control operations
-  - Handled based on message type
+  Unlike assertions, messages are not stored in the dataspace - they are delivered
+  once to all matching observers and then discarded.
 
   ## Parameters
 
   - `dataspace` - The dataspace receiving the message
-  - `message` - The message content
+  - `message` - The message content (Preserves value)
   - `turn` - The current turn context
 
   ## Returns
 
-  A tuple of `{dataspace, turn}` (unchanged).
+  A tuple of `{dataspace, updated_turn}`.
+
+  The turn will contain message actions to notify all observers whose patterns
+  match the incoming message.
   """
-  def on_message(dataspace, _message, turn) do
-    # Messages to dataspace are currently not routed
-    # In a full implementation, this might broadcast to all entities
-    # or handle special dataspace control messages
-    {dataspace, turn}
+  def on_message(dataspace, message, turn) do
+    Dataspace.handle_message(dataspace, message, turn)
   end
 
   @doc """

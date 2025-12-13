@@ -525,6 +525,125 @@ defmodule Absynthe.Dataspace.SkeletonTest do
     end
   end
 
+  describe "send_message/2" do
+    test "routes message to observers whose patterns match" do
+      skeleton = Skeleton.new()
+
+      # Add an observer for Ping messages
+      pattern = Pattern.compile({:record, {{:symbol, "Ping"}, [{:symbol, "$id"}]}})
+      observer_id = :ping_observer
+      observer_ref = make_ref()
+
+      {skeleton, _matches} = Skeleton.add_observer(skeleton, observer_id, observer_ref, pattern)
+
+      # Send a matching message
+      message = {:record, {{:symbol, "Ping"}, [{:integer, 42}]}}
+      matches = Skeleton.send_message(skeleton, message)
+
+      # Should find the matching observer
+      assert length(matches) == 1
+      [{matched_id, matched_ref, captures}] = matches
+      assert matched_id == observer_id
+      assert matched_ref == observer_ref
+      assert captures == [{:integer, 42}]
+
+      # Cleanup
+      Skeleton.destroy(skeleton)
+    end
+
+    test "does not route message to observers that don't match" do
+      skeleton = Skeleton.new()
+
+      # Add an observer for Ping messages
+      pattern = Pattern.compile({:record, {{:symbol, "Ping"}, [{:symbol, "$id"}]}})
+      observer_id = :ping_observer
+      observer_ref = make_ref()
+
+      {skeleton, _matches} = Skeleton.add_observer(skeleton, observer_id, observer_ref, pattern)
+
+      # Send a non-matching message (different label)
+      message = {:record, {{:symbol, "Pong"}, [{:integer, 42}]}}
+      matches = Skeleton.send_message(skeleton, message)
+
+      # Should NOT find the observer (different label)
+      assert matches == []
+
+      # Cleanup
+      Skeleton.destroy(skeleton)
+    end
+
+    test "routes message to multiple matching observers" do
+      skeleton = Skeleton.new()
+
+      # Add observer 1: Any Ping message
+      pattern1 = Pattern.compile({:record, {{:symbol, "Ping"}, [{:symbol, "$"}]}})
+      {skeleton, _} = Skeleton.add_observer(skeleton, :observer1, make_ref(), pattern1)
+
+      # Add observer 2: Ping messages with specific value
+      pattern2 = Pattern.compile({:record, {{:symbol, "Ping"}, [{:integer, 42}]}})
+      {skeleton, _} = Skeleton.add_observer(skeleton, :observer2, make_ref(), pattern2)
+
+      # Add observer 3: Different message type
+      pattern3 = Pattern.compile({:record, {{:symbol, "Pong"}, [{:symbol, "$"}]}})
+      {skeleton, _} = Skeleton.add_observer(skeleton, :observer3, make_ref(), pattern3)
+
+      # Send a Ping with id=42
+      message = {:record, {{:symbol, "Ping"}, [{:integer, 42}]}}
+      matches = Skeleton.send_message(skeleton, message)
+
+      # Should notify observer1 and observer2, but not observer3
+      matched_ids = Enum.map(matches, fn {id, _, _} -> id end)
+      assert :observer1 in matched_ids
+      assert :observer2 in matched_ids
+      refute :observer3 in matched_ids
+
+      # Cleanup
+      Skeleton.destroy(skeleton)
+    end
+
+    test "wildcard observer receives all messages" do
+      skeleton = Skeleton.new()
+
+      # Add a wildcard observer (matches anything)
+      pattern = Pattern.compile({:symbol, "$"})
+      observer_id = :catch_all
+      observer_ref = make_ref()
+
+      {skeleton, _matches} = Skeleton.add_observer(skeleton, observer_id, observer_ref, pattern)
+
+      # Send any message
+      message = {:string, "hello world"}
+      matches = Skeleton.send_message(skeleton, message)
+
+      # Wildcard observer should receive it
+      assert length(matches) == 1
+      [{matched_id, _, captures}] = matches
+      assert matched_id == observer_id
+      assert captures == [{:string, "hello world"}]
+
+      # Cleanup
+      Skeleton.destroy(skeleton)
+    end
+
+    test "message is not stored (unlike assertions)" do
+      skeleton = Skeleton.new()
+
+      # Send a message without any observers
+      message = {:string, "test"}
+      matches = Skeleton.send_message(skeleton, message)
+
+      # No observers, so no matches
+      assert matches == []
+
+      # The message should NOT be stored in the assertions table
+      all_assertions = :ets.tab2list(skeleton.assertions)
+      assert all_assertions == []
+
+      # Cleanup
+      Skeleton.destroy(skeleton)
+    end
+  end
+
   describe "destroy/1" do
     test "cleans up all ETS tables including observer_index" do
       skeleton = Skeleton.new()
