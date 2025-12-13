@@ -109,11 +109,9 @@ defmodule Absynthe.Relay.Relay do
           export_membrane: Membrane.t(),
           import_membrane: Membrane.t(),
           recv_buffer: binary(),
-          # Inbound handle mappings (peer -> local)
+          # Inbound handle mapping (peer wire handle -> local handle)
           inbound_wire_handles: %{non_neg_integer() => Handle.t()},
-          inbound_local_handles: %{Handle.t() => non_neg_integer()},
-          # Outbound handle mappings (local -> peer)
-          outbound_wire_handles: %{non_neg_integer() => Handle.t()},
+          # Outbound handle mapping (local handle -> peer wire handle)
           outbound_local_handles: %{Handle.t() => non_neg_integer()},
           handle_to_oid: %{Handle.t() => non_neg_integer()},
           # Track which OIDs were imported for each inbound assertion (for decref on retract)
@@ -317,8 +315,6 @@ defmodule Absynthe.Relay.Relay do
       import_membrane: import_membrane,
       recv_buffer: Framing.new_state(),
       inbound_wire_handles: %{},
-      inbound_local_handles: %{},
-      outbound_wire_handles: %{},
       outbound_local_handles: %{},
       handle_to_oid: %{},
       inbound_handle_oids: %{},
@@ -800,7 +796,6 @@ defmodule Absynthe.Relay.Relay do
     state = %{
       state
       | inbound_wire_handles: Map.put(state.inbound_wire_handles, wire_handle, local_handle),
-        inbound_local_handles: Map.put(state.inbound_local_handles, local_handle, wire_handle),
         import_membrane: import_membrane,
         export_membrane: export_membrane,
         inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced),
@@ -846,7 +841,6 @@ defmodule Absynthe.Relay.Relay do
         state = %{
           state
           | inbound_wire_handles: Map.delete(state.inbound_wire_handles, wire_handle),
-            inbound_local_handles: Map.delete(state.inbound_local_handles, local_handle),
             import_membrane: import_membrane,
             export_membrane: export_membrane,
             inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle),
@@ -934,7 +928,6 @@ defmodule Absynthe.Relay.Relay do
     state = %{
       state
       | inbound_wire_handles: Map.put(state.inbound_wire_handles, wire_handle, local_handle),
-        inbound_local_handles: Map.put(state.inbound_local_handles, local_handle, wire_handle),
         import_membrane: import_membrane,
         export_membrane: export_membrane,
         inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced),
@@ -989,7 +982,6 @@ defmodule Absynthe.Relay.Relay do
         state = %{
           state
           | inbound_wire_handles: Map.delete(state.inbound_wire_handles, wire_handle),
-            inbound_local_handles: Map.delete(state.inbound_local_handles, local_handle),
             import_membrane: import_membrane,
             export_membrane: export_membrane,
             inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle),
@@ -1165,11 +1157,10 @@ defmodule Absynthe.Relay.Relay do
         oid, {exp, imp} -> {Membrane.inc_ref(exp, oid), imp}
       end)
 
-    # Track handle -> wire_handle, wire_handle -> handle, handle -> oid, and handle -> oids
+    # Track handle -> wire_handle, handle -> oid, and handle -> oids
     state = %{
       state
       | outbound_local_handles: Map.put(state.outbound_local_handles, handle, wire_handle),
-        outbound_wire_handles: Map.put(state.outbound_wire_handles, wire_handle, handle),
         handle_to_oid: Map.put(state.handle_to_oid, handle, oid),
         export_membrane: export_membrane,
         import_membrane: import_membrane,
@@ -1215,7 +1206,6 @@ defmodule Absynthe.Relay.Relay do
             state = %{
               state
               | outbound_local_handles: Map.delete(state.outbound_local_handles, handle),
-                outbound_wire_handles: Map.delete(state.outbound_wire_handles, wire_handle),
                 handle_to_oid: Map.delete(state.handle_to_oid, handle),
                 export_membrane: export_membrane,
                 import_membrane: import_membrane,
@@ -1240,7 +1230,6 @@ defmodule Absynthe.Relay.Relay do
             %{
               state
               | outbound_local_handles: Map.delete(state.outbound_local_handles, handle),
-                outbound_wire_handles: Map.delete(state.outbound_wire_handles, wire_handle),
                 outbound_handle_oids: Map.delete(state.outbound_handle_oids, handle)
             }
         end
