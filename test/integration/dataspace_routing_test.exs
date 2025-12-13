@@ -584,4 +584,204 @@ defmodule Absynthe.Integration.DataspaceRoutingTest do
       assert notify_action.captures == []
     end
   end
+
+  describe "dataspace message routing" do
+    test "messages are routed to observers whose patterns match" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up observer for Ping messages
+      pattern = Value.record(Value.symbol("Ping"), [Value.symbol("$id")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Send a message that matches the pattern
+      turn = Turn.new(:test_actor, :test_facet)
+      ping_message = Value.record(Value.symbol("Ping"), [Value.integer(42)])
+
+      {_dataspace, updated_turn} = Entity.on_message(dataspace, ping_message, turn)
+
+      # Turn should have a message action to notify the observer
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      message_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      assert length(message_actions) == 1
+
+      [notify_action] = message_actions
+      assert notify_action.ref == observer_ref
+      assert notify_action.body == ping_message
+    end
+
+    test "messages are NOT routed to observers that don't match" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up observer for Ping messages
+      pattern = Value.record(Value.symbol("Ping"), [Value.symbol("_")])
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Send a message that does NOT match the pattern (different label)
+      turn = Turn.new(:test_actor, :test_facet)
+      pong_message = Value.record(Value.symbol("Pong"), [Value.integer(42)])
+
+      {_dataspace, updated_turn} = Entity.on_message(dataspace, pong_message, turn)
+
+      # Turn should have NO message actions (pattern doesn't match)
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      message_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      assert message_actions == []
+    end
+
+    test "message is routed to multiple matching observers" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up first observer for any Status message
+      pattern1 = Value.record(Value.symbol("Status"), [Value.symbol("_")])
+      observer_ref1 = %Absynthe.Core.Ref{actor_id: :observer1, entity_id: 0}
+
+      observe1 =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern1, {:embedded, observer_ref1}]
+        )
+
+      {dataspace, turn} = Entity.on_publish(dataspace, observe1, Handle.new(:test_actor, 1), turn)
+
+      # Set up second observer with same pattern
+      pattern2 = Value.record(Value.symbol("Status"), [Value.symbol("_")])
+      observer_ref2 = %Absynthe.Core.Ref{actor_id: :observer2, entity_id: 0}
+
+      observe2 =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern2, {:embedded, observer_ref2}]
+        )
+
+      {dataspace, _turn} =
+        Entity.on_publish(dataspace, observe2, Handle.new(:test_actor, 2), turn)
+
+      # Send a status message
+      turn = Turn.new(:test_actor, :test_facet)
+      status_message = Value.record(Value.symbol("Status"), [Value.string("online")])
+
+      {_dataspace, updated_turn} = Entity.on_message(dataspace, status_message, turn)
+
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      message_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      # Both observers should receive the message
+      assert length(message_actions) == 2
+
+      refs = Enum.map(message_actions, & &1.ref)
+      assert observer_ref1 in refs
+      assert observer_ref2 in refs
+    end
+
+    test "message is NOT stored in dataspace (unlike assertions)" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Send a message (without any observers)
+      message = Value.string("hello world")
+      {updated_dataspace, _turn} = Entity.on_message(dataspace, message, turn)
+
+      # Message should NOT be stored as an assertion
+      refute Dataspace.has_assertion?(updated_dataspace, message)
+      assert Dataspace.assertions(updated_dataspace) == []
+    end
+
+    test "wildcard observer receives all messages" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up wildcard observer (matches anything)
+      pattern = Value.symbol("$")
+      observer_ref = %Absynthe.Core.Ref{actor_id: :catch_all, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Send various messages - all should be routed to the wildcard observer
+      turn = Turn.new(:test_actor, :test_facet)
+      msg1 = Value.string("string message")
+      {dataspace, turn} = Entity.on_message(dataspace, msg1, turn)
+      {_committed, actions1} = Turn.commit(turn)
+
+      turn = Turn.new(:test_actor, :test_facet)
+      msg2 = Value.integer(42)
+      {dataspace, turn} = Entity.on_message(dataspace, msg2, turn)
+      {_committed, actions2} = Turn.commit(turn)
+
+      turn = Turn.new(:test_actor, :test_facet)
+      msg3 = Value.record(Value.symbol("Record"), [Value.string("data")])
+      {_dataspace, turn} = Entity.on_message(dataspace, msg3, turn)
+      {_committed, actions3} = Turn.commit(turn)
+
+      # All should have exactly one message action
+      message_actions1 = Enum.filter(actions1, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      message_actions2 = Enum.filter(actions2, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      message_actions3 = Enum.filter(actions3, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+
+      assert length(message_actions1) == 1
+      assert length(message_actions2) == 1
+      assert length(message_actions3) == 1
+    end
+
+    test "removing observer stops message routing" do
+      dataspace = Dataspace.new()
+      turn = Turn.new(:test_actor, :test_facet)
+
+      # Set up observer
+      pattern = Value.symbol("_")
+      observer_ref = %Absynthe.Core.Ref{actor_id: :observer, entity_id: 0}
+
+      observe_assertion =
+        Value.record(
+          Value.symbol("Observe"),
+          [pattern, {:embedded, observer_ref}]
+        )
+
+      observe_handle = Handle.new(:test_actor, 1)
+      {dataspace, _turn} = Entity.on_publish(dataspace, observe_assertion, observe_handle, turn)
+
+      # Remove observer
+      turn = Turn.new(:test_actor, :test_facet)
+      {dataspace, _turn} = Entity.on_retract(dataspace, observe_handle, turn)
+
+      # Send a message - should NOT generate any notifications
+      turn = Turn.new(:test_actor, :test_facet)
+      message = Value.string("test")
+      {_dataspace, updated_turn} = Entity.on_message(dataspace, message, turn)
+
+      {_committed, actions} = Turn.commit(updated_turn)
+
+      message_actions = Enum.filter(actions, &match?(%Absynthe.Protocol.Event.Message{}, &1))
+      assert message_actions == []
+    end
+  end
 end

@@ -550,6 +550,66 @@ defmodule Absynthe.Dataspace.Skeleton do
   end
 
   @doc """
+  Routes a message to all observers whose patterns match.
+
+  Unlike `add_assertion/3`, this function does not store the message - it only
+  routes it to matching observers. This implements the Syndicate message semantics
+  where messages are transient events delivered to interested parties based on
+  their subscription patterns.
+
+  ## Parameters
+
+    - `skeleton` - The Skeleton index
+    - `message` - The Preserves value to route as a message
+
+  ## Returns
+
+  A list of tuples `{observer_id, observer_ref, captures}` where:
+  - `observer_id` - The unique identifier for the observer
+  - `observer_ref` - The entity reference to notify
+  - `captures` - Values captured by pattern variables
+
+  ## Examples
+
+      skeleton = Absynthe.Dataspace.Skeleton.new()
+
+      # Add an observer for Ping messages
+      pattern = Pattern.compile({:record, {{:symbol, "Ping"}, [{:symbol, "$id"}]}})
+      {skeleton, _} = Skeleton.add_observer(skeleton, :ping_observer, my_ref, pattern)
+
+      # Route a message - observer receives it if pattern matches
+      message = {:record, {{:symbol, "Ping"}, [{:integer, 42}]}}
+      matches = Skeleton.send_message(skeleton, message)
+      # => [{:ping_observer, my_ref, [{:integer, 42}]}]
+
+  """
+  @spec send_message(t(), Value.t()) ::
+          [{observer_id :: term(), observer_ref :: term(), captures :: [Value.t()]}]
+  def send_message(%__MODULE__{} = skeleton, message) do
+    # Find observers whose patterns match the message
+    # This is similar to find_matching_observers but we don't have a handle
+    candidate_ids = find_candidate_observers(skeleton, message)
+
+    # For each candidate, perform full pattern matching
+    candidate_ids
+    |> Enum.flat_map(fn observer_id ->
+      case :ets.lookup(skeleton.observers, observer_id) do
+        [{^observer_id, {pattern, observer_ref}}] ->
+          case Pattern.match(pattern, message) do
+            {:ok, captures} ->
+              [{observer_id, observer_ref, captures}]
+
+            :no_match ->
+              []
+          end
+
+        [] ->
+          []
+      end
+    end)
+  end
+
+  @doc """
   Destroys the Skeleton and cleans up all ETS tables.
 
   This should be called when the Skeleton is no longer needed to free resources.
