@@ -126,6 +126,7 @@ defmodule Absynthe.Relay.Listener do
     actor_pid = Keyword.get(opts, :actor_pid)
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
     noise_keypair = Keyword.get(opts, :noise_keypair)
+    flow_control = Keyword.get(opts, :flow_control)
 
     listener_id =
       Keyword.get_lazy(opts, :listener_id, fn ->
@@ -139,7 +140,8 @@ defmodule Absynthe.Relay.Listener do
       idle_timeout: idle_timeout,
       listener_id: listener_id,
       connection_counter: 0,
-      noise_keypair: noise_keypair
+      noise_keypair: noise_keypair,
+      flow_control: flow_control
     }
 
     case type do
@@ -303,6 +305,14 @@ defmodule Absynthe.Relay.Listener do
     relay_opts =
       if state.actor_pid do
         Keyword.put(relay_opts, :actor_pid, state.actor_pid)
+      else
+        relay_opts
+      end
+
+    # Add flow_control if configured
+    relay_opts =
+      if state.flow_control do
+        Keyword.put(relay_opts, :flow_control, state.flow_control)
       else
         relay_opts
       end

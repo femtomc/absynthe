@@ -314,6 +314,36 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc """
+  Delivers an event with flow control acknowledgment.
+
+  This variant is used by relays to enable ack-based flow control. After the
+  turn completes (event is fully processed), the actor will send a
+  `{:flow_control_loan_ack, loan_id}` message back to the relay_pid.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+  - `ref` - The entity reference
+  - `event` - The event to deliver
+  - `relay_pid` - The relay process to send the ack to
+  - `loan_id` - The loan ID to include in the ack
+
+  ## Returns
+
+  - `:ok` - Event queued for delivery
+  """
+  @spec deliver_with_flow_control(
+          GenServer.server(),
+          Ref.t(),
+          Event.t(),
+          pid(),
+          non_neg_integer()
+        ) :: :ok
+  def deliver_with_flow_control(actor, ref, event, relay_pid, loan_id) do
+    GenServer.cast(actor, {:deliver_with_flow_control, ref, event, relay_pid, loan_id})
+  end
+
+  @doc """
   Sends a message to an entity.
 
   Messages are ephemeral, one-shot communications that don't persist
@@ -761,6 +791,13 @@ defmodule Absynthe.Core.Actor do
     {:noreply, new_state}
   end
 
+  @impl GenServer
+  def handle_cast({:deliver_with_flow_control, ref, event, relay_pid, loan_id}, state) do
+    # Deliver event with flow control ack - send ack back after turn completes
+    new_state = deliver_event_with_flow_control(state, ref, event, relay_pid, loan_id)
+    {:noreply, new_state}
+  end
+
   # Implementation Helpers
 
   @doc false
@@ -948,6 +985,53 @@ defmodule Absynthe.Core.Actor do
       :rejected ->
         # Event rejected by attenuation - drop silently
         Logger.debug("Event rejected by attenuation on ref #{inspect(ref)}")
+        state
+    end
+  end
+
+  @doc false
+  # Deliver event with flow control ack - sends ack back to relay after turn completes
+  defp deliver_event_with_flow_control(state, ref, event, relay_pid, loan_id) do
+    entity_id = Ref.entity_id(ref)
+
+    # Apply attenuation to the event (may rewrite or reject)
+    case apply_event_attenuation(ref, event) do
+      {:ok, rewritten_event} ->
+        case Map.fetch(state.entities, entity_id) do
+          {:ok, {facet_id, entity}} ->
+            # Track inbound assertions from remote actors for crash cleanup
+            # Use relay_pid as the sender for crash tracking
+            state = maybe_track_inbound_assertion(state, rewritten_event, ref, relay_pid)
+
+            # Execute a turn for this event
+            result = execute_turn(state, facet_id, entity_id, entity, rewritten_event)
+
+            # Send flow control ack back to relay after turn completes (success or failure)
+            # This ensures debt is repaid even if the turn fails
+            send(relay_pid, {:flow_control_loan_ack, loan_id})
+
+            case result do
+              {:ok, _updated_entity, new_state} ->
+                # Entity state is already updated in execute_turn before action processing
+                new_state
+
+              {:error, reason} ->
+                Logger.error("Turn failed for entity #{entity_id}: #{inspect(reason)}")
+                # On error, state remains unchanged (rollback)
+                state
+            end
+
+          :error ->
+            # Entity not found - still send ack to prevent debt accumulation
+            Logger.warning("Entity #{entity_id} not found for event: #{inspect(event)}")
+            send(relay_pid, {:flow_control_loan_ack, loan_id})
+            state
+        end
+
+      :rejected ->
+        # Event rejected by attenuation - still send ack
+        Logger.debug("Event rejected by attenuation on ref #{inspect(ref)}")
+        send(relay_pid, {:flow_control_loan_ack, loan_id})
         state
     end
   end

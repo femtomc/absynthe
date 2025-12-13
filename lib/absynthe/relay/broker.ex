@@ -95,6 +95,7 @@ defmodule Absynthe.Relay.Broker do
   - `:tcp_port` - TCP port to listen on
   - `:tcp_host` - TCP host to bind to (default: `{127, 0, 0, 1}`)
   - `:idle_timeout` - Idle timeout in milliseconds for relay connections (default: `:infinity`)
+  - `:flow_control` - Flow control options for relay connections (see `Absynthe.Relay.Relay`)
   - `:noise_keypair` - Noise protocol keypair `{public, private}` for encrypted transport
   - `:noise_secret` - 32-byte secret to derive a deterministic Noise keypair
   - `:name` - Optional GenServer name
@@ -241,6 +242,7 @@ defmodule Absynthe.Relay.Broker do
 
   defp start_listeners(state, opts) do
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+    flow_control = Keyword.get(opts, :flow_control)
 
     # Build common listener options
     common_opts = [
@@ -248,6 +250,14 @@ defmodule Absynthe.Relay.Broker do
       actor_pid: state.actor_pid,
       idle_timeout: idle_timeout
     ]
+
+    # Add flow_control if configured
+    common_opts =
+      if flow_control do
+        Keyword.put(common_opts, :flow_control, flow_control)
+      else
+        common_opts
+      end
 
     # Add noise_keypair if configured
     common_opts =

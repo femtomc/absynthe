@@ -62,6 +62,7 @@ defmodule Absynthe.Relay.Relay do
   alias Absynthe.Relay.Transport.Noise
   alias Absynthe.FlowControl
   alias Absynthe.FlowControl.Account
+  alias Absynthe.FlowControl.LoanedItem
 
   # Proxy entity for imported remote refs
   defmodule Proxy do
@@ -133,7 +134,11 @@ defmodule Absynthe.Relay.Relay do
           connection_id: String.t(),
           # Flow control
           flow_control_account: Account.t() | nil,
-          flow_control_enabled: boolean()
+          flow_control_enabled: boolean(),
+          # Pending loans awaiting ack from actor
+          pending_loans: %{non_neg_integer() => {LoanedItem.t(), reference(), integer()}},
+          next_loan_id: non_neg_integer(),
+          loan_ack_timeout: non_neg_integer()
         }
 
   # Client API
@@ -159,28 +164,29 @@ defmodule Absynthe.Relay.Relay do
   - `:limit` - Maximum debt before rejecting new events (default: 1000)
   - `:high_water_mark` - Debt level that pauses socket reads (default: 80% of limit)
   - `:low_water_mark` - Debt level that resumes socket reads (default: 40% of limit)
+  - `:loan_ack_timeout` - Timeout in ms for actor to ack loan repayment (default: 30000)
 
   When debt exceeds the high water mark, the relay stops reading from the socket,
   applying TCP-level backpressure to the sender.
 
-  ### Current Limitations
+  ### Acknowledgment-Based Flow Control
 
-  The current implementation provides CPU-bound backpressure during packet
-  processing, but does not directly track downstream actor processing time.
-  Events are delivered asynchronously to the actor via `Actor.deliver/3` (cast),
-  and debt is repaid after the relay finishes processing each turn packet.
+  The relay uses acknowledgment-based debt repayment for true end-to-end
+  backpressure. When events are delivered to the actor, the relay tracks the
+  loan and waits for the actor to send an acknowledgment after turn completion.
 
-  This means the flow control throttles based on:
+  This provides backpressure based on:
   - Packet decoding and translation overhead (CPU-bound)
   - Membrane operations and ref translation (CPU-bound)
+  - Actor processing time (turn execution)
+  - Entity event handler duration
 
-  But does NOT directly throttle based on:
-  - Actor mailbox depth
-  - Time spent in entity event handlers
+  If the actor doesn't acknowledge within `:loan_ack_timeout`, the loan is
+  force-repaid to prevent debt accumulation from crashed or hung actors. A
+  warning is logged when this happens.
 
-  For true end-to-end backpressure, use Sync events periodically to measure
-  actor processing latency and adjust limits accordingly. Future versions may
-  add explicit acknowledgment-based flow control.
+  This implements similar semantics to syndicate-rs Account/LoanedItem, where
+  debt is charged to the origin and repaid only after downstream processing.
 
   ## Returns
 
@@ -259,10 +265,10 @@ defmodule Absynthe.Relay.Relay do
     {_oid, export_membrane} = Membrane.export(export_membrane, dataspace_ref)
 
     # Initialize flow control if configured
-    {flow_control_enabled, flow_control_account} =
+    {flow_control_enabled, flow_control_account, loan_ack_timeout} =
       case Keyword.get(opts, :flow_control) do
         nil ->
-          {false, nil}
+          {false, nil, 30_000}
 
         flow_opts when is_list(flow_opts) ->
           relay_pid = self()
@@ -285,7 +291,8 @@ defmodule Absynthe.Relay.Relay do
               )
             )
 
-          {true, account}
+          timeout = Keyword.get(flow_opts, :loan_ack_timeout, 30_000)
+          {true, account, timeout}
       end
 
     state = %{
@@ -317,7 +324,13 @@ defmodule Absynthe.Relay.Relay do
       noise_session: nil,
       # Flow control state
       flow_control_enabled: flow_control_enabled,
-      flow_control_account: flow_control_account
+      flow_control_account: flow_control_account,
+      # Pending loans awaiting ack from actor (loan_id -> {loan, timer_ref, timestamp})
+      pending_loans: %{},
+      # Counter for generating unique loan IDs across turns
+      next_loan_id: 0,
+      # Timeout for unacked loans (configurable, default 30 seconds)
+      loan_ack_timeout: loan_ack_timeout
     }
 
     Logger.info("[#{connection_id}] Relay started")
@@ -459,9 +472,21 @@ defmodule Absynthe.Relay.Relay do
     {:noreply, state}
   end
 
-  # Handle debt repayment notification from turn processing
+  # Handle debt repayment notification from turn processing (legacy - direct loan)
   def handle_info({:flow_control_repay, loan}, state) do
     state = maybe_repay_debt(state, loan)
+    {:noreply, state}
+  end
+
+  # Handle loan ack from actor after turn completion (new - by loan_id)
+  def handle_info({:flow_control_loan_ack, loan_id}, state) do
+    state = maybe_repay_pending_loan(state, loan_id)
+    {:noreply, state}
+  end
+
+  # Handle loan timeout - actor didn't ack in time (crashed or hung)
+  def handle_info({:loan_timeout, loan_id}, state) do
+    state = handle_loan_timeout(state, loan_id)
     {:noreply, state}
   end
 
@@ -690,24 +715,20 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp process_inbound_packet(state, %Packet.Turn{events: events}) do
-    # Borrow debt for this turn
-    {state, loan} = maybe_borrow_debt_for_turn(state, events)
+    # Borrow debt for this turn and track pending loan for ack-based repayment
+    {state, loan_id} = maybe_borrow_and_track_loan(state, events)
 
     # Process all events in the turn
-    state = Enum.reduce(events, state, &process_turn_event/2)
+    # Only pass the loan_id to the LAST event to ensure ack is sent after all events processed
+    event_count = length(events)
 
-    # For now, we repay immediately after processing the turn.
-    # This is a simplification - ideally we'd track when the downstream
-    # actor actually finishes processing. However, since events are delivered
-    # asynchronously via Actor.deliver (cast), we don't have a direct feedback
-    # mechanism. The debt still provides useful backpressure because:
-    # 1. If the relay is CPU-bound processing packets, debt accumulates
-    # 2. The pause/resume callbacks stop socket reads when debt is high
-    # 3. TCP backpressure propagates to the sender
-    #
-    # For more precise tracking, callers can use Sync events to measure
-    # true processing latency and adjust thresholds accordingly.
-    state = maybe_repay_debt(state, loan)
+    state =
+      events
+      |> Enum.with_index(1)
+      |> Enum.reduce(state, fn {event, index}, acc_state ->
+        is_last = index == event_count
+        process_turn_event_with_ack(event, acc_state, loan_id, is_last)
+      end)
 
     {:ok, state}
   end
@@ -722,20 +743,6 @@ defmodule Absynthe.Relay.Relay do
   defp process_inbound_packet(state, %Packet.Extension{label: label}) do
     Logger.debug("[#{state.connection_id}] Ignoring unknown extension: #{inspect(label)}")
     {:ok, state}
-  end
-
-  defp process_turn_event(%Packet.TurnEvent{oid: oid, event: event}, state) do
-    # Look up the target ref from our export membrane, with attenuation enforced.
-    # This is critical for security: exported refs may have attenuation from
-    # sturdy refs or other sources, and we must apply it to inbound events.
-    case Membrane.lookup_by_oid_with_attenuation(state.export_membrane, oid) do
-      {:ok, ref} ->
-        process_event_for_ref(state, ref, oid, event)
-
-      :error ->
-        Logger.warning("[#{state.connection_id}] Received event for unknown OID #{oid}")
-        state
-    end
   end
 
   defp process_event_for_ref(state, ref, _target_oid, %Packet.Assert{
@@ -849,6 +856,180 @@ defmodule Absynthe.Relay.Relay do
     peer_ref = Ref.new({:relay, self()}, {:sync, sync_id})
 
     Actor.deliver(state.actor_pid, ref, Event.sync(ref, peer_ref))
+
+    state
+  end
+
+  # Process events with ack-based flow control
+  # These variants use Actor.deliver_with_flow_control which includes relay/loan info
+  # so the actor can send an ack after turn completion
+
+  defp process_event_for_ref_with_ack(state, ref, target_oid, event, nil, _is_last) do
+    # No flow control - use regular processing
+    process_event_for_ref(state, ref, target_oid, event)
+  end
+
+  defp process_event_for_ref_with_ack(state, ref, target_oid, event, _loan_id, false) do
+    # Not the last event - use regular processing (ack will be sent by last event)
+    process_event_for_ref(state, ref, target_oid, event)
+  end
+
+  # The following clauses only match when is_last is true (due to the false clause above)
+  defp process_event_for_ref_with_ack(
+         state,
+         ref,
+         _target_oid,
+         %Packet.Assert{
+           assertion: assertion,
+           handle: wire_handle
+         },
+         loan_id,
+         true = _is_last
+       ) do
+    # Translate embedded wire refs in the assertion to local refs
+    {translated_assertion, state, oids_referenced} = translate_inbound_refs(state, assertion)
+
+    # Create a local handle
+    local_handle = Handle.new({:relay, self()}, wire_handle)
+
+    # Increment refcount for each OID embedded in the assertion
+    {import_membrane, export_membrane} =
+      Enum.reduce(oids_referenced, {state.import_membrane, state.export_membrane}, fn
+        {:export, oid}, {imp, exp} -> {imp, Membrane.inc_ref(exp, oid)}
+        oid, {imp, exp} -> {Membrane.inc_ref(imp, oid), exp}
+      end)
+
+    # Track handle mapping, OIDs, and target ref for later retraction
+    state = %{
+      state
+      | inbound_wire_handles: Map.put(state.inbound_wire_handles, wire_handle, local_handle),
+        inbound_local_handles: Map.put(state.inbound_local_handles, local_handle, wire_handle),
+        import_membrane: import_membrane,
+        export_membrane: export_membrane,
+        inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced),
+        inbound_handle_refs: Map.put(state.inbound_handle_refs, local_handle, ref)
+    }
+
+    # Deliver assertion with flow control ack info
+    Actor.deliver_with_flow_control(
+      state.actor_pid,
+      ref,
+      Event.assert(ref, translated_assertion, local_handle),
+      self(),
+      loan_id
+    )
+
+    state
+  end
+
+  defp process_event_for_ref_with_ack(
+         state,
+         ref,
+         _target_oid,
+         %Packet.Retract{handle: wire_handle},
+         loan_id,
+         true = _is_last
+       ) do
+    case Map.get(state.inbound_wire_handles, wire_handle) do
+      nil ->
+        Logger.warning(
+          "[#{state.connection_id}] Retract for unknown inbound handle #{wire_handle}"
+        )
+
+        state
+
+      local_handle ->
+        # Get the OIDs that were referenced by this assertion
+        oids_referenced = Map.get(state.inbound_handle_oids, local_handle, [])
+
+        # Decrement refcount for each OID, potentially GC'ing them
+        {import_membrane, export_membrane} =
+          Enum.reduce(oids_referenced, {state.import_membrane, state.export_membrane}, fn
+            {:export, oid}, {imp, exp} ->
+              {exp, _status} = Membrane.dec_ref(exp, oid)
+              {imp, exp}
+
+            oid, {imp, exp} ->
+              {imp, _status} = Membrane.dec_ref(imp, oid)
+              {imp, exp}
+          end)
+
+        # Clean up handle mapping
+        state = %{
+          state
+          | inbound_wire_handles: Map.delete(state.inbound_wire_handles, wire_handle),
+            inbound_local_handles: Map.delete(state.inbound_local_handles, local_handle),
+            import_membrane: import_membrane,
+            export_membrane: export_membrane,
+            inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle),
+            inbound_handle_refs: Map.delete(state.inbound_handle_refs, local_handle)
+        }
+
+        # Deliver retraction with flow control ack info
+        Actor.deliver_with_flow_control(
+          state.actor_pid,
+          ref,
+          Event.retract(ref, local_handle),
+          self(),
+          loan_id
+        )
+
+        state
+    end
+  end
+
+  defp process_event_for_ref_with_ack(
+         state,
+         ref,
+         _target_oid,
+         %Packet.Message{body: body},
+         loan_id,
+         true = _is_last
+       ) do
+    # Translate embedded wire refs
+    {translated_body, state, _oids} = translate_inbound_refs(state, body)
+
+    # Deliver message with flow control ack info
+    Actor.deliver_with_flow_control(
+      state.actor_pid,
+      ref,
+      Event.message(ref, translated_body),
+      self(),
+      loan_id
+    )
+
+    state
+  end
+
+  defp process_event_for_ref_with_ack(
+         state,
+         ref,
+         _target_oid,
+         %Packet.Sync{},
+         loan_id,
+         true = _is_last
+       ) do
+    # Generate a sync ID to track the response
+    sync_id = state.next_sync_id
+
+    # Track the pending sync and respond when the local actor completes it
+    state = %{
+      state
+      | pending_syncs: Map.put(state.pending_syncs, sync_id, ref),
+        next_sync_id: sync_id + 1
+    }
+
+    # Create a peer ref that will notify us when sync completes
+    peer_ref = Ref.new({:relay, self()}, {:sync, sync_id})
+
+    # Deliver sync with flow control ack info
+    Actor.deliver_with_flow_control(
+      state.actor_pid,
+      ref,
+      Event.sync(ref, peer_ref),
+      self(),
+      loan_id
+    )
 
     state
   end
@@ -1282,12 +1463,13 @@ defmodule Absynthe.Relay.Relay do
 
   # Flow control helpers
 
-  # Borrow debt for a Turn packet (multiple events)
-  defp maybe_borrow_debt_for_turn(%{flow_control_enabled: false} = state, _events) do
+  # Borrow debt for a Turn packet and track it for ack-based repayment
+  # Returns {state, loan_id} where loan_id is nil if flow control is disabled
+  defp maybe_borrow_and_track_loan(%{flow_control_enabled: false} = state, _events) do
     {state, nil}
   end
 
-  defp maybe_borrow_debt_for_turn(state, events) do
+  defp maybe_borrow_and_track_loan(state, events) do
     # Sum cost of all events in the turn
     total_cost =
       Enum.reduce(events, 0, fn event, acc ->
@@ -1296,7 +1478,45 @@ defmodule Absynthe.Relay.Relay do
 
     {loan, account} = Account.force_borrow(state.flow_control_account, cost: total_cost)
 
-    {%{state | flow_control_account: account}, loan}
+    # Generate a unique loan ID and set up timeout
+    loan_id = state.next_loan_id
+    timer_ref = Process.send_after(self(), {:loan_timeout, loan_id}, state.loan_ack_timeout)
+    timestamp = System.monotonic_time(:millisecond)
+
+    # Track the pending loan
+    pending_loans = Map.put(state.pending_loans, loan_id, {loan, timer_ref, timestamp})
+
+    state = %{
+      state
+      | flow_control_account: account,
+        pending_loans: pending_loans,
+        next_loan_id: loan_id + 1
+    }
+
+    {state, loan_id}
+  end
+
+  # Process a turn event with ack-based flow control tracking
+  # is_last indicates if this is the last event in the turn - only then should we
+  # pass the loan_id through to trigger an ack from the actor
+  defp process_turn_event_with_ack(turn_event, state, loan_id, is_last) do
+    %Packet.TurnEvent{oid: oid, event: event} = turn_event
+
+    # Look up the target ref from our export membrane, with attenuation enforced.
+    case Membrane.lookup_by_oid_with_attenuation(state.export_membrane, oid) do
+      {:ok, ref} ->
+        process_event_for_ref_with_ack(state, ref, oid, event, loan_id, is_last)
+
+      :error ->
+        Logger.warning("[#{state.connection_id}] Received event for unknown OID #{oid}")
+        # When OID is unknown and this is the last event, we need to ack immediately
+        # since no actor will process it
+        if is_last and loan_id != nil do
+          maybe_repay_pending_loan(state, loan_id)
+        else
+          state
+        end
+    end
   end
 
   # Calculate cost for a TurnEvent (wire format)
@@ -1329,7 +1549,7 @@ defmodule Absynthe.Relay.Relay do
     Enum.reduce(list, 0, fn elem, acc -> acc + count_wire_refs(elem) end)
   end
 
-  # Repay debt after processing completes
+  # Repay debt after processing completes (legacy - direct loan struct)
   defp maybe_repay_debt(%{flow_control_enabled: false} = state, _loan) do
     state
   end
@@ -1341,6 +1561,56 @@ defmodule Absynthe.Relay.Relay do
   defp maybe_repay_debt(state, loan) do
     account = Account.repay(state.flow_control_account, loan)
     %{state | flow_control_account: account}
+  end
+
+  # Repay a pending loan by loan_id (ack-based flow control)
+  defp maybe_repay_pending_loan(%{flow_control_enabled: false} = state, _loan_id) do
+    state
+  end
+
+  defp maybe_repay_pending_loan(state, loan_id) do
+    case Map.pop(state.pending_loans, loan_id) do
+      {nil, _} ->
+        # Loan not found - already repaid or timed out
+        Logger.debug("[#{state.connection_id}] Loan ack for unknown loan_id=#{loan_id}")
+        state
+
+      {{loan, timer_ref, _timestamp}, pending_loans} ->
+        # Cancel the timeout timer
+        Process.cancel_timer(timer_ref)
+
+        # Repay the loan
+        account = Account.repay(state.flow_control_account, loan)
+
+        %{state | flow_control_account: account, pending_loans: pending_loans}
+    end
+  end
+
+  # Handle loan timeout - force repay to prevent debt accumulation from crashed actors
+  defp handle_loan_timeout(%{flow_control_enabled: false} = state, _loan_id) do
+    state
+  end
+
+  defp handle_loan_timeout(state, loan_id) do
+    case Map.pop(state.pending_loans, loan_id) do
+      {nil, _} ->
+        # Loan not found - already repaid
+        state
+
+      {{loan, _timer_ref, timestamp}, pending_loans} ->
+        # Log the timeout with age
+        age_ms = System.monotonic_time(:millisecond) - timestamp
+
+        Logger.warning(
+          "[#{state.connection_id}] Loan timeout: loan_id=#{loan_id}, age=#{age_ms}ms - " <>
+            "actor may be slow or crashed, force repaying"
+        )
+
+        # Force repay to prevent debt accumulation
+        account = Account.repay(state.flow_control_account, loan)
+
+        %{state | flow_control_account: account, pending_loans: pending_loans}
+    end
   end
 
   @doc """
