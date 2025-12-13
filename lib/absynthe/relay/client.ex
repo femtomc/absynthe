@@ -50,6 +50,8 @@ defmodule Absynthe.Relay.Client do
 
   @connect_timeout 5_000
   @recv_timeout 5_000
+  # Max ciphertext size that fits in 16-bit length prefix
+  @max_noise_ciphertext_size 65535
 
   @doc """
   Connects to a relay server via Unix domain socket.
@@ -183,13 +185,18 @@ defmodule Absynthe.Relay.Client do
       ) do
     case Noise.encrypt(session, data) do
       {:ok, ciphertext, new_session} ->
-        # Send length-prefixed ciphertext
         length = byte_size(ciphertext)
-        packet = <<length::16-big, ciphertext::binary>>
 
-        case :gen_tcp.send(socket, packet) do
-          :ok -> {:ok, %{client | noise_session: new_session}}
-          {:error, reason} -> {:error, {:send_failed, reason}}
+        if length > @max_noise_ciphertext_size do
+          {:error, {:noise_message_too_large, length, @max_noise_ciphertext_size}}
+        else
+          # Send length-prefixed ciphertext
+          packet = <<length::16-big, ciphertext::binary>>
+
+          case :gen_tcp.send(socket, packet) do
+            :ok -> {:ok, %{client | noise_session: new_session}}
+            {:error, reason} -> {:error, {:send_failed, reason}}
+          end
         end
 
       {:error, reason} ->

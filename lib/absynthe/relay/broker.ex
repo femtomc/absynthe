@@ -173,6 +173,18 @@ defmodule Absynthe.Relay.Broker do
 
   @impl GenServer
   def init(opts) do
+    # Derive noise keypair from options first - fail fast on invalid config
+    case derive_noise_keypair(opts) do
+      {:ok, noise_keypair} ->
+        init_with_keypair(opts, noise_keypair)
+
+      {:error, reason} ->
+        Logger.error("Broker failed to start: #{inspect(reason)}")
+        {:stop, reason}
+    end
+  end
+
+  defp init_with_keypair(opts, noise_keypair) do
     # Start the actor that will host the dataspace
     {:ok, actor_pid} = Actor.start_link(id: {:broker, self()})
 
@@ -180,9 +192,6 @@ defmodule Absynthe.Relay.Broker do
     {:ok, dataspace_ref} = Actor.spawn_entity(actor_pid, :root, Dataspace.new())
 
     Logger.info("Broker started with dataspace #{inspect(dataspace_ref)}")
-
-    # Derive noise keypair from options
-    noise_keypair = derive_noise_keypair(opts)
 
     if noise_keypair do
       {public, _private} = noise_keypair
@@ -207,24 +216,24 @@ defmodule Absynthe.Relay.Broker do
   end
 
   # Derive noise keypair from options - supports :noise_keypair or :noise_secret
+  # Returns {:ok, keypair} or {:ok, nil} for no encryption, or {:error, reason}
   defp derive_noise_keypair(opts) do
     case Keyword.get(opts, :noise_keypair) do
       {_public, _private} = keypair ->
-        keypair
+        {:ok, keypair}
 
       nil ->
         case Keyword.get(opts, :noise_secret) do
           nil ->
-            nil
+            {:ok, nil}
 
           secret when is_binary(secret) ->
             case Noise.keypair_from_secret(secret) do
               {:ok, keypair} ->
-                keypair
+                {:ok, keypair}
 
               {:error, reason} ->
-                Logger.error("Failed to derive Noise keypair from secret: #{inspect(reason)}")
-                nil
+                {:error, {:invalid_noise_secret, reason}}
             end
         end
     end

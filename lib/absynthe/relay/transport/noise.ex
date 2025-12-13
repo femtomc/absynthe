@@ -47,6 +47,8 @@ defmodule Absynthe.Relay.Transport.Noise do
 
   @protocol_name "Noise_NK_25519_ChaChaPoly_SHA256"
   @handshake_timeout 5_000
+  # Max ciphertext size that fits in 16-bit length prefix
+  @max_ciphertext_size 65535
 
   @typedoc """
   A Noise keypair: {public_key, private_key}.
@@ -372,11 +374,16 @@ defmodule Absynthe.Relay.Transport.Noise do
     case encrypt(session, plaintext) do
       {:ok, ciphertext, session} ->
         length = byte_size(ciphertext)
-        packet = <<length::16-big, ciphertext::binary>>
 
-        case :gen_tcp.send(socket, packet) do
-          :ok -> {:ok, session}
-          {:error, reason} -> {:error, {:send, reason}}
+        if length > @max_ciphertext_size do
+          {:error, {:message_too_large, length, @max_ciphertext_size}}
+        else
+          packet = <<length::16-big, ciphertext::binary>>
+
+          case :gen_tcp.send(socket, packet) do
+            :ok -> {:ok, session}
+            {:error, reason} -> {:error, {:send, reason}}
+          end
         end
 
       {:error, reason} ->

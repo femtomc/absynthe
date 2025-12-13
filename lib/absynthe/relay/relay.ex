@@ -1116,17 +1116,27 @@ defmodule Absynthe.Relay.Relay do
     :ssl.send(socket, data)
   end
 
+  # Max ciphertext size that fits in 16-bit length prefix
+  # Noise adds 16 bytes AEAD overhead, so max plaintext is 65535 - 16 = 65519
+  @max_noise_ciphertext_size 65535
+
   # For Noise transport, encrypt before sending with length prefix
   defp send_data(%{socket: socket, transport: :noise, noise_session: noise_session}, data) do
     case Noise.encrypt(noise_session, data) do
       {:ok, ciphertext, noise_session} ->
-        # Update session state (caller needs to handle this)
-        # Since send_data doesn't return state, we use the process dictionary
-        # as a temporary mechanism to update the session
-        Process.put(:noise_session_update, noise_session)
-        # Send length-prefixed ciphertext
         length = byte_size(ciphertext)
-        :gen_tcp.send(socket, <<length::16-big, ciphertext::binary>>)
+
+        if length > @max_noise_ciphertext_size do
+          {:error, {:noise_message_too_large, length, @max_noise_ciphertext_size}}
+        else
+          # Update session state (caller needs to handle this)
+          # Since send_data doesn't return state, we use the process dictionary
+          # as a temporary mechanism to update the session. This is safe within
+          # the GenServer's single-threaded execution model.
+          Process.put(:noise_session_update, noise_session)
+          # Send length-prefixed ciphertext
+          :gen_tcp.send(socket, <<length::16-big, ciphertext::binary>>)
+        end
 
       {:error, reason} ->
         {:error, {:noise_encrypt_failed, reason}}
