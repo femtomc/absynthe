@@ -403,6 +403,86 @@ defmodule Absynthe.Relay.EdgeCaseTest do
   describe "Socket ownership transfer" do
     @moduletag timeout: 10_000
 
+    test "listener continues accepting after controlling_process handoff succeeds" do
+      # Test the happy path: handoff succeeds and listener keeps accepting
+      socket_path = "/tmp/absynthe_handoff_#{:erlang.unique_integer([:positive])}.sock"
+      {:ok, broker} = Broker.start_link(socket_path: socket_path)
+      Process.sleep(100)
+
+      # Connect and verify handoff works
+      {:ok, client1} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false])
+
+      turn = %Turn{
+        events: [%TurnEvent{oid: 0, event: %Assert{assertion: {:string, "test1"}, handle: 1}}]
+      }
+
+      {:ok, data} = Framing.encode(turn)
+      :ok = :gen_tcp.send(client1, data)
+      Process.sleep(50)
+
+      # Second connection should also work
+      {:ok, client2} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false])
+
+      turn2 = %Turn{
+        events: [%TurnEvent{oid: 0, event: %Assert{assertion: {:string, "test2"}, handle: 1}}]
+      }
+
+      {:ok, data2} = Framing.encode(turn2)
+      :ok = :gen_tcp.send(client2, data2)
+      Process.sleep(50)
+
+      :gen_tcp.close(client1)
+      :gen_tcp.close(client2)
+
+      # Broker should still be alive
+      assert Process.alive?(broker)
+
+      Broker.stop(broker)
+    end
+
+    test "listener survives when relay process exits early during handoff" do
+      # This tests that if the relay process exits between start_link and
+      # controlling_process, the listener doesn't crash and keeps accepting
+      socket_path = "/tmp/absynthe_early_exit_#{:erlang.unique_integer([:positive])}.sock"
+      {:ok, broker} = Broker.start_link(socket_path: socket_path)
+      Process.sleep(100)
+
+      # Connect and close rapidly multiple times to stress test early exits
+      for _ <- 1..10 do
+        case :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false]) do
+          {:ok, client} ->
+            # Close immediately to potentially trigger races
+            :gen_tcp.close(client)
+
+          {:error, _reason} ->
+            # Connection failed, that's ok
+            :ok
+        end
+      end
+
+      Process.sleep(100)
+
+      # Broker should still be accepting connections
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false])
+
+      turn = %Turn{
+        events: [
+          %TurnEvent{oid: 0, event: %Assert{assertion: {:string, "still works"}, handle: 1}}
+        ]
+      }
+
+      {:ok, data} = Framing.encode(turn)
+      :ok = :gen_tcp.send(client, data)
+      Process.sleep(50)
+
+      :gen_tcp.close(client)
+
+      # Broker should still be alive
+      assert Process.alive?(broker)
+
+      Broker.stop(broker)
+    end
+
     test "listener handles relay start failure gracefully" do
       # Test that the listener handles failures gracefully when relay can't start
       socket_path = "/tmp/absynthe_ownership_#{:erlang.unique_integer([:positive])}.sock"
