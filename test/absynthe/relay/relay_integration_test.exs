@@ -1,7 +1,7 @@
 defmodule Absynthe.Relay.RelayIntegrationTest do
   use ExUnit.Case
 
-  alias Absynthe.Relay.{Broker, Framing, Membrane}
+  alias Absynthe.Relay.{Broker, Framing, Relay}
   alias Absynthe.Relay.Packet.{Turn, TurnEvent, Assert, Retract, Message}
 
   @moduletag :integration
@@ -332,6 +332,36 @@ defmodule Absynthe.Relay.RelayIntegrationTest do
       refute_receive {:tcp_closed, ^client}, 0
 
       # Clean up
+      :gen_tcp.close(client)
+      Broker.stop(broker)
+    end
+  end
+
+  describe "transport validation" do
+    test "rejects unsupported transport with clear error" do
+      socket_path = "/tmp/absynthe_test_#{:erlang.unique_integer([:positive])}.sock"
+
+      {:ok, broker} = Broker.start_link(socket_path: socket_path)
+      Process.sleep(50)
+
+      dataspace_ref = Broker.dataspace_ref(broker)
+
+      # Create a socket to test with
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: false])
+
+      # Attempting to start a relay with :ssl transport should fail with ArgumentError
+      # Use GenServer.start (not start_link) to avoid crashing the test process
+      result =
+        GenServer.start(Relay,
+          socket: client,
+          transport: :ssl,
+          dataspace_ref: dataspace_ref
+        )
+
+      assert {:error, {%ArgumentError{message: message}, _stacktrace}} = result
+      assert message =~ "unsupported transport: :ssl"
+      assert message =~ "expected :gen_tcp or :noise"
+
       :gen_tcp.close(client)
       Broker.stop(broker)
     end

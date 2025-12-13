@@ -99,8 +99,8 @@ defmodule Absynthe.Relay.Relay do
   Relay state.
   """
   @type state :: %{
-          socket: port() | :ssl.sslsocket(),
-          transport: module(),
+          socket: port(),
+          transport: :gen_tcp | :noise,
           actor_pid: pid(),
           dataspace_ref: Ref.t(),
           export_membrane: Membrane.t(),
@@ -139,7 +139,7 @@ defmodule Absynthe.Relay.Relay do
   ## Options
 
   - `:socket` - The connected socket (required)
-  - `:transport` - Transport module, `:gen_tcp`, `:ssl`, or `:noise` (default: `:gen_tcp`)
+  - `:transport` - Transport module, `:gen_tcp` or `:noise` (default: `:gen_tcp`)
   - `:dataspace_ref` - Ref to the target dataspace entity (required)
   - `:actor_pid` - PID of the hosting actor (default: start a new actor)
   - `:idle_timeout` - Idle timeout in milliseconds (default: `:infinity`)
@@ -187,6 +187,12 @@ defmodule Absynthe.Relay.Relay do
   def init(opts) do
     socket = Keyword.fetch!(opts, :socket)
     transport = Keyword.get(opts, :transport, :gen_tcp)
+
+    unless transport in [:gen_tcp, :noise] do
+      raise ArgumentError,
+            "unsupported transport: #{inspect(transport)}, expected :gen_tcp or :noise"
+    end
+
     dataspace_ref = Keyword.fetch!(opts, :dataspace_ref)
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
     noise_keypair = Keyword.get(opts, :noise_keypair)
@@ -319,29 +325,15 @@ defmodule Absynthe.Relay.Relay do
     handle_incoming_data(state, data)
   end
 
-  def handle_info({:ssl, socket, data}, %{socket: socket} = state) do
-    handle_incoming_data(state, data)
-  end
-
   # Handle TCP close
   def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
     Logger.info("[#{state.connection_id}] Connection closed by peer")
     {:stop, :normal, %{state | closed: true}}
   end
 
-  def handle_info({:ssl_closed, socket}, %{socket: socket} = state) do
-    Logger.info("[#{state.connection_id}] SSL connection closed by peer")
-    {:stop, :normal, %{state | closed: true}}
-  end
-
   # Handle TCP error
   def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state) do
     Logger.error("[#{state.connection_id}] TCP error: #{inspect(reason)}")
-    {:stop, {:error, reason}, %{state | closed: true}}
-  end
-
-  def handle_info({:ssl_error, socket, reason}, %{socket: socket} = state) do
-    Logger.error("[#{state.connection_id}] SSL error: #{inspect(reason)}")
     {:stop, {:error, reason}, %{state | closed: true}}
   end
 
@@ -1068,10 +1060,6 @@ defmodule Absynthe.Relay.Relay do
     end
   end
 
-  defp set_socket_active(%{socket: socket, transport: :ssl}) do
-    :ssl.setopts(socket, active: :once)
-  end
-
   # Noise uses raw TCP socket for transport
   defp set_socket_active(%{socket: socket, transport: :noise, connection_id: conn_id}) do
     case :inet.setopts(socket, active: :once) do
@@ -1112,10 +1100,6 @@ defmodule Absynthe.Relay.Relay do
     :gen_tcp.send(socket, data)
   end
 
-  defp send_data(%{socket: socket, transport: :ssl}, data) do
-    :ssl.send(socket, data)
-  end
-
   # Max ciphertext size that fits in 16-bit length prefix
   # Noise adds 16 bytes AEAD overhead, so max plaintext is 65535 - 16 = 65519
   @max_noise_ciphertext_size 65535
@@ -1145,10 +1129,6 @@ defmodule Absynthe.Relay.Relay do
 
   defp close_socket(%{socket: socket, transport: :gen_tcp}) do
     :gen_tcp.close(socket)
-  end
-
-  defp close_socket(%{socket: socket, transport: :ssl}) do
-    :ssl.close(socket)
   end
 
   # Noise uses raw TCP socket for transport, but also cleanup session
