@@ -186,6 +186,8 @@ defmodule Absynthe.Core.Actor do
   alias Absynthe.Core.Rewrite
   alias Absynthe.Protocol.Event
   alias Absynthe.Assertions.Handle
+  alias Absynthe.FlowControl
+  alias Absynthe.FlowControl.Account
 
   # Import Event sub-modules for pattern matching
   alias Event.{Assert, Retract, Message, Sync}
@@ -223,7 +225,10 @@ defmodule Absynthe.Core.Actor do
           # Maps owner_pid -> MapSet of handles from that owner
           owner_handles: %{pid() => MapSet.t(Handle.t())},
           # Maps pid -> monitor_ref for demonitoring when no longer needed
-          pid_monitors: %{pid() => reference()}
+          pid_monitors: %{pid() => reference()},
+          # Per-actor flow control account for internal cascades
+          # When present, each action enqueued during turn commit borrows from this account
+          flow_control_account: Account.t() | nil
         }
 
   @typedoc """
@@ -525,6 +530,30 @@ defmodule Absynthe.Core.Actor do
   end
 
   @doc """
+  Returns flow control statistics for the actor.
+
+  If flow control is not enabled for this actor, returns `nil`.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+
+  ## Examples
+
+      stats = Absynthe.Core.Actor.flow_control_stats(actor)
+      # %{debt: 50, limit: 1000, paused: false, utilization: 5.0, ...}
+
+  ## Returns
+
+  - `map()` - Flow control statistics
+  - `nil` - Flow control not enabled
+  """
+  @spec flow_control_stats(GenServer.server()) :: map() | nil
+  def flow_control_stats(actor) do
+    GenServer.call(actor, :flow_control_stats)
+  end
+
+  @doc """
   Creates a new facet as a child of the specified parent facet.
 
   Facets provide scoped resource management - when a facet terminates,
@@ -649,6 +678,26 @@ defmodule Absynthe.Core.Actor do
     actor_id = Keyword.get(opts, :id, self())
     root_facet_id = Keyword.get(opts, :root_facet_id, :root)
 
+    # Create flow control account if enabled
+    # Options:
+    # - flow_control: true - use default flow control settings
+    # - flow_control: [limit: 500, ...] - custom account options
+    # - flow_control: false or omitted - no internal flow control
+    flow_control_account =
+      case Keyword.get(opts, :flow_control) do
+        nil ->
+          nil
+
+        false ->
+          nil
+
+        true ->
+          Account.new(id: {:actor, actor_id})
+
+        account_opts when is_list(account_opts) ->
+          Account.new([{:id, {:actor, actor_id}} | account_opts])
+      end
+
     # Create the root facet
     # Note: root facet starts with inert_check_preventers=1 to prevent premature termination
     # The root facet is special and should not be auto-terminated by inertness
@@ -675,12 +724,31 @@ defmodule Absynthe.Core.Actor do
       # Crash cleanup tracking
       inbound_assertions: %{},
       owner_handles: %{},
-      pid_monitors: %{}
+      pid_monitors: %{},
+      # Per-actor flow control for internal cascades
+      flow_control_account: flow_control_account
     }
 
     Logger.debug("Actor #{inspect(actor_id)} initialized with root facet #{root_facet_id}")
 
     {:ok, state}
+  end
+
+  @impl GenServer
+  def handle_call(:flow_control_stats, _from, state) do
+    stats =
+      case state.flow_control_account do
+        nil ->
+          nil
+
+        account ->
+          {:message_queue_len, mailbox_len} = Process.info(self(), :message_queue_len)
+
+          Account.stats(account)
+          |> Map.put(:mailbox_length, mailbox_len)
+      end
+
+    {:reply, stats, state}
   end
 
   @impl GenServer
@@ -926,9 +994,10 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_cast({:deliver, ref, event}, state) do
+    # External delivery - from Actor.deliver/3 or Actor.send_message/3
+    # No flow control repayment here since we didn't borrow for external events
     # Deliver the event - either locally or to remote actor
-    # For local refs, we process directly (this is either from external casts
-    # or from our own async self-casts from turn commit).
+    # For local refs, we process directly.
     # For remote refs, we forward to the remote actor.
     new_state =
       case Ref.local?(ref, state.id) do
@@ -953,6 +1022,22 @@ defmodule Absynthe.Core.Actor do
               state
           end
       end
+
+    {:noreply, new_state}
+  end
+
+  @impl GenServer
+  def handle_cast({:deliver_internal, ref, event}, state) do
+    # Internal delivery from self-cast during commit_turn
+    # We borrowed for these in borrow_for_actions, so we repay here
+    state = check_flow_control_overload(state)
+
+    # Local delivery - process the event directly
+    state = deliver_event_impl(state, ref, event, nil)
+
+    # Flow control: repay debt after turn completion
+    # This corresponds to the borrow done in commit_turn
+    new_state = repay_action_cost(state, event)
 
     {:noreply, new_state}
   end
@@ -1292,6 +1377,10 @@ defmodule Absynthe.Core.Actor do
     # Get the facet_id from the turn for tracking assertion ownership
     facet_id = Turn.facet_id(turn)
 
+    # Flow control: borrow from account for each action's cost
+    # This charges fan-out to the originating turn
+    state = borrow_for_actions(state, actions)
+
     # Process each pending action
     state =
       Enum.reduce(actions, state, fn action, acc_state ->
@@ -1303,11 +1392,130 @@ defmodule Absynthe.Core.Actor do
     stop_inert_facets(state, facet_id)
   end
 
+  # Check if actor is overloaded based on flow control and mailbox length
+  # Emits telemetry when paused, allowing external monitoring and intervention
+  defp check_flow_control_overload(%{flow_control_account: nil} = state), do: state
+
+  defp check_flow_control_overload(%{flow_control_account: account} = state) do
+    if account.paused do
+      # Get mailbox length for telemetry
+      {:message_queue_len, mailbox_len} = Process.info(self(), :message_queue_len)
+
+      :telemetry.execute(
+        [:absynthe, :flow_control, :actor, :overload],
+        %{debt: account.debt, mailbox_length: mailbox_len},
+        %{actor_id: state.id, account_id: account.id}
+      )
+
+      # Log warning if mailbox is also growing
+      if mailbox_len > account.limit do
+        Logger.warning(
+          "Actor #{inspect(state.id)} overloaded: debt=#{account.debt}, mailbox=#{mailbox_len}"
+        )
+      end
+    end
+
+    state
+  end
+
+  # Borrow from flow control account for the cost of all actions
+  # This is preemptive - we charge the originating turn for the cascade it causes
+  #
+  # Note: We directly manipulate debt instead of using Account.force_borrow/2
+  # because we track aggregate debt, not individual loans. This avoids growing
+  # the loaned_items map unboundedly.
+  defp borrow_for_actions(%{flow_control_account: nil} = state, _actions), do: state
+
+  defp borrow_for_actions(%{flow_control_account: account} = state, actions) do
+    # Calculate total cost of all actions
+    total_cost = Enum.reduce(actions, 0, fn action, acc -> acc + action_cost(action) end)
+
+    if total_cost > 0 do
+      # Directly increment debt (no loan tracking needed for aggregate debt)
+      new_debt = account.debt + total_cost
+      new_account = %{account | debt: new_debt}
+
+      # Check if we should pause (debt exceeded high water mark)
+      new_account =
+        if not account.paused and new_debt >= account.high_water_mark do
+          :telemetry.execute(
+            [:absynthe, :flow_control, :account, :pause],
+            %{debt: new_debt, high_water: account.high_water_mark},
+            %{account_id: account.id}
+          )
+
+          paused_account = %{new_account | paused: true}
+
+          if account.pause_callback do
+            account.pause_callback.(paused_account)
+          end
+
+          paused_account
+        else
+          new_account
+        end
+
+      %{state | flow_control_account: new_account}
+    else
+      state
+    end
+  end
+
+  # Calculate the cost of an action for flow control
+  # Delegates to FlowControl.event_cost/1 for protocol events
+  defp action_cost(%Assert{} = event), do: FlowControl.event_cost(event)
+  defp action_cost(%Retract{} = event), do: FlowControl.event_cost(event)
+  defp action_cost(%Message{} = event), do: FlowControl.event_cost(event)
+  defp action_cost(%Sync{} = event), do: FlowControl.event_cost(event)
+  defp action_cost(%Event.Spawn{}), do: 2
+  defp action_cost({:field_update, _, _}), do: 1
+  defp action_cost(_), do: 1
+
+  # Repay flow control debt after processing an event
+  # This balances the borrow done in commit_turn when the action was enqueued
+  defp repay_action_cost(%{flow_control_account: nil} = state, _event), do: state
+
+  defp repay_action_cost(%{flow_control_account: account} = state, event) do
+    cost = action_cost(event)
+
+    if cost > 0 do
+      # Directly reduce debt and check resume threshold
+      # This is simpler than using the loan mechanism since we track aggregate debt
+      new_debt = max(0, account.debt - cost)
+      new_account = %{account | debt: new_debt}
+
+      # Check if we should resume (debt fell below low water mark)
+      new_account =
+        if account.paused and new_debt < account.low_water_mark do
+          :telemetry.execute(
+            [:absynthe, :flow_control, :account, :resume],
+            %{debt: new_debt, low_water: account.low_water_mark},
+            %{account_id: account.id}
+          )
+
+          resumed_account = %{new_account | paused: false}
+
+          if account.resume_callback do
+            account.resume_callback.(resumed_account)
+          end
+
+          resumed_account
+        else
+          new_account
+        end
+
+      %{state | flow_control_account: new_account}
+    else
+      state
+    end
+  end
+
   @doc false
-  defp process_action(state, {:field_update, field_id, new_value}, _facet_id) do
+  defp process_action(state, {:field_update, field_id, new_value} = action, _facet_id) do
     # Execute dataflow field updates
     Absynthe.Dataflow.Field.execute_field_update(field_id, new_value)
-    state
+    # Field updates are synchronous - repay immediately
+    repay_action_cost(state, action)
   end
 
   # Handle Assert actions - deliver to target entity
@@ -1356,7 +1564,7 @@ defmodule Absynthe.Core.Actor do
   # Spawn failures raise an error to abort the entire turn, maintaining atomicity
   defp process_action(
          state,
-         %Event.Spawn{facet_id: facet_id, entity: entity, callback: callback},
+         %Event.Spawn{facet_id: facet_id, entity: entity, callback: callback} = action,
          _turn_facet_id
        ) do
     case spawn_entity_impl(state, facet_id, entity) do
@@ -1374,7 +1582,8 @@ defmodule Absynthe.Core.Actor do
           end
         end
 
-        new_state
+        # Spawns are synchronous - repay immediately
+        repay_action_cost(new_state, action)
 
       {:error, reason} ->
         # Spawn failure aborts the turn to maintain atomicity
@@ -1386,7 +1595,8 @@ defmodule Absynthe.Core.Actor do
   defp process_action(state, action, _facet_id) do
     # Unknown action type - log warning
     Logger.warning("Unknown action type: #{inspect(action)}")
-    state
+    # Repay for unknown actions to prevent debt leak
+    repay_action_cost(state, action)
   end
 
   # Track an assertion handle as belonging to a facet
@@ -1540,6 +1750,10 @@ defmodule Absynthe.Core.Actor do
   # processed immediately. This keeps call stacks shallow and allows the actor to
   # process mailbox work between cascades.
   #
+  # Flow control debt is repaid:
+  # - For local delivery: when handle_cast({:deliver, ...}) completes
+  # - For remote delivery: immediately after cast (remote actor handles its own cost)
+  #
   # IMPORTANT: This means turns no longer complete all local effects atomically.
   # Observers will see effects in subsequent turns. This is a trade-off for:
   # - Shallow call stacks (prevents stack overflow on large fan-out)
@@ -1550,25 +1764,30 @@ defmodule Absynthe.Core.Actor do
       true ->
         # Local delivery - enqueue via self-cast for async processing
         # This keeps call stacks shallow during observer fan-out
-        GenServer.cast(self(), {:deliver, ref, event})
+        # Uses :deliver_internal so we can distinguish from external delivers
+        # Debt repayment happens in handle_cast({:deliver_internal, ...})
+        GenServer.cast(self(), {:deliver_internal, ref, event})
         state
 
       false ->
         # Remote delivery - send to remote actor with sender PID for crash tracking
+        # Repay debt immediately - the remote actor will track its own cost
         remote_actor_id = Ref.actor_id(ref)
 
         case resolve_actor(remote_actor_id) do
           {:ok, actor_pid} ->
             # Use :deliver_from to include sender PID for crash cleanup
             GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
-            state
+            # Repay our debt - remote actor manages its own flow control
+            repay_action_cost(state, event)
 
           :error ->
             Logger.warning(
               "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
             )
 
-            state
+            # Repay even on error - the work is done from our perspective
+            repay_action_cost(state, event)
         end
     end
   end
