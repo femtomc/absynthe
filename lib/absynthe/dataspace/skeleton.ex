@@ -9,7 +9,7 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   ## Architecture
 
-  The Skeleton uses three ETS tables with `:read_concurrency` enabled for parallel reads:
+  The Skeleton uses four ETS tables with `:read_concurrency` enabled for parallel reads:
 
   1. **Path Index**: Maps `{path, value_at_path}` tuples to sets of assertion handles.
      This allows quick lookup of assertions by specific path values.
@@ -19,6 +19,9 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   3. **Observer Registry**: Maps observer IDs to their compiled patterns and observer
      references. This enables efficient notification when matching assertions change.
+
+  4. **Observer Index**: Maps `{path, value_class}` tuples to sets of `{observer_id, exact_value}`
+     pairs. This allows O(matching observers) lookup instead of scanning all observers.
 
   ## Indexing Strategy
 
@@ -30,8 +33,14 @@ defmodule Absynthe.Dataspace.Skeleton do
   Generates the following index entries:
 
       {[:label], {:symbol, "Person"}} -> MapSet containing handle
-      {[:field, 0], {:string, "Alice"}} -> MapSet containing handle
-      {[:field, 1], {:integer, 30}} -> MapSet containing handle
+      {[{:field, 0}], {:string, "Alice"}} -> MapSet containing handle
+      {[{:field, 1}], {:integer, 30}} -> MapSet containing handle
+
+  Path elements are tuples to match the compiled Pattern format:
+  - `[:label]` for record labels
+  - `[{:field, n}]` for record fields
+  - `[n]` (bare integer) for sequence elements
+  - `[{:key, k}]` for dictionary values
 
   This indexing allows patterns constrained to specific field values to quickly find
   matching assertions without scanning the entire assertion space.
@@ -93,13 +102,14 @@ defmodule Absynthe.Dataspace.Skeleton do
   @typedoc """
   Path into a Preserves value structure.
 
-  Paths describe locations within compound values:
+  Paths describe locations within compound values using elements that match
+  the compiled Pattern format:
   - `[:label]` - The label of a record
-  - `[:field, n]` - The nth field of a record
-  - `[:element, n]` - The nth element of a sequence
-  - `[:key, key]` - A specific key in a dictionary
+  - `[{:field, n}]` - The nth field of a record (tuple)
+  - `[n]` - The nth element of a sequence (bare integer)
+  - `[{:key, key}]` - A specific key in a dictionary (tuple)
   """
-  @type path :: [atom() | non_neg_integer() | Value.t()]
+  @type path :: [atom() | non_neg_integer() | {:field, non_neg_integer()} | {:key, Value.t()}]
 
   @typedoc """
   The Skeleton index structure.
@@ -108,21 +118,34 @@ defmodule Absynthe.Dataspace.Skeleton do
   - `path_index`: ETS table mapping `{path, value}` to `MapSet.t(Handle.t())`
   - `assertions`: ETS table mapping `Handle.t()` to `Value.t()`
   - `observers`: ETS table mapping observer ID to `{Pattern.t(), observer_ref}`
+  - `observer_index`: ETS table mapping `{path, value_class}` to `MapSet.t({observer_id, exact_value | nil})`
+    where value_class is an atom like `:symbol`, `:integer`, etc. and exact_value is the
+    constraint value (or nil for wildcard constraints at that path)
+  - `wildcard_observers`: Set of observer IDs with unconstrained patterns (match everything)
   - `owner`: PID of the process that created the skeleton
   """
   @type t :: %__MODULE__{
           path_index: :ets.tid(),
           assertions: :ets.tid(),
           observers: :ets.tid(),
+          observer_index: :ets.tid(),
+          wildcard_observers: MapSet.t(term()),
           owner: pid()
         }
 
-  defstruct [:path_index, :assertions, :observers, :owner]
+  defstruct [
+    :path_index,
+    :assertions,
+    :observers,
+    :observer_index,
+    wildcard_observers: MapSet.new(),
+    owner: nil
+  ]
 
   @doc """
   Creates a new Skeleton index.
 
-  Initializes three ETS tables with `:read_concurrency` enabled for efficient
+  Initializes four ETS tables with `:read_concurrency` enabled for efficient
   parallel reads. The tables are owned by the calling process.
 
   ## Returns
@@ -142,6 +165,8 @@ defmodule Absynthe.Dataspace.Skeleton do
       path_index: :ets.new(:path_index, [:set, :public, read_concurrency: true]),
       assertions: :ets.new(:assertions, [:set, :public, read_concurrency: true]),
       observers: :ets.new(:observers, [:set, :public, read_concurrency: true]),
+      observer_index: :ets.new(:observer_index, [:set, :public, read_concurrency: true]),
+      wildcard_observers: MapSet.new(),
       owner: self()
     }
   end
@@ -332,7 +357,8 @@ defmodule Absynthe.Dataspace.Skeleton do
   @doc """
   Registers an observer with a compiled pattern.
 
-  Stores the observer's pattern and reference, then returns all existing assertions
+  Stores the observer's pattern and reference, indexes the observer by its
+  constraints for efficient lookup, then returns all existing assertions
   that match the pattern along with their captured values.
 
   ## Parameters
@@ -344,8 +370,10 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   ## Returns
 
-  A list of tuples `{handle, captures}` representing existing assertions that
-  match the pattern, along with their captured values.
+  A tuple `{updated_skeleton, matches}` where:
+  - `updated_skeleton` - The skeleton with the observer indexed
+  - `matches` - A list of tuples `{handle, value, captures}` representing existing
+    assertions that match the pattern, along with their captured values.
 
   ## Examples
 
@@ -354,7 +382,7 @@ defmodule Absynthe.Dataspace.Skeleton do
         Absynthe.Preserves.Value.symbol("User"),
         [{:capture, :name}]
       )
-      matches = Absynthe.Dataspace.Skeleton.add_observer(
+      {updated_skeleton, matches} = Absynthe.Dataspace.Skeleton.add_observer(
         skeleton,
         :observer_1,
         self(),
@@ -363,20 +391,23 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   """
   @spec add_observer(t(), observer_id :: term(), observer_ref :: term(), Pattern.t()) ::
-          [{Handle.t(), Value.t(), captures :: [Value.t()]}]
+          {t(), [{Handle.t(), Value.t(), captures :: [Value.t()]}]}
   def add_observer(%__MODULE__{} = skeleton, observer_id, observer_ref, pattern) do
     # Store the observer
     :ets.insert(skeleton.observers, {observer_id, {pattern, observer_ref}})
 
+    # Index the observer by its constraints for efficient lookup
+    skeleton = index_observer(skeleton, observer_id, pattern)
+
     # Find all existing matching assertions - query returns {handle, value, captures}
-    query(skeleton, pattern)
+    {skeleton, query(skeleton, pattern)}
   end
 
   @doc """
   Unregisters an observer.
 
-  Removes the observer from the registry. The observer will no longer receive
-  notifications about assertion changes.
+  Removes the observer from the registry and from the observer index.
+  The observer will no longer receive notifications about assertion changes.
 
   ## Parameters
 
@@ -385,19 +416,29 @@ defmodule Absynthe.Dataspace.Skeleton do
 
   ## Returns
 
-  `:ok`
+  The updated skeleton with the observer removed from all indices.
 
   ## Examples
 
       skeleton = Absynthe.Dataspace.Skeleton.new()
       # ... add observer ...
-      :ok = Absynthe.Dataspace.Skeleton.remove_observer(skeleton, :observer_1)
+      updated_skeleton = Absynthe.Dataspace.Skeleton.remove_observer(skeleton, :observer_1)
 
   """
-  @spec remove_observer(t(), observer_id :: term()) :: :ok
+  @spec remove_observer(t(), observer_id :: term()) :: t()
   def remove_observer(%__MODULE__{} = skeleton, observer_id) do
+    # Get pattern before deleting to know what to unindex
+    skeleton =
+      case :ets.lookup(skeleton.observers, observer_id) do
+        [{^observer_id, {pattern, _observer_ref}}] ->
+          unindex_observer(skeleton, observer_id, pattern)
+
+        [] ->
+          skeleton
+      end
+
     :ets.delete(skeleton.observers, observer_id)
-    :ok
+    skeleton
   end
 
   @doc """
@@ -527,24 +568,33 @@ defmodule Absynthe.Dataspace.Skeleton do
     :ets.delete(skeleton.path_index)
     :ets.delete(skeleton.assertions)
     :ets.delete(skeleton.observers)
+    :ets.delete(skeleton.observer_index)
     :ok
   end
 
   # Private Helper Functions
 
-  # Extracts all indexable paths from a value
+  # Extracts all indexable paths from a value.
+  # IMPORTANT: Path format must match Pattern.compile_pattern/2:
+  # - Records: [:label] for label, [{:field, index}] for fields
+  # - Sequences: [index] (bare integer)
+  # - Dictionaries: [{:key, key}] for values
+  # - Sets: [index] (sorted canonical order)
   @spec extract_paths(Value.t()) :: [{path(), Value.t()}]
   defp extract_paths(value), do: extract_paths(value, [])
 
   @spec extract_paths(Value.t(), path()) :: [{path(), Value.t()}]
   defp extract_paths({:record, {label, fields}}, path) do
-    label_paths = [{path ++ [:label], label} | extract_paths(label, path ++ [:label])]
+    # Label uses [:label] atom
+    label_path = path ++ [:label]
+    label_paths = [{label_path, label} | extract_paths(label, label_path)]
 
+    # Fields use [{:field, index}] tuples (matching Pattern.compile_pattern)
     field_paths =
       fields
       |> Enum.with_index()
       |> Enum.flat_map(fn {field, idx} ->
-        field_path = path ++ [:field, idx]
+        field_path = path ++ [{:field, idx}]
         [{field_path, field} | extract_paths(field, field_path)]
       end)
 
@@ -552,38 +602,38 @@ defmodule Absynthe.Dataspace.Skeleton do
   end
 
   defp extract_paths({:sequence, items}, path) do
+    # Sequences use bare integer indices (matching Pattern.compile_pattern)
     items
     |> Enum.with_index()
     |> Enum.flat_map(fn {item, idx} ->
-      item_path = path ++ [:element, idx]
+      item_path = path ++ [idx]
       [{item_path, item} | extract_paths(item, item_path)]
     end)
   end
 
   defp extract_paths({:set, items}, path) do
-    items
-    |> Enum.flat_map(fn item ->
-      # For sets, we can't use positional indices, so we index by the value itself
-      item_path = path ++ [:member, item]
+    # Sets use sorted canonical order with integer indices (matching Pattern.compile_pattern)
+    sorted_items = items |> MapSet.to_list() |> Absynthe.Preserves.Compare.sort()
+
+    sorted_items
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {item, idx} ->
+      item_path = path ++ [idx]
       [{item_path, item} | extract_paths(item, item_path)]
     end)
   end
 
-  defp extract_paths({:dictionary, map}, path) do
-    map
+  defp extract_paths({:dictionary, entries}, path) do
+    # Dictionaries use [{:key, key}] tuples (matching Pattern.compile_pattern)
+    entries
     |> Enum.flat_map(fn {key, val} ->
-      key_path = path ++ [:key, key]
-      val_path = path ++ [:value, key]
-
-      key_paths = [{key_path, key} | extract_paths(key, key_path)]
-      val_paths = [{val_path, val} | extract_paths(val, val_path)]
-
-      key_paths ++ val_paths
+      val_path = path ++ [{:key, key}]
+      [{val_path, val} | extract_paths(val, val_path)]
     end)
   end
 
-  # Atomic values don't have nested paths
-  defp extract_paths(_atomic, _path), do: []
+  # Atomic values: include root path entry so we can match on literal patterns
+  defp extract_paths(atomic, path), do: [{path, atomic}]
 
   # Removes assertion handle from path index
   defp remove_from_path_index(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
@@ -629,19 +679,145 @@ defmodule Absynthe.Dataspace.Skeleton do
     )
   end
 
-  # Find observers that match a given assertion
+  # Find observers that match a given assertion using the observer index.
+  # This is O(matching observers) instead of O(all observers).
   @spec find_matching_observers(t(), Handle.t(), Value.t()) ::
           [{observer_id :: term(), observer_ref :: term(), Value.t(), captures :: [Value.t()]}]
   defp find_matching_observers(%__MODULE__{} = skeleton, _handle, value) do
-    :ets.tab2list(skeleton.observers)
-    |> Enum.flat_map(fn {observer_id, {pattern, observer_ref}} ->
-      case Pattern.match(pattern, value) do
-        {:ok, captures} ->
-          [{observer_id, observer_ref, value, captures}]
+    # Get candidate observers using the observer index
+    candidate_ids = find_candidate_observers(skeleton, value)
 
-        :no_match ->
+    # For each candidate, perform full pattern matching
+    candidate_ids
+    |> Enum.flat_map(fn observer_id ->
+      case :ets.lookup(skeleton.observers, observer_id) do
+        [{^observer_id, {pattern, observer_ref}}] ->
+          case Pattern.match(pattern, value) do
+            {:ok, captures} ->
+              [{observer_id, observer_ref, value, captures}]
+
+            :no_match ->
+              []
+          end
+
+        [] ->
           []
       end
     end)
   end
+
+  # Find candidate observers that might match a value by looking up the observer index.
+  # Returns a set of observer_ids that have constraints potentially satisfied by the value.
+  @spec find_candidate_observers(t(), Value.t()) :: MapSet.t(term())
+  defp find_candidate_observers(%__MODULE__{} = skeleton, value) do
+    # Start with wildcard observers (they always need to be checked)
+    base_candidates = skeleton.wildcard_observers
+
+    # Extract paths from the assertion value
+    paths = extract_paths(value)
+
+    # For each path in the value, look up which observers have constraints on that path
+    # An observer is a candidate if ALL its constraints could be satisfied
+    # But we can only determine this by checking, so we gather all observers with
+    # at least one matching constraint and let Pattern.match filter the rest
+
+    # Gather observer_ids that have at least one constraint matching our value
+    path_candidates =
+      paths
+      |> Enum.reduce(MapSet.new(), fn {path, path_value}, acc ->
+        value_class = value_class(path_value)
+        index_key = {path, value_class}
+
+        case :ets.lookup(skeleton.observer_index, index_key) do
+          [{^index_key, observer_entries}] ->
+            # Check each observer entry - if exact_value matches (or is nil for any-of-class)
+            matching =
+              observer_entries
+              |> Enum.filter(fn {_observer_id, exact_value} ->
+                exact_value == nil or exact_value == path_value
+              end)
+              |> Enum.map(fn {observer_id, _} -> observer_id end)
+
+            MapSet.union(acc, MapSet.new(matching))
+
+          [] ->
+            acc
+        end
+      end)
+
+    MapSet.union(base_candidates, path_candidates)
+  end
+
+  # Index an observer by its pattern constraints for efficient lookup
+  @spec index_observer(t(), term(), Pattern.t()) :: t()
+  defp index_observer(%__MODULE__{} = skeleton, observer_id, %Pattern{} = pattern) do
+    constraints = Pattern.index_paths(pattern)
+
+    case constraints do
+      [] ->
+        # No constraints - this observer matches everything, add to wildcard set
+        %{skeleton | wildcard_observers: MapSet.put(skeleton.wildcard_observers, observer_id)}
+
+      _ ->
+        # Add observer to index for each constraint
+        Enum.each(constraints, fn {path, expected_value} ->
+          value_class = value_class(expected_value)
+          index_key = {path, value_class}
+
+          case :ets.lookup(skeleton.observer_index, index_key) do
+            [{^index_key, observer_entries}] ->
+              new_entries = MapSet.put(observer_entries, {observer_id, expected_value})
+              :ets.insert(skeleton.observer_index, {index_key, new_entries})
+
+            [] ->
+              :ets.insert(
+                skeleton.observer_index,
+                {index_key, MapSet.new([{observer_id, expected_value}])}
+              )
+          end
+        end)
+
+        skeleton
+    end
+  end
+
+  # Remove an observer from the index
+  @spec unindex_observer(t(), term(), Pattern.t()) :: t()
+  defp unindex_observer(%__MODULE__{} = skeleton, observer_id, %Pattern{} = pattern) do
+    constraints = Pattern.index_paths(pattern)
+
+    case constraints do
+      [] ->
+        # Was a wildcard observer
+        %{skeleton | wildcard_observers: MapSet.delete(skeleton.wildcard_observers, observer_id)}
+
+      _ ->
+        # Remove from each index entry
+        Enum.each(constraints, fn {path, expected_value} ->
+          value_class = value_class(expected_value)
+          index_key = {path, value_class}
+
+          case :ets.lookup(skeleton.observer_index, index_key) do
+            [{^index_key, observer_entries}] ->
+              new_entries = MapSet.delete(observer_entries, {observer_id, expected_value})
+
+              if MapSet.size(new_entries) == 0 do
+                :ets.delete(skeleton.observer_index, index_key)
+              else
+                :ets.insert(skeleton.observer_index, {index_key, new_entries})
+              end
+
+            [] ->
+              :ok
+          end
+        end)
+
+        skeleton
+    end
+  end
+
+  # Get the value class (type tag) for a Preserves value
+  @spec value_class(Value.t()) :: atom()
+  defp value_class({tag, _}) when is_atom(tag), do: tag
+  defp value_class(_), do: :unknown
 end
