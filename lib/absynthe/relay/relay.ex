@@ -138,7 +138,11 @@ defmodule Absynthe.Relay.Relay do
           # Pending loans awaiting ack from actor
           pending_loans: %{non_neg_integer() => {LoanedItem.t(), reference(), integer()}},
           next_loan_id: non_neg_integer(),
-          loan_ack_timeout: non_neg_integer()
+          loan_ack_timeout: non_neg_integer(),
+          # Max consecutive timeouts before closing connection
+          max_unacked_timeouts: non_neg_integer(),
+          # Current consecutive timeout count (resets on any ack)
+          consecutive_timeouts: non_neg_integer()
         }
 
   # Client API
@@ -165,9 +169,17 @@ defmodule Absynthe.Relay.Relay do
   - `:high_water_mark` - Debt level that pauses socket reads (default: 80% of limit)
   - `:low_water_mark` - Debt level that resumes socket reads (default: 40% of limit)
   - `:loan_ack_timeout` - Timeout in ms for actor to ack loan repayment (default: 30000)
+  - `:max_unacked_timeouts` - Max consecutive unacked timeouts before closing connection (default: 3)
 
   When debt exceeds the high water mark, the relay stops reading from the socket,
   applying TCP-level backpressure to the sender.
+
+  ### Timeout Behavior
+
+  Unlike earlier implementations that forgave debt on timeout, this version keeps
+  debt outstanding when actors are slow or crashed. After `:max_unacked_timeouts`
+  consecutive timeouts without any acks, the connection is closed to prevent
+  unbounded debt accumulation on stuck connections.
 
   ### Acknowledgment-Based Flow Control
 
@@ -181,9 +193,9 @@ defmodule Absynthe.Relay.Relay do
   - Actor processing time (turn execution)
   - Entity event handler duration
 
-  If the actor doesn't acknowledge within `:loan_ack_timeout`, the loan is
-  force-repaid to prevent debt accumulation from crashed or hung actors. A
-  warning is logged when this happens.
+  If the actor doesn't acknowledge within `:loan_ack_timeout`, the debt remains
+  outstanding and a warning is logged. After `:max_unacked_timeouts` consecutive
+  timeouts across all loans without any acks, the connection is closed.
 
   This implements similar semantics to syndicate-rs Account/LoanedItem, where
   debt is charged to the origin and repaid only after downstream processing.
@@ -265,10 +277,10 @@ defmodule Absynthe.Relay.Relay do
     {_oid, export_membrane} = Membrane.export(export_membrane, dataspace_ref)
 
     # Initialize flow control if configured
-    {flow_control_enabled, flow_control_account, loan_ack_timeout} =
+    {flow_control_enabled, flow_control_account, loan_ack_timeout, max_unacked_timeouts} =
       case Keyword.get(opts, :flow_control) do
         nil ->
-          {false, nil, 30_000}
+          {false, nil, 30_000, 3}
 
         flow_opts when is_list(flow_opts) ->
           relay_pid = self()
@@ -292,7 +304,8 @@ defmodule Absynthe.Relay.Relay do
             )
 
           timeout = Keyword.get(flow_opts, :loan_ack_timeout, 30_000)
-          {true, account, timeout}
+          max_timeouts = Keyword.get(flow_opts, :max_unacked_timeouts, 3)
+          {true, account, timeout, max_timeouts}
       end
 
     state = %{
@@ -330,7 +343,11 @@ defmodule Absynthe.Relay.Relay do
       # Counter for generating unique loan IDs across turns
       next_loan_id: 0,
       # Timeout for unacked loans (configurable, default 30 seconds)
-      loan_ack_timeout: loan_ack_timeout
+      loan_ack_timeout: loan_ack_timeout,
+      # Max consecutive timeouts before closing connection
+      max_unacked_timeouts: max_unacked_timeouts,
+      # Current consecutive timeout count (resets on any ack)
+      consecutive_timeouts: 0
     }
 
     Logger.info("[#{connection_id}] Relay started")
@@ -370,8 +387,16 @@ defmodule Absynthe.Relay.Relay do
   def handle_call(:flow_control_stats, _from, state) do
     stats =
       case state.flow_control_account do
-        nil -> nil
-        account -> Account.stats(account)
+        nil ->
+          nil
+
+        account ->
+          Account.stats(account)
+          |> Map.merge(%{
+            pending_loans: map_size(state.pending_loans),
+            consecutive_timeouts: state.consecutive_timeouts,
+            max_unacked_timeouts: state.max_unacked_timeouts
+          })
       end
 
     {:reply, stats, state}
@@ -486,8 +511,14 @@ defmodule Absynthe.Relay.Relay do
 
   # Handle loan timeout - actor didn't ack in time (crashed or hung)
   def handle_info({:loan_timeout, loan_id}, state) do
-    state = handle_loan_timeout(state, loan_id)
-    {:noreply, state}
+    case handle_loan_timeout(state, loan_id) do
+      {:ok, state} ->
+        {:noreply, state}
+
+      {:close, state} ->
+        # Too many consecutive timeouts - close the connection
+        {:stop, {:shutdown, :unresponsive_actor}, %{state | closed: true}}
+    end
   end
 
   # Handle idle timeout - verify token matches to avoid acting on stale timer messages
@@ -1582,34 +1613,69 @@ defmodule Absynthe.Relay.Relay do
         # Repay the loan
         account = Account.repay(state.flow_control_account, loan)
 
-        %{state | flow_control_account: account, pending_loans: pending_loans}
+        # Reset consecutive timeout counter since we got a successful ack
+        %{
+          state
+          | flow_control_account: account,
+            pending_loans: pending_loans,
+            consecutive_timeouts: 0
+        }
     end
   end
 
-  # Handle loan timeout - force repay to prevent debt accumulation from crashed actors
+  # Handle loan timeout - keep debt outstanding and track consecutive timeouts.
+  # The loan remains in pending_loans so late acks can still repay the debt.
+  # Returns {:ok, state} to continue or {:close, state} to terminate the connection.
   defp handle_loan_timeout(%{flow_control_enabled: false} = state, _loan_id) do
-    state
+    {:ok, state}
   end
 
   defp handle_loan_timeout(state, loan_id) do
-    case Map.pop(state.pending_loans, loan_id) do
-      {nil, _} ->
-        # Loan not found - already repaid
-        state
+    case Map.get(state.pending_loans, loan_id) do
+      nil ->
+        # Loan not found - already repaid by late ack
+        {:ok, state}
 
-      {{loan, _timer_ref, timestamp}, pending_loans} ->
+      {loan, _timer_ref, timestamp} ->
         # Log the timeout with age
         age_ms = System.monotonic_time(:millisecond) - timestamp
+        new_timeout_count = state.consecutive_timeouts + 1
 
-        Logger.warning(
-          "[#{state.connection_id}] Loan timeout: loan_id=#{loan_id}, age=#{age_ms}ms - " <>
-            "actor may be slow or crashed, force repaying"
-        )
+        # Keep debt outstanding - DO NOT repay. This ensures:
+        # 1. The debt remains tracked, preventing new work from being accepted
+        # 2. The pause callback keeps the socket paused (TCP backpressure)
+        # 3. Only actual work completion (ack) can clear the debt
 
-        # Force repay to prevent debt accumulation
-        account = Account.repay(state.flow_control_account, loan)
+        # IMPORTANT: Keep the loan in pending_loans so late acks can still repay.
+        # Schedule a new timeout timer for continued monitoring.
+        new_timer_ref =
+          Process.send_after(self(), {:loan_timeout, loan_id}, state.loan_ack_timeout)
 
-        %{state | flow_control_account: account, pending_loans: pending_loans}
+        pending_loans = Map.put(state.pending_loans, loan_id, {loan, new_timer_ref, timestamp})
+
+        state = %{
+          state
+          | pending_loans: pending_loans,
+            consecutive_timeouts: new_timeout_count
+        }
+
+        if new_timeout_count >= state.max_unacked_timeouts do
+          Logger.error(
+            "[#{state.connection_id}] Loan timeout: loan_id=#{loan_id}, age=#{age_ms}ms - " <>
+              "#{new_timeout_count} consecutive timeouts (max: #{state.max_unacked_timeouts}), " <>
+              "closing connection due to unresponsive actor"
+          )
+
+          {:close, state}
+        else
+          Logger.warning(
+            "[#{state.connection_id}] Loan timeout: loan_id=#{loan_id}, age=#{age_ms}ms - " <>
+              "actor may be slow (#{new_timeout_count}/#{state.max_unacked_timeouts} timeouts), " <>
+              "debt remains outstanding, will retry"
+          )
+
+          {:ok, state}
+        end
     end
   end
 
