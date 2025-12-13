@@ -268,4 +268,72 @@ defmodule Absynthe.Relay.RelayIntegrationTest do
       Broker.stop(broker)
     end
   end
+
+  describe "idle timeout" do
+    test "connection closes after idle timeout" do
+      socket_path = "/tmp/absynthe_test_#{:erlang.unique_integer([:positive])}.sock"
+
+      # Start broker with short idle timeout (100ms)
+      {:ok, broker} = Broker.start_link(socket_path: socket_path, idle_timeout: 100)
+      Process.sleep(50)
+
+      # Connect as a client
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: true])
+
+      # Wait for idle timeout to trigger
+      Process.sleep(200)
+
+      # Should receive tcp_closed message
+      assert_receive {:tcp_closed, ^client}, 500
+
+      Broker.stop(broker)
+    end
+
+    test "activity resets idle timeout" do
+      socket_path = "/tmp/absynthe_test_#{:erlang.unique_integer([:positive])}.sock"
+
+      # Start broker with short idle timeout (200ms)
+      {:ok, broker} = Broker.start_link(socket_path: socket_path, idle_timeout: 200)
+      Process.sleep(50)
+
+      # Connect as a client
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: true])
+
+      # Send activity every 100ms, which should reset the idle timer
+      for _ <- 1..3 do
+        Process.sleep(100)
+        # Send a nop packet to reset idle timer
+        {:ok, nop_data} = Framing.encode(:nop)
+        :ok = :gen_tcp.send(client, nop_data)
+      end
+
+      # Connection should still be open after 300ms total
+      refute_receive {:tcp_closed, ^client}, 100
+
+      # Now wait for idle timeout
+      Process.sleep(250)
+      assert_receive {:tcp_closed, ^client}, 500
+
+      Broker.stop(broker)
+    end
+
+    test "infinity timeout keeps connection open indefinitely" do
+      socket_path = "/tmp/absynthe_test_#{:erlang.unique_integer([:positive])}.sock"
+
+      # Start broker with no idle timeout (default)
+      {:ok, broker} = Broker.start_link(socket_path: socket_path)
+      Process.sleep(50)
+
+      # Connect as a client
+      {:ok, client} = :gen_tcp.connect({:local, socket_path}, 0, [:binary, active: true])
+
+      # Wait a while - connection should stay open
+      Process.sleep(300)
+      refute_receive {:tcp_closed, ^client}, 0
+
+      # Clean up
+      :gen_tcp.close(client)
+      Broker.stop(broker)
+    end
+  end
 end
