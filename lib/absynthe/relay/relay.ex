@@ -481,8 +481,10 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp process_turn_event(%Packet.TurnEvent{oid: oid, event: event}, state) do
-    # Look up the target ref from our export membrane
-    case Membrane.lookup_by_oid(state.export_membrane, oid) do
+    # Look up the target ref from our export membrane, with attenuation enforced.
+    # This is critical for security: exported refs may have attenuation from
+    # sturdy refs or other sources, and we must apply it to inbound events.
+    case Membrane.lookup_by_oid_with_attenuation(state.export_membrane, oid) do
       {:ok, ref} ->
         process_event_for_ref(state, ref, oid, event)
 
@@ -632,20 +634,14 @@ defmodule Absynthe.Relay.Relay do
 
       {:ok, %Packet.WireRef{variant: :yours, oid: oid, attenuation: attenuation}} ->
         # Peer is returning a reference we exported to them
-        case Membrane.lookup_by_oid(state.export_membrane, oid) do
+        # Use reimport to compose wire attenuation with our original attenuation
+        # This prevents amplification - peer cannot remove caveats we had
+        case Membrane.reimport(state.export_membrane, oid, attenuation) do
           {:ok, ref} ->
-            # Apply any attenuation
-            ref =
-              if attenuation == [] do
-                ref
-              else
-                Ref.with_attenuation(ref, attenuation)
-              end
-
             # Track this OID in export membrane (for refcounting)
             {{:embedded, ref}, state, [{:export, oid}]}
 
-          :error ->
+          {:error, :unknown_oid} ->
             Logger.warning("[#{state.connection_id}] Yours ref for unknown OID #{oid}")
             {{:embedded, nil}, state, []}
         end

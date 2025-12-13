@@ -49,12 +49,14 @@ defmodule Absynthe.Relay.Membrane do
   A wire symbol entry in the membrane.
 
   Contains the mapping between an OID and a Ref, plus the reference count
-  tracking how many live assertions mention this symbol.
+  tracking how many live assertions mention this symbol. Also tracks any
+  original attenuation to prevent amplification on re-import.
   """
   @type wire_symbol :: %{
           oid: non_neg_integer(),
           ref: Ref.t(),
-          refcount: non_neg_integer()
+          refcount: non_neg_integer(),
+          original_attenuation: [term()] | nil
         }
 
   @typedoc """
@@ -122,16 +124,18 @@ defmodule Absynthe.Relay.Membrane do
   def export(%__MODULE__{} = membrane, %Ref{} = ref) do
     # Strip attenuation for the key lookup - we export the base ref
     base_ref = Ref.without_attenuation(ref)
+    original_attenuation = Ref.attenuation(ref)
 
     case Map.get(membrane.ref_to_oid, base_ref) do
       nil ->
-        # New export - allocate OID
+        # New export - allocate OID and track original attenuation
         oid = membrane.next_oid
 
         symbol = %{
           oid: oid,
           ref: base_ref,
-          refcount: 0
+          refcount: 0,
+          original_attenuation: original_attenuation
         }
 
         membrane = %{
@@ -144,9 +148,34 @@ defmodule Absynthe.Relay.Membrane do
         {oid, membrane}
 
       oid ->
-        # Already exported
+        # Already exported - update original_attenuation if this one is more restrictive
+        # (i.e., has attenuation when the original didn't, or has more caveats)
+        symbol = Map.get(membrane.oid_to_symbol, oid)
+
+        updated_symbol =
+          if should_update_attenuation?(symbol.original_attenuation, original_attenuation) do
+            %{symbol | original_attenuation: original_attenuation}
+          else
+            symbol
+          end
+
+        membrane = %{
+          membrane
+          | oid_to_symbol: Map.put(membrane.oid_to_symbol, oid, updated_symbol)
+        }
+
         {oid, membrane}
     end
+  end
+
+  # Determine if we should update the tracked attenuation
+  # We update if the new attenuation is more restrictive (longer chain)
+  defp should_update_attenuation?(nil, nil), do: false
+  defp should_update_attenuation?(nil, _new), do: true
+  defp should_update_attenuation?(_old, nil), do: false
+
+  defp should_update_attenuation?(old, new) when is_list(old) and is_list(new) do
+    length(new) > length(old)
   end
 
   @doc """
@@ -187,7 +216,8 @@ defmodule Absynthe.Relay.Membrane do
         symbol = %{
           oid: oid,
           ref: base_ref,
-          refcount: 0
+          refcount: 0,
+          original_attenuation: nil
         }
 
         membrane = %{
@@ -207,7 +237,59 @@ defmodule Absynthe.Relay.Membrane do
   end
 
   @doc """
+  Re-imports an OID that we previously exported, applying attenuation.
+
+  This is used when a peer sends back a ref we gave them (a "yours" ref).
+  We compose the wire attenuation with our original attenuation to prevent
+  amplification - the peer cannot remove caveats we originally had.
+
+  ## Parameters
+
+  - `membrane` - The membrane state
+  - `oid` - The OID we exported
+  - `wire_attenuation` - Attenuation from the wire protocol
+
+  ## Returns
+
+  - `{:ok, ref}` - Successfully re-imported with composed attenuation
+  - `{:error, :unknown_oid}` - OID not in our export membrane
+  """
+  @spec reimport(t(), non_neg_integer(), list()) :: {:ok, Ref.t()} | {:error, :unknown_oid}
+  def reimport(%__MODULE__{} = membrane, oid, wire_attenuation) when is_integer(oid) do
+    case Map.get(membrane.oid_to_symbol, oid) do
+      nil ->
+        {:error, :unknown_oid}
+
+      symbol ->
+        # Compose wire attenuation with our original attenuation
+        # Wire attenuation is applied first (outer), then original (inner)
+        # This ensures the peer's restrictions are applied on top of ours
+        composed_attenuation =
+          compose_attenuation(wire_attenuation, symbol.original_attenuation)
+
+        ref = apply_attenuation(symbol.ref, composed_attenuation)
+        {:ok, ref}
+    end
+  end
+
+  # Compose two attenuation chains
+  # The outer attenuation is applied first, then the inner
+  defp compose_attenuation(nil, nil), do: nil
+  defp compose_attenuation(nil, inner), do: inner
+  defp compose_attenuation(outer, nil), do: outer
+  defp compose_attenuation([], inner), do: inner
+  defp compose_attenuation(outer, []), do: outer
+
+  defp compose_attenuation(outer, inner) when is_list(outer) and is_list(inner) do
+    # Outer applied first, so it comes first in the list
+    outer ++ inner
+  end
+
+  @doc """
   Looks up a Ref by its OID.
+
+  Returns the base ref without any attenuation. For exported refs where
+  attenuation should be enforced, use `lookup_by_oid_with_attenuation/2`.
 
   ## Parameters
 
@@ -223,6 +305,34 @@ defmodule Absynthe.Relay.Membrane do
     case Map.get(membrane.oid_to_symbol, oid) do
       nil -> :error
       symbol -> {:ok, symbol.ref}
+    end
+  end
+
+  @doc """
+  Looks up a Ref by its OID, including any tracked attenuation.
+
+  This is the secure version of `lookup_by_oid/2` that returns the ref
+  with its original attenuation applied. Use this for inbound events
+  to ensure attenuation from sturdy refs and other sources is enforced.
+
+  ## Parameters
+
+  - `membrane` - The membrane state
+  - `oid` - The OID to look up
+
+  ## Returns
+
+  `{:ok, ref}` or `:error` if not found.
+  """
+  @spec lookup_by_oid_with_attenuation(t(), non_neg_integer()) :: {:ok, Ref.t()} | :error
+  def lookup_by_oid_with_attenuation(%__MODULE__{} = membrane, oid) when is_integer(oid) do
+    case Map.get(membrane.oid_to_symbol, oid) do
+      nil ->
+        :error
+
+      symbol ->
+        ref = apply_attenuation(symbol.ref, symbol.original_attenuation)
+        {:ok, ref}
     end
   end
 
