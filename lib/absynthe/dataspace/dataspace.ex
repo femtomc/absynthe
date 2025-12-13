@@ -99,16 +99,27 @@ defmodule Absynthe.Dataspace.Dataspace do
 
   ### `Absynthe.Dataspace.Skeleton`
 
-  The Skeleton module must provide:
+  The Skeleton uses four ETS tables for efficient indexing, plus a wildcard observer set:
+  - **path_index**: Maps `{path, value}` to assertion handles
+  - **assertions**: Maps handles to assertion values
+  - **observers**: Maps observer IDs to `{pattern, ref}`
+  - **observer_index**: Maps `{path, value_class}` to sets of `{observer_id, exact_value}`
+  - **wildcard_observers** (in struct): Observer IDs with unconstrained patterns
+
+  The module must provide:
 
       @spec new() :: Skeleton.t()
-      @spec add_observer(Skeleton.t(), Handle.t(), Ref.t(), compiled_pattern) ::
+      @spec add_observer(Skeleton.t(), observer_id, Ref.t(), compiled_pattern) ::
         {Skeleton.t(), [{Handle.t(), assertion, captures}]}
-      @spec remove_observer(Skeleton.t(), Handle.t()) :: Skeleton.t()
+      @spec remove_observer(Skeleton.t(), observer_id) :: Skeleton.t()
       @spec add_assertion(Skeleton.t(), Handle.t(), assertion) ::
-        {Skeleton.t(), [{Ref.t(), assertion, captures}]}
+        [{observer_id, observer_ref, assertion, captures}]
       @spec remove_assertion(Skeleton.t(), Handle.t()) ::
-        {Skeleton.t(), [Ref.t()]}
+        [{observer_id, observer_ref}]
+
+  **Note**: `add_observer` and `remove_observer` return updated skeleton structs that must be
+  stored. ETS tables are mutated in-place for assertions, but the wildcard observer set lives
+  in the struct and requires the caller to use the returned skeleton for correct notifications.
 
   ### `Absynthe.Dataspace.Observer`
 

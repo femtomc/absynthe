@@ -67,6 +67,12 @@ defmodule Absynthe.Dataspace.Skeleton do
   allowing multiple processes to read simultaneously. Write operations (add/remove)
   are the caller's responsibility to synchronize if needed.
 
+  **Important**: The `wildcard_observers` set is stored in the struct, not in ETS.
+  Functions `add_observer/4` and `remove_observer/2` return an updated skeleton struct
+  that MUST be used for subsequent operations. Using a stale skeleton will cause
+  wildcard observers to be missed during notification. This design assumes a single
+  owner process (typically the dataspace actor) manages the skeleton.
+
   ## Examples
 
       # Create a new skeleton
@@ -632,8 +638,11 @@ defmodule Absynthe.Dataspace.Skeleton do
     end)
   end
 
-  # Atomic values: include root path entry so we can match on literal patterns
-  defp extract_paths(atomic, path), do: [{path, atomic}]
+  # Atomic values at root level: include root path entry for literal patterns like {:integer, 42}
+  defp extract_paths(atomic, []), do: [{[], atomic}]
+
+  # Non-root atomic values: already indexed by parent clause, no additional entries needed
+  defp extract_paths(_atomic, _path), do: []
 
   # Removes assertion handle from path index
   defp remove_from_path_index(%__MODULE__{} = skeleton, %Handle{} = handle, value) do
