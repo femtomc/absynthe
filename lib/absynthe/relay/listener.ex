@@ -31,6 +31,7 @@ defmodule Absynthe.Relay.Listener do
   - `:actor_pid` - PID of the hosting actor (optional)
   - `:idle_timeout` - Idle timeout in milliseconds for relay connections (default: `:infinity`)
   - `:listener_id` - Unique identifier for logging (default: auto-generated)
+  - `:noise_keypair` - Noise protocol keypair `{public, private}` for encrypted transport (optional)
 
   Unix socket options:
   - `:type` - `:unix`
@@ -65,7 +66,8 @@ defmodule Absynthe.Relay.Listener do
           relays: [pid()],
           idle_timeout: timeout(),
           listener_id: String.t(),
-          connection_counter: non_neg_integer()
+          connection_counter: non_neg_integer(),
+          noise_keypair: {binary(), binary()} | nil
         }
 
   # Client API
@@ -123,6 +125,7 @@ defmodule Absynthe.Relay.Listener do
     dataspace_ref = Keyword.fetch!(opts, :dataspace_ref)
     actor_pid = Keyword.get(opts, :actor_pid)
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+    noise_keypair = Keyword.get(opts, :noise_keypair)
 
     listener_id =
       Keyword.get_lazy(opts, :listener_id, fn ->
@@ -135,7 +138,8 @@ defmodule Absynthe.Relay.Listener do
       relays: [],
       idle_timeout: idle_timeout,
       listener_id: listener_id,
-      connection_counter: 0
+      connection_counter: 0,
+      noise_keypair: noise_keypair
     }
 
     case type do
@@ -276,14 +280,25 @@ defmodule Absynthe.Relay.Listener do
 
     Logger.info("[#{state.listener_id}] Accepted connection #{connection_id}")
 
+    # Determine transport type based on whether noise_keypair is configured
+    transport = if state.noise_keypair, do: :noise, else: :gen_tcp
+
     # Spawn a relay for this connection
     relay_opts = [
       socket: client_socket,
-      transport: :gen_tcp,
+      transport: transport,
       dataspace_ref: state.dataspace_ref,
       idle_timeout: state.idle_timeout,
       connection_id: connection_id
     ]
+
+    # Add noise_keypair if configured
+    relay_opts =
+      if state.noise_keypair do
+        Keyword.put(relay_opts, :noise_keypair, state.noise_keypair)
+      else
+        relay_opts
+      end
 
     relay_opts =
       if state.actor_pid do

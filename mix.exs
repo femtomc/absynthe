@@ -98,7 +98,8 @@ defmodule Absynthe.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
+      {:decibel, "~> 0.2.4"}
     ]
   end
 end

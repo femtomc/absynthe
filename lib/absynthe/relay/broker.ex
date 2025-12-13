@@ -49,6 +49,8 @@ defmodule Absynthe.Relay.Broker do
   - `:tcp_port` - TCP port to listen on (optional)
   - `:tcp_host` - TCP host to bind to (default: `{127, 0, 0, 1}`)
   - `:name` - Optional registered name for the broker
+  - `:noise_keypair` - Noise protocol keypair `{public, private}` for encrypted transport
+  - `:noise_secret` - 32-byte secret to derive a deterministic Noise keypair (alternative to `:noise_keypair`)
 
   ## Supervision
 
@@ -67,6 +69,7 @@ defmodule Absynthe.Relay.Broker do
   alias Absynthe.Core.{Actor, Ref}
   alias Absynthe.Dataspace.Dataspace
   alias Absynthe.Relay.Listener
+  alias Absynthe.Relay.Transport.Noise
 
   @typedoc """
   Broker state.
@@ -76,7 +79,9 @@ defmodule Absynthe.Relay.Broker do
           dataspace_ref: Ref.t(),
           listeners: [pid()],
           # Service assertion handles for listener advertisements
-          service_handles: %{pid() => Absynthe.Assertions.Handle.t()}
+          service_handles: %{pid() => Absynthe.Assertions.Handle.t()},
+          # Noise keypair for encrypted transport
+          noise_keypair: {binary(), binary()} | nil
         }
 
   # Client API
@@ -90,9 +95,12 @@ defmodule Absynthe.Relay.Broker do
   - `:tcp_port` - TCP port to listen on
   - `:tcp_host` - TCP host to bind to (default: `{127, 0, 0, 1}`)
   - `:idle_timeout` - Idle timeout in milliseconds for relay connections (default: `:infinity`)
+  - `:noise_keypair` - Noise protocol keypair `{public, private}` for encrypted transport
+  - `:noise_secret` - 32-byte secret to derive a deterministic Noise keypair
   - `:name` - Optional GenServer name
 
   At least one of `:socket_path` or `:tcp_port` should be provided.
+  If `:noise_keypair` or `:noise_secret` is provided, all connections will use Noise encryption.
 
   ## Returns
 
@@ -131,6 +139,17 @@ defmodule Absynthe.Relay.Broker do
   end
 
   @doc """
+  Returns the Noise public key for the broker.
+
+  Clients need this key to perform the NK handshake. Returns `nil` if
+  the broker is not using Noise encryption.
+  """
+  @spec noise_public_key(GenServer.server()) :: binary() | nil
+  def noise_public_key(broker) do
+    GenServer.call(broker, :noise_public_key)
+  end
+
+  @doc """
   Stops the broker and all connections.
   """
   @spec stop(GenServer.server()) :: :ok
@@ -162,11 +181,23 @@ defmodule Absynthe.Relay.Broker do
 
     Logger.info("Broker started with dataspace #{inspect(dataspace_ref)}")
 
+    # Derive noise keypair from options
+    noise_keypair = derive_noise_keypair(opts)
+
+    if noise_keypair do
+      {public, _private} = noise_keypair
+
+      Logger.info(
+        "Broker using Noise encryption, public key: #{Base.encode16(public, case: :lower)}"
+      )
+    end
+
     state = %{
       actor_pid: actor_pid,
       dataspace_ref: dataspace_ref,
       listeners: [],
-      service_handles: %{}
+      service_handles: %{},
+      noise_keypair: noise_keypair
     }
 
     # Start listeners and advertise them in the dataspace
@@ -175,8 +206,47 @@ defmodule Absynthe.Relay.Broker do
     {:ok, state}
   end
 
+  # Derive noise keypair from options - supports :noise_keypair or :noise_secret
+  defp derive_noise_keypair(opts) do
+    case Keyword.get(opts, :noise_keypair) do
+      {_public, _private} = keypair ->
+        keypair
+
+      nil ->
+        case Keyword.get(opts, :noise_secret) do
+          nil ->
+            nil
+
+          secret when is_binary(secret) ->
+            case Noise.keypair_from_secret(secret) do
+              {:ok, keypair} ->
+                keypair
+
+              {:error, reason} ->
+                Logger.error("Failed to derive Noise keypair from secret: #{inspect(reason)}")
+                nil
+            end
+        end
+    end
+  end
+
   defp start_listeners(state, opts) do
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+
+    # Build common listener options
+    common_opts = [
+      dataspace_ref: state.dataspace_ref,
+      actor_pid: state.actor_pid,
+      idle_timeout: idle_timeout
+    ]
+
+    # Add noise_keypair if configured
+    common_opts =
+      if state.noise_keypair do
+        Keyword.put(common_opts, :noise_keypair, state.noise_keypair)
+      else
+        common_opts
+      end
 
     # Unix socket listener
     state =
@@ -185,13 +255,9 @@ defmodule Absynthe.Relay.Broker do
           state
 
         path ->
-          case Listener.start_link(
-                 type: :unix,
-                 path: path,
-                 dataspace_ref: state.dataspace_ref,
-                 actor_pid: state.actor_pid,
-                 idle_timeout: idle_timeout
-               ) do
+          listener_opts = Keyword.merge(common_opts, type: :unix, path: path)
+
+          case Listener.start_link(listener_opts) do
             {:ok, pid} ->
               Process.monitor(pid)
               # Assert service advertisement into the dataspace
@@ -217,15 +283,9 @@ defmodule Absynthe.Relay.Broker do
 
         port ->
           host = Keyword.get(opts, :tcp_host, {127, 0, 0, 1})
+          listener_opts = Keyword.merge(common_opts, type: :tcp, port: port, host: host)
 
-          case Listener.start_link(
-                 type: :tcp,
-                 port: port,
-                 host: host,
-                 dataspace_ref: state.dataspace_ref,
-                 actor_pid: state.actor_pid,
-                 idle_timeout: idle_timeout
-               ) do
+          case Listener.start_link(listener_opts) do
             {:ok, pid} ->
               Process.monitor(pid)
               # Get actual port from listener
@@ -282,6 +342,16 @@ defmodule Absynthe.Relay.Broker do
 
   def handle_call(:actor_pid, _from, state) do
     {:reply, state.actor_pid, state}
+  end
+
+  def handle_call(:noise_public_key, _from, state) do
+    public_key =
+      case state.noise_keypair do
+        {public, _private} -> public
+        nil -> nil
+      end
+
+    {:reply, public_key, state}
   end
 
   def handle_call(:addresses, _from, state) do

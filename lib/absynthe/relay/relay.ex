@@ -59,6 +59,7 @@ defmodule Absynthe.Relay.Relay do
   alias Absynthe.Assertions.Handle
   alias Absynthe.Protocol.Event
   alias Absynthe.Relay.{Membrane, Packet, Framing}
+  alias Absynthe.Relay.Transport.Noise
 
   # Proxy entity for imported remote refs
   defmodule Proxy do
@@ -138,11 +139,12 @@ defmodule Absynthe.Relay.Relay do
   ## Options
 
   - `:socket` - The connected socket (required)
-  - `:transport` - Transport module, `:gen_tcp` or `:ssl` (default: `:gen_tcp`)
+  - `:transport` - Transport module, `:gen_tcp`, `:ssl`, or `:noise` (default: `:gen_tcp`)
   - `:dataspace_ref` - Ref to the target dataspace entity (required)
   - `:actor_pid` - PID of the hosting actor (default: start a new actor)
   - `:idle_timeout` - Idle timeout in milliseconds (default: `:infinity`)
   - `:connection_id` - Unique identifier for logging (default: auto-generated)
+  - `:noise_keypair` - Server's Noise keypair for encrypted transport (required if transport is `:noise`)
 
   ## Returns
 
@@ -187,6 +189,7 @@ defmodule Absynthe.Relay.Relay do
     transport = Keyword.get(opts, :transport, :gen_tcp)
     dataspace_ref = Keyword.fetch!(opts, :dataspace_ref)
     idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+    noise_keypair = Keyword.get(opts, :noise_keypair)
 
     connection_id =
       Keyword.get_lazy(opts, :connection_id, fn ->
@@ -236,7 +239,10 @@ defmodule Absynthe.Relay.Relay do
       idle_timeout: idle_timeout,
       idle_timer_ref: nil,
       idle_timer_token: nil,
-      connection_id: connection_id
+      connection_id: connection_id,
+      # Noise transport state
+      noise_keypair: noise_keypair,
+      noise_session: nil
     }
 
     Logger.info("[#{connection_id}] Relay started")
@@ -278,6 +284,23 @@ defmodule Absynthe.Relay.Relay do
     {:stop, :normal, state}
   end
 
+  def handle_cast(:activate_socket, %{transport: :noise} = state) do
+    Logger.debug("[#{state.connection_id}] Performing Noise handshake")
+
+    case Noise.server_handshake(state.socket, state.noise_keypair) do
+      {:ok, noise_session} ->
+        Logger.info("[#{state.connection_id}] Noise handshake complete")
+        state = %{state | noise_session: noise_session}
+        set_socket_active(state)
+        state = reset_idle_timer(state)
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.error("[#{state.connection_id}] Noise handshake failed: #{inspect(reason)}")
+        {:stop, {:error, {:noise_handshake_failed, reason}}, %{state | closed: true}}
+    end
+  end
+
   def handle_cast(:activate_socket, state) do
     Logger.debug("[#{state.connection_id}] Activating socket")
     set_socket_active(state)
@@ -287,6 +310,11 @@ defmodule Absynthe.Relay.Relay do
 
   # Handle incoming TCP data
   @impl GenServer
+  def handle_info({:tcp, socket, data}, %{socket: socket, transport: :noise} = state) do
+    # For Noise transport, decrypt before processing
+    handle_incoming_noise_data(state, data)
+  end
+
   def handle_info({:tcp, socket, data}, %{socket: socket} = state) do
     handle_incoming_data(state, data)
   end
@@ -371,6 +399,107 @@ defmodule Absynthe.Relay.Relay do
   end
 
   # Implementation
+
+  # Handle incoming Noise-encrypted data
+  # Noise data arrives as length-prefixed ciphertext chunks
+  defp handle_incoming_noise_data(state, data) do
+    # Reset idle timer on any incoming data
+    state = reset_idle_timer(state)
+
+    # Noise messages are length-prefixed: 2-byte big-endian length + ciphertext
+    # We need to buffer and reassemble, then decrypt each complete message
+    handle_noise_buffer(state, state.recv_buffer <> data)
+  end
+
+  defp handle_noise_buffer(state, buffer) when byte_size(buffer) < 2 do
+    # Not enough data for length prefix - wait for more
+    set_socket_active(state)
+    {:noreply, %{state | recv_buffer: buffer}}
+  end
+
+  defp handle_noise_buffer(state, <<length::16-big, rest::binary>> = buffer) do
+    if byte_size(rest) < length do
+      # Not enough data for complete message - wait for more
+      set_socket_active(state)
+      {:noreply, %{state | recv_buffer: buffer}}
+    else
+      # Extract complete ciphertext and decrypt
+      <<ciphertext::binary-size(length), remaining::binary>> = rest
+
+      case Noise.decrypt(state.noise_session, ciphertext) do
+        {:ok, plaintext, noise_session} ->
+          state = %{state | noise_session: noise_session}
+          # Process the decrypted data as normal protocol framing
+          case process_decrypted_data(state, plaintext, remaining) do
+            {:ok, state} ->
+              # Continue processing any remaining buffered data
+              if remaining == <<>> do
+                set_socket_active(state)
+                {:noreply, %{state | recv_buffer: <<>>}}
+              else
+                handle_noise_buffer(%{state | recv_buffer: <<>>}, remaining)
+              end
+
+            {:stop, reason, state} ->
+              {:stop, reason, state}
+          end
+
+        {:error, reason} ->
+          Logger.error("[#{state.connection_id}] Noise decryption failed: #{inspect(reason)}")
+          {:stop, {:error, {:noise_decrypt_failed, reason}}, %{state | closed: true}}
+      end
+    end
+  end
+
+  # Process decrypted plaintext through framing and packet handling
+  defp process_decrypted_data(state, plaintext, _remaining) do
+    case Framing.append_and_decode(Framing.new_state(), plaintext) do
+      {:ok, packets, _buffer} ->
+        # Process each packet with error handling
+        result =
+          Enum.reduce_while(packets, {:ok, state}, fn packet, {:ok, acc_state} ->
+            try do
+              case process_inbound_packet(acc_state, packet) do
+                {:ok, new_state} -> {:cont, {:ok, new_state}}
+                {:error, new_state, reason} -> {:halt, {:error, new_state, reason}}
+              end
+            rescue
+              error ->
+                Logger.error(
+                  "[#{state.connection_id}] Error processing packet: #{inspect(error)}"
+                )
+
+                Logger.error(Exception.format_stacktrace(__STACKTRACE__))
+                {:cont, {:ok, acc_state}}
+            end
+          end)
+
+        case result do
+          {:ok, state} ->
+            {:ok, state}
+
+          {:error, state, reason} ->
+            {:stop, {:shutdown, {:peer_error, reason}}, %{state | closed: true}}
+        end
+
+      {:error, reason, packets, _buffer} ->
+        # Process any packets that were successfully decoded
+        state =
+          Enum.reduce(packets, state, fn packet, acc_state ->
+            try do
+              case process_inbound_packet(acc_state, packet) do
+                {:ok, new_state} -> new_state
+                {:error, new_state, _reason} -> new_state
+              end
+            rescue
+              _ -> acc_state
+            end
+          end)
+
+        Logger.error("[#{state.connection_id}] Framing decode error: #{inspect(reason)}")
+        {:stop, {:error, {:decode_error, reason}}, %{state | closed: true}}
+    end
+  end
 
   defp handle_incoming_data(state, data) do
     # Reset idle timer on any incoming data
@@ -943,11 +1072,30 @@ defmodule Absynthe.Relay.Relay do
     :ssl.setopts(socket, active: :once)
   end
 
+  # Noise uses raw TCP socket for transport
+  defp set_socket_active(%{socket: socket, transport: :noise, connection_id: conn_id}) do
+    case :inet.setopts(socket, active: :once) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("[#{conn_id}] Failed to set socket active: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
   defp do_send_packet(state, packet) do
     case Framing.encode(packet) do
       {:ok, data} ->
         case send_data(state, data) do
           :ok ->
+            # For Noise transport, pick up updated session from process dictionary
+            state =
+              case Process.delete(:noise_session_update) do
+                nil -> state
+                noise_session -> %{state | noise_session: noise_session}
+              end
+
             # Reset idle timer on successful outbound send
             {:ok, reset_idle_timer(state)}
 
@@ -968,11 +1116,37 @@ defmodule Absynthe.Relay.Relay do
     :ssl.send(socket, data)
   end
 
+  # For Noise transport, encrypt before sending with length prefix
+  defp send_data(%{socket: socket, transport: :noise, noise_session: noise_session}, data) do
+    case Noise.encrypt(noise_session, data) do
+      {:ok, ciphertext, noise_session} ->
+        # Update session state (caller needs to handle this)
+        # Since send_data doesn't return state, we use the process dictionary
+        # as a temporary mechanism to update the session
+        Process.put(:noise_session_update, noise_session)
+        # Send length-prefixed ciphertext
+        length = byte_size(ciphertext)
+        :gen_tcp.send(socket, <<length::16-big, ciphertext::binary>>)
+
+      {:error, reason} ->
+        {:error, {:noise_encrypt_failed, reason}}
+    end
+  end
+
   defp close_socket(%{socket: socket, transport: :gen_tcp}) do
     :gen_tcp.close(socket)
   end
 
   defp close_socket(%{socket: socket, transport: :ssl}) do
     :ssl.close(socket)
+  end
+
+  # Noise uses raw TCP socket for transport, but also cleanup session
+  defp close_socket(%{socket: socket, transport: :noise, noise_session: noise_session}) do
+    if noise_session do
+      Noise.close(noise_session)
+    end
+
+    :gen_tcp.close(socket)
   end
 end
