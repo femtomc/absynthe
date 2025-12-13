@@ -292,4 +292,156 @@ defmodule Absynthe.Relay.MembraneTest do
       assert :error = Membrane.lookup_by_oid(membrane, 42)
     end
   end
+
+  describe "reimport/3 - attenuation enforcement" do
+    test "reimports with no attenuation when none was originally exported" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      {oid, membrane} = Membrane.export(membrane, ref)
+      {:ok, reimported_ref} = Membrane.reimport(membrane, oid, [])
+
+      refute Ref.attenuated?(reimported_ref)
+    end
+
+    test "applies wire attenuation on reimport" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      {oid, membrane} = Membrane.export(membrane, ref)
+      {:ok, reimported_ref} = Membrane.reimport(membrane, oid, [:wire_caveat])
+
+      assert Ref.attenuated?(reimported_ref)
+      assert Ref.attenuation(reimported_ref) == [:wire_caveat]
+    end
+
+    test "preserves original attenuation when exporting attenuated ref" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:original_caveat])
+
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+
+      # Reimport with no additional attenuation - should still have original
+      {:ok, reimported_ref} = Membrane.reimport(membrane, oid, [])
+
+      assert Ref.attenuation(reimported_ref) == [:original_caveat]
+    end
+
+    test "composes wire attenuation with original attenuation" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:original])
+
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+
+      # Reimport with additional wire attenuation
+      {:ok, reimported_ref} = Membrane.reimport(membrane, oid, [:wire])
+
+      # Wire should come first (outer), then original (inner)
+      assert Ref.attenuation(reimported_ref) == [:wire, :original]
+    end
+
+    test "prevents amplification - peer cannot remove original caveats" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:caveat1, :caveat2])
+
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+
+      # Even if peer sends empty attenuation, original is preserved
+      {:ok, reimported_ref} = Membrane.reimport(membrane, oid, [])
+
+      assert Ref.attenuation(reimported_ref) == [:caveat1, :caveat2]
+    end
+
+    test "returns error for unknown OID" do
+      membrane = Membrane.new()
+
+      assert {:error, :unknown_oid} = Membrane.reimport(membrane, 999, [])
+    end
+
+    test "updates tracked attenuation if exporting more restrictive version" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      # First export without attenuation
+      {oid, membrane} = Membrane.export(membrane, ref)
+
+      # Export again with attenuation (more restrictive)
+      attenuated = Ref.with_attenuation(ref, [:new_caveat])
+      {oid2, membrane} = Membrane.export(membrane, attenuated)
+
+      # Same OID
+      assert oid == oid2
+
+      # Reimport should now include the new attenuation
+      {:ok, reimported} = Membrane.reimport(membrane, oid, [])
+      assert Ref.attenuation(reimported) == [:new_caveat]
+    end
+  end
+
+  describe "lookup_by_oid_with_attenuation/2" do
+    test "returns ref without attenuation when none was exported" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+
+      {oid, membrane} = Membrane.export(membrane, ref)
+      {:ok, looked_up} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+
+      refute Ref.attenuated?(looked_up)
+    end
+
+    test "returns ref with original attenuation applied" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:caveat1, :caveat2])
+
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+      {:ok, looked_up} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+
+      assert Ref.attenuated?(looked_up)
+      assert Ref.attenuation(looked_up) == [:caveat1, :caveat2]
+    end
+
+    test "returns error for unknown OID" do
+      membrane = Membrane.new()
+
+      assert :error = Membrane.lookup_by_oid_with_attenuation(membrane, 999)
+    end
+
+    test "preserves attenuation even when base ref is exported later" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:caveat])
+
+      # Export attenuated version first
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+
+      # Export base version (should not remove attenuation)
+      {oid2, membrane} = Membrane.export(membrane, ref)
+      assert oid == oid2
+
+      # lookup_by_oid_with_attenuation should still return attenuated ref
+      {:ok, looked_up} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+      assert Ref.attenuation(looked_up) == [:caveat]
+    end
+
+    test "lookup_by_oid returns base ref, lookup_by_oid_with_attenuation returns attenuated" do
+      membrane = Membrane.new()
+      ref = Ref.new(:actor, 1)
+      attenuated_ref = Ref.with_attenuation(ref, [:caveat])
+
+      {oid, membrane} = Membrane.export(membrane, attenuated_ref)
+
+      # Base lookup returns base ref
+      {:ok, base} = Membrane.lookup_by_oid(membrane, oid)
+      refute Ref.attenuated?(base)
+
+      # Attenuated lookup returns attenuated ref
+      {:ok, with_atten} = Membrane.lookup_by_oid_with_attenuation(membrane, oid)
+      assert Ref.attenuated?(with_atten)
+      assert Ref.attenuation(with_atten) == [:caveat]
+    end
+  end
 end
