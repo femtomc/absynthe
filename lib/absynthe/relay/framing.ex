@@ -152,7 +152,7 @@ defmodule Absynthe.Relay.Framing do
   @doc """
   Decodes all complete packets from a buffer.
 
-  Returns a list of decoded packets and any remaining incomplete data.
+  Returns decoded packets, remaining buffer, and any error that occurred.
 
   ## Parameters
 
@@ -160,17 +160,21 @@ defmodule Absynthe.Relay.Framing do
 
   ## Returns
 
-  `{packets, remaining_buffer}` tuple.
+  - `{:ok, packets, remaining_buffer}` - All data decoded without errors
+  - `{:error, reason, packets, remaining_buffer}` - Error occurred after decoding some packets.
+    The packets decoded before the error are returned, and the buffer contains the corrupted data.
 
   ## Examples
 
       iex> {:ok, b1} = Framing.encode(Packet.turn([]))
       iex> {:ok, b2} = Framing.encode(:nop)
-      iex> {packets, rest} = Framing.decode_all(b1 <> b2)
+      iex> {:ok, packets, rest} = Framing.decode_all(b1 <> b2)
       iex> length(packets)
       2
   """
-  @spec decode_all(binary()) :: {[Packet.packet()], binary()}
+  @spec decode_all(binary()) ::
+          {:ok, [Packet.packet()], binary()}
+          | {:error, term(), [Packet.packet()], binary()}
   def decode_all(buffer) do
     decode_all(buffer, [])
   end
@@ -181,11 +185,11 @@ defmodule Absynthe.Relay.Framing do
         decode_all(rest, [packet | acc])
 
       {:incomplete, buffer} ->
-        {Enum.reverse(acc), buffer}
+        {:ok, Enum.reverse(acc), buffer}
 
-      {:error, _reason} ->
-        # On error, return what we have and the remaining buffer
-        {Enum.reverse(acc), buffer}
+      {:error, reason} ->
+        # Return the error along with any successfully decoded packets
+        {:error, reason, Enum.reverse(acc), buffer}
     end
   end
 
@@ -209,18 +213,20 @@ defmodule Absynthe.Relay.Framing do
 
   ## Returns
 
-  `{packets, new_buffer}` tuple where packets is a list of decoded packets
-  and new_buffer contains any incomplete data.
+  - `{:ok, packets, new_buffer}` - All data decoded without errors
+  - `{:error, reason, packets, new_buffer}` - Error occurred after decoding some packets
 
   ## Examples
 
       iex> buffer = Framing.new_state()
       iex> {:ok, data} = Framing.encode(Packet.turn([]))
-      iex> {packets, buffer} = Framing.append_and_decode(buffer, data)
+      iex> {:ok, packets, buffer} = Framing.append_and_decode(buffer, data)
       iex> length(packets)
       1
   """
-  @spec append_and_decode(binary(), binary()) :: {[Packet.packet()], binary()}
+  @spec append_and_decode(binary(), binary()) ::
+          {:ok, [Packet.packet()], binary()}
+          | {:error, term(), [Packet.packet()], binary()}
   def append_and_decode(buffer, data) when is_binary(buffer) and is_binary(data) do
     decode_all(buffer <> data)
   end

@@ -62,7 +62,7 @@ defmodule Absynthe.Relay.FramingTest do
       {:ok, binary2} = Framing.encode(:nop)
       {:ok, binary3} = Framing.encode(Packet.turn([]))
 
-      {packets, rest} = Framing.decode_all(binary1 <> binary2 <> binary3)
+      {:ok, packets, rest} = Framing.decode_all(binary1 <> binary2 <> binary3)
 
       assert length(packets) == 3
       assert rest == <<>>
@@ -76,17 +76,42 @@ defmodule Absynthe.Relay.FramingTest do
       # Take only first half of second packet
       partial = binary_part(binary2, 0, div(byte_size(binary2), 2))
 
-      {packets, rest} = Framing.decode_all(binary1 <> partial)
+      {:ok, packets, rest} = Framing.decode_all(binary1 <> partial)
 
       assert length(packets) == 1
       assert rest == partial
     end
 
     test "returns empty list for empty buffer" do
-      {packets, rest} = Framing.decode_all(<<>>)
+      {:ok, packets, rest} = Framing.decode_all(<<>>)
 
       assert packets == []
       assert rest == <<>>
+    end
+
+    test "returns error for corrupted data" do
+      # Invalid Preserves binary - starts with an invalid tag byte
+      corrupted = <<0xFF, 0x00, 0x01, 0x02>>
+
+      {:error, reason, packets, buffer} = Framing.decode_all(corrupted)
+
+      assert packets == []
+      assert buffer == corrupted
+      assert {:preserves_decode_error, _} = reason
+    end
+
+    test "returns error with successfully decoded packets" do
+      {:ok, valid_binary} = Framing.encode(Packet.turn([]))
+      # Add some corrupted data after the valid packet
+      corrupted = <<0xFF, 0x00, 0x01, 0x02>>
+
+      {:error, reason, packets, buffer} = Framing.decode_all(valid_binary <> corrupted)
+
+      # Should have decoded the first valid packet
+      assert length(packets) == 1
+      # Buffer contains the corrupted data
+      assert buffer == corrupted
+      assert {:preserves_decode_error, _} = reason
     end
   end
 
@@ -98,11 +123,11 @@ defmodule Absynthe.Relay.FramingTest do
       buffer = Framing.new_state()
 
       # First chunk - partial packet
-      {packets1, buffer} = Framing.append_and_decode(buffer, binary_part(binary1, 0, 1))
+      {:ok, packets1, buffer} = Framing.append_and_decode(buffer, binary_part(binary1, 0, 1))
       assert packets1 == []
 
       # Rest of first packet + second packet
-      {packets2, buffer} =
+      {:ok, packets2, buffer} =
         Framing.append_and_decode(
           buffer,
           binary_part(binary1, 1, byte_size(binary1) - 1) <> binary2
@@ -110,6 +135,16 @@ defmodule Absynthe.Relay.FramingTest do
 
       assert length(packets2) == 2
       assert buffer == <<>>
+    end
+
+    test "returns error for corrupted data" do
+      buffer = Framing.new_state()
+      corrupted = <<0xFF, 0x00, 0x01, 0x02>>
+
+      {:error, reason, packets, _buffer} = Framing.append_and_decode(buffer, corrupted)
+
+      assert packets == []
+      assert {:preserves_decode_error, _} = reason
     end
   end
 
