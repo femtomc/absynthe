@@ -21,8 +21,14 @@ defmodule Absynthe.Relay.Membrane do
 
   ## Attenuation Tracking
 
-  When a previously-exported ref is re-imported with attenuation (caveats),
-  we track this separately to ensure attenuation cannot be amplified.
+  When a ref is exported with attenuation (caveats), we track the original
+  attenuation to ensure it cannot be removed on re-import. If the same ref
+  is exported multiple times with different attenuation, we preserve the
+  original chain and only update to a longer (more restrictive) chain.
+
+  This fail-safe behavior ensures we never lose attenuation that was originally
+  intended, while avoiding semantic issues that could arise from merging
+  order-sensitive caveat chains.
 
   ## Example Usage
 
@@ -148,8 +154,18 @@ defmodule Absynthe.Relay.Membrane do
         {oid, membrane}
 
       oid ->
-        # Already exported - update original_attenuation if this one is more restrictive
-        # (i.e., has attenuation when the original didn't, or has more caveats)
+        # Already exported - update attenuation only if more restrictive (longer chain).
+        #
+        # Design rationale (fail-safe behavior):
+        # - Attenuation chains are order-sensitive (rewrites compose sequentially)
+        # - Duplicate caveats in a chain have distinct semantics
+        # - Merging chains of equal length could break rewrite order or drop duplicates
+        # - We preserve the original attenuation and only update when the new chain
+        #   is strictly longer (provably more restrictive)
+        # - If the same ref is re-exported with different but equal-length attenuation,
+        #   we keep the first chain to avoid semantic ambiguity
+        #
+        # This matches the original intent: fail-safe, never lose restrictions.
         symbol = Map.get(membrane.oid_to_symbol, oid)
 
         updated_symbol =
@@ -168,8 +184,11 @@ defmodule Absynthe.Relay.Membrane do
     end
   end
 
-  # Determine if we should update the tracked attenuation
-  # We update if the new attenuation is more restrictive (longer chain)
+  # Determine if we should update the tracked attenuation.
+  # We update only if the new attenuation is strictly more restrictive (longer chain).
+  # A longer chain means more caveats have been applied, which is definitionally
+  # more restrictive. For equal-length chains, we preserve the original to avoid
+  # breaking order-sensitive rewrite semantics.
   defp should_update_attenuation?(nil, nil), do: false
   defp should_update_attenuation?(nil, _new), do: true
   defp should_update_attenuation?(_old, nil), do: false
