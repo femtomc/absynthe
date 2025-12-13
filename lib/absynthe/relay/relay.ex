@@ -325,26 +325,56 @@ defmodule Absynthe.Relay.Relay do
   # Implementation
 
   defp handle_incoming_data(state, data) do
-    {packets, buffer} = Framing.append_and_decode(state.recv_buffer, data)
-    state = %{state | recv_buffer: buffer}
+    case Framing.append_and_decode(state.recv_buffer, data) do
+      {:ok, packets, buffer} ->
+        state = %{state | recv_buffer: buffer}
 
-    # Process each packet with error handling
-    state =
-      Enum.reduce(packets, state, fn packet, acc_state ->
-        try do
-          process_inbound_packet(acc_state, packet)
-        rescue
-          error ->
-            Logger.error("Relay: error processing packet: #{inspect(error)}")
-            Logger.error(Exception.format_stacktrace(__STACKTRACE__))
-            acc_state
+        # Process each packet with error handling
+        state =
+          Enum.reduce(packets, state, fn packet, acc_state ->
+            try do
+              process_inbound_packet(acc_state, packet)
+            rescue
+              error ->
+                Logger.error("Relay: error processing packet: #{inspect(error)}")
+                Logger.error(Exception.format_stacktrace(__STACKTRACE__))
+                acc_state
+            end
+          end)
+
+        # Re-enable socket for more data
+        set_socket_active(state)
+
+        {:noreply, state}
+
+      {:error, reason, packets, _buffer} ->
+        # Process any packets that were successfully decoded before the error
+        state =
+          Enum.reduce(packets, state, fn packet, acc_state ->
+            try do
+              process_inbound_packet(acc_state, packet)
+            rescue
+              error ->
+                Logger.error("Relay: error processing packet: #{inspect(error)}")
+                Logger.error(Exception.format_stacktrace(__STACKTRACE__))
+                acc_state
+            end
+          end)
+
+        # Log the decode error and close the connection
+        Logger.error("Relay: framing decode error: #{inspect(reason)}, closing connection")
+
+        # Send error packet to peer before closing
+        error_packet = Packet.error("protocol error", {:symbol, "decode_error"})
+
+        case do_send_packet(state, error_packet) do
+          {:ok, state} ->
+            {:stop, {:error, {:decode_error, reason}}, %{state | closed: true}}
+
+          {:error, _send_error} ->
+            {:stop, {:error, {:decode_error, reason}}, %{state | closed: true}}
         end
-      end)
-
-    # Re-enable socket for more data
-    set_socket_active(state)
-
-    {:noreply, state}
+    end
   end
 
   defp process_inbound_packet(state, :nop) do
