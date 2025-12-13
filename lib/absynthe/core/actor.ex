@@ -77,8 +77,16 @@ defmodule Absynthe.Core.Actor do
   3. **Message** - Send a one-shot, stateless message
   4. **Sync** - Establish a synchronization barrier
 
-  All events are delivered asynchronously via `handle_cast/2`, ensuring that
-  actors don't block each other and maintaining isolation.
+  For events arriving via the public client API, delivery to the target entity
+  is asynchronous via `handle_cast/2`, ensuring that actors don't block each
+  other and maintaining isolation. However, internal operations such as facet
+  teardown and turn-initiated actions use synchronous local delivery to ensure
+  proper ordering and cleanup semantics.
+
+  Note: The client API functions `assert/3`, `retract/3`, and `update_assertion/4`
+  use `GenServer.call` to synchronously validate attenuation and track handles,
+  but the actual event delivery to the target entity is still asynchronous.
+  Functions `send_message/3` and `sync/3` are fully asynchronous.
 
   ## Lifecycle
 
@@ -376,6 +384,9 @@ defmodule Absynthe.Core.Actor do
   Assertions are persistent facts that remain until explicitly retracted.
   Returns a handle that can be used later to retract this specific assertion.
 
+  This function blocks the caller to validate attenuation and generate a handle,
+  but the actual event delivery to the target entity is asynchronous.
+
   ## Parameters
 
   - `actor` - The actor PID or registered name
@@ -392,9 +403,10 @@ defmodule Absynthe.Core.Actor do
 
   ## Returns
 
-  - `{:ok, handle}` - Assertion made, returns handle for retraction
+  - `{:ok, handle}` - Handle allocated and delivery enqueued
+  - `{:error, :attenuation_rejected}` - Assertion blocked by ref attenuation
   """
-  @spec assert(GenServer.server(), Ref.t(), term()) :: {:ok, Handle.t()}
+  @spec assert(GenServer.server(), Ref.t(), term()) :: {:ok, Handle.t()} | {:error, term()}
   def assert(actor, ref, assertion) do
     GenServer.call(actor, {:assert, ref, assertion})
   end
@@ -404,6 +416,9 @@ defmodule Absynthe.Core.Actor do
 
   Removes the assertion identified by the given handle from the system.
   The handle must have been returned by a previous call to `assert/3`.
+
+  This function blocks the caller to validate and untrack the handle,
+  but the actual retraction event delivery to the target entity is asynchronous.
 
   ## Parameters
 
@@ -417,7 +432,7 @@ defmodule Absynthe.Core.Actor do
 
   ## Returns
 
-  - `:ok` - Assertion retracted
+  - `:ok` - Handle untracked and retraction enqueued
   - `{:error, :not_found}` - Handle not found (already retracted?)
   """
   @spec retract(GenServer.server(), Handle.t()) :: :ok | {:error, term()}
@@ -434,6 +449,9 @@ defmodule Absynthe.Core.Actor do
 
   When the old handle is `nil` or no new assertion is provided, this becomes a simple
   assert or retract operation respectively.
+
+  This function blocks the caller to validate attenuation and manage handles atomically,
+  but the actual event delivery to the target entity is asynchronous.
 
   ## Parameters
 
@@ -455,8 +473,8 @@ defmodule Absynthe.Core.Actor do
 
   ## Returns
 
-  - `{:ok, handle}` - New assertion made, returns new handle for future updates
-  - `:ok` - Only retraction performed (assertion was nil)
+  - `{:ok, handle}` - New handle allocated and delivery enqueued
+  - `:ok` - Only retraction performed (no new assertion)
   - `{:error, :attenuation_rejected}` - New assertion rejected by ref attenuation
   - `{:error, :not_found}` - Old handle not found (already retracted?)
 
