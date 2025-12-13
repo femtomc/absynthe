@@ -219,8 +219,15 @@ defmodule Absynthe.Relay.Listener do
         {:ok, client_socket} ->
           # Transfer socket ownership to the listener BEFORE this task exits,
           # otherwise the socket gets closed when the task terminates
-          :gen_tcp.controlling_process(client_socket, parent)
-          send(parent, {:accepted, client_socket})
+          case :gen_tcp.controlling_process(client_socket, parent) do
+            :ok ->
+              send(parent, {:accepted, client_socket})
+
+            {:error, reason} ->
+              Logger.error("Socket handoff to listener failed: #{inspect(reason)}")
+              :gen_tcp.close(client_socket)
+              send(parent, :accept)
+          end
 
         {:error, :closed} ->
           # Listener was closed, stop accepting
@@ -259,22 +266,41 @@ defmodule Absynthe.Relay.Listener do
           "Transferring socket #{inspect(client_socket)} to relay #{inspect(relay_pid)}"
         )
 
-        cp_result = :gen_tcp.controlling_process(client_socket, relay_pid)
-        Logger.debug("controlling_process result: #{inspect(cp_result)}")
+        case :gen_tcp.controlling_process(client_socket, relay_pid) do
+          :ok ->
+            Logger.debug("controlling_process succeeded")
 
-        # Activate the socket now that ownership is transferred
-        Logger.debug("Activating relay")
-        Relay.activate(relay_pid)
+            # Activate the socket now that ownership is transferred
+            Logger.debug("Activating relay")
+            Relay.activate(relay_pid)
 
-        # Monitor the relay
-        Process.monitor(relay_pid)
+            # Monitor the relay
+            Process.monitor(relay_pid)
 
-        state = %{state | relays: [relay_pid | state.relays]}
+            state = %{state | relays: [relay_pid | state.relays]}
 
-        # Accept next connection
-        send(self(), :accept)
+            # Accept next connection
+            send(self(), :accept)
 
-        {:noreply, state}
+            {:noreply, state}
+
+          {:error, reason} ->
+            Logger.error("Socket handoff to relay failed: #{inspect(reason)}")
+
+            # Stop the relay since handoff failed - guard with Process.alive?
+            # to avoid crashing the listener if relay already exited (which may
+            # be why controlling_process failed in the first place)
+            if Process.alive?(relay_pid) do
+              GenServer.stop(relay_pid, :normal)
+            end
+
+            :gen_tcp.close(client_socket)
+
+            # Accept next connection
+            send(self(), :accept)
+
+            {:noreply, state}
+        end
 
       {:error, reason} ->
         Logger.error("Failed to start relay: #{inspect(reason)}")
