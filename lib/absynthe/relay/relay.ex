@@ -105,11 +105,17 @@ defmodule Absynthe.Relay.Relay do
           export_membrane: Membrane.t(),
           import_membrane: Membrane.t(),
           recv_buffer: binary(),
-          local_handles: %{Handle.t() => non_neg_integer()},
-          wire_handles: %{non_neg_integer() => Handle.t()},
+          # Inbound handle mappings (peer -> local)
+          inbound_wire_handles: %{non_neg_integer() => Handle.t()},
+          inbound_local_handles: %{Handle.t() => non_neg_integer()},
+          # Outbound handle mappings (local -> peer)
+          outbound_wire_handles: %{non_neg_integer() => Handle.t()},
+          outbound_local_handles: %{Handle.t() => non_neg_integer()},
           handle_to_oid: %{Handle.t() => non_neg_integer()},
           # Track which OIDs were imported for each inbound assertion (for decref on retract)
           inbound_handle_oids: %{Handle.t() => [non_neg_integer()]},
+          # Track which ref each inbound assertion was delivered to (for correct retraction on termination)
+          inbound_handle_refs: %{Handle.t() => Ref.t()},
           # Track which OIDs were exported for each outbound assertion (for decref on retract)
           outbound_handle_oids: %{Handle.t() => [non_neg_integer()]},
           next_wire_handle: non_neg_integer(),
@@ -201,10 +207,13 @@ defmodule Absynthe.Relay.Relay do
       export_membrane: export_membrane,
       import_membrane: import_membrane,
       recv_buffer: Framing.new_state(),
-      local_handles: %{},
-      wire_handles: %{},
+      inbound_wire_handles: %{},
+      inbound_local_handles: %{},
+      outbound_wire_handles: %{},
+      outbound_local_handles: %{},
       handle_to_oid: %{},
       inbound_handle_oids: %{},
+      inbound_handle_refs: %{},
       outbound_handle_oids: %{},
       next_wire_handle: 0,
       pending_syncs: %{},
@@ -390,14 +399,15 @@ defmodule Absynthe.Relay.Relay do
         oid, {imp, exp} -> {Membrane.inc_ref(imp, oid), exp}
       end)
 
-    # Track handle mapping and OIDs for later decref
+    # Track handle mapping, OIDs, and target ref for later retraction
     state = %{
       state
-      | wire_handles: Map.put(state.wire_handles, wire_handle, local_handle),
-        local_handles: Map.put(state.local_handles, local_handle, wire_handle),
+      | inbound_wire_handles: Map.put(state.inbound_wire_handles, wire_handle, local_handle),
+        inbound_local_handles: Map.put(state.inbound_local_handles, local_handle, wire_handle),
         import_membrane: import_membrane,
         export_membrane: export_membrane,
-        inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced)
+        inbound_handle_oids: Map.put(state.inbound_handle_oids, local_handle, oids_referenced),
+        inbound_handle_refs: Map.put(state.inbound_handle_refs, local_handle, ref)
     }
 
     # Deliver assertion to the local entity
@@ -411,9 +421,9 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp process_event_for_ref(state, ref, _target_oid, %Packet.Retract{handle: wire_handle}) do
-    case Map.get(state.wire_handles, wire_handle) do
+    case Map.get(state.inbound_wire_handles, wire_handle) do
       nil ->
-        Logger.warning("Relay: retract for unknown handle #{wire_handle}")
+        Logger.warning("Relay: retract for unknown inbound handle #{wire_handle}")
         state
 
       local_handle ->
@@ -435,11 +445,12 @@ defmodule Absynthe.Relay.Relay do
         # Clean up handle mapping
         state = %{
           state
-          | wire_handles: Map.delete(state.wire_handles, wire_handle),
-            local_handles: Map.delete(state.local_handles, local_handle),
+          | inbound_wire_handles: Map.delete(state.inbound_wire_handles, wire_handle),
+            inbound_local_handles: Map.delete(state.inbound_local_handles, local_handle),
             import_membrane: import_membrane,
             export_membrane: export_membrane,
-            inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle)
+            inbound_handle_oids: Map.delete(state.inbound_handle_oids, local_handle),
+            inbound_handle_refs: Map.delete(state.inbound_handle_refs, local_handle)
         }
 
         # Deliver retraction
@@ -589,8 +600,8 @@ defmodule Absynthe.Relay.Relay do
     # Track handle -> wire_handle, wire_handle -> handle, handle -> oid, and handle -> oids
     state = %{
       state
-      | local_handles: Map.put(state.local_handles, handle, wire_handle),
-        wire_handles: Map.put(state.wire_handles, wire_handle, handle),
+      | outbound_local_handles: Map.put(state.outbound_local_handles, handle, wire_handle),
+        outbound_wire_handles: Map.put(state.outbound_wire_handles, wire_handle, handle),
         handle_to_oid: Map.put(state.handle_to_oid, handle, oid),
         export_membrane: export_membrane,
         import_membrane: import_membrane,
@@ -608,9 +619,9 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp handle_outbound_retract(state, handle) do
-    case Map.get(state.local_handles, handle) do
+    case Map.get(state.outbound_local_handles, handle) do
       nil ->
-        Logger.warning("Relay: retract for unknown local handle")
+        Logger.warning("Relay: retract for unknown outbound local handle")
         state
 
       wire_handle ->
@@ -635,8 +646,8 @@ defmodule Absynthe.Relay.Relay do
             # Clean up all mappings
             state = %{
               state
-              | local_handles: Map.delete(state.local_handles, handle),
-                wire_handles: Map.delete(state.wire_handles, wire_handle),
+              | outbound_local_handles: Map.delete(state.outbound_local_handles, handle),
+                outbound_wire_handles: Map.delete(state.outbound_wire_handles, wire_handle),
                 handle_to_oid: Map.delete(state.handle_to_oid, handle),
                 export_membrane: export_membrane,
                 import_membrane: import_membrane,
@@ -660,8 +671,8 @@ defmodule Absynthe.Relay.Relay do
             # Also clean up OID tracking
             %{
               state
-              | local_handles: Map.delete(state.local_handles, handle),
-                wire_handles: Map.delete(state.wire_handles, wire_handle),
+              | outbound_local_handles: Map.delete(state.outbound_local_handles, handle),
+                outbound_wire_handles: Map.delete(state.outbound_wire_handles, wire_handle),
                 outbound_handle_oids: Map.delete(state.outbound_handle_oids, handle)
             }
         end
@@ -776,16 +787,30 @@ defmodule Absynthe.Relay.Relay do
     {Enum.reverse(translated), state, oids}
   end
 
-  # Retract all assertions when relay terminates
+  # Retract all inbound assertions when relay terminates
   defp retract_all_inbound_assertions(state) do
-    Enum.each(state.wire_handles, fn {_wire_handle, local_handle} ->
-      # Find the ref this was asserted to
-      # For simplicity, use the dataspace ref
-      Actor.deliver(
-        state.actor_pid,
-        state.dataspace_ref,
-        Event.retract(state.dataspace_ref, local_handle)
-      )
+    Enum.each(state.inbound_wire_handles, fn {_wire_handle, local_handle} ->
+      # Look up the ref this assertion was originally delivered to
+      case Map.get(state.inbound_handle_refs, local_handle) do
+        nil ->
+          # Fallback to dataspace_ref if not found (shouldn't happen in normal operation)
+          Logger.warning(
+            "Relay: no tracked ref for handle #{inspect(local_handle)}, using dataspace_ref"
+          )
+
+          Actor.deliver(
+            state.actor_pid,
+            state.dataspace_ref,
+            Event.retract(state.dataspace_ref, local_handle)
+          )
+
+        target_ref ->
+          Actor.deliver(
+            state.actor_pid,
+            target_ref,
+            Event.retract(target_ref, local_handle)
+          )
+      end
     end)
   end
 
