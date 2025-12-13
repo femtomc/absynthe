@@ -77,16 +77,21 @@ defmodule Absynthe.Core.Actor do
   3. **Message** - Send a one-shot, stateless message
   4. **Sync** - Establish a synchronization barrier
 
-  For events arriving via the public client API, delivery to the target entity
-  is asynchronous via `handle_cast/2`, ensuring that actors don't block each
-  other and maintaining isolation. However, internal operations such as facet
-  teardown and turn-initiated actions use synchronous local delivery to ensure
-  proper ordering and cleanup semantics.
+  All event delivery is asynchronous via `handle_cast/2`. This includes:
+
+  - Events from external actors (always async)
+  - Events generated during turn commit (enqueued via self-cast)
+  - Facet teardown operations (sync for proper cleanup ordering)
 
   Note: The client API functions `assert/3`, `retract/3`, and `update_assertion/4`
   use `GenServer.call` to synchronously validate attenuation and track handles,
   but the actual event delivery to the target entity is still asynchronous.
   Functions `send_message/3` and `sync/3` are fully asynchronous.
+
+  **Important**: Local turn-initiated actions are processed in subsequent turns,
+  not synchronously during commit. This keeps call stacks shallow and prevents
+  observer fan-out from monopolizing the actor, but means observers see effects
+  in subsequent turns rather than atomically within the initiating turn.
 
   ## Lifecycle
 
@@ -921,8 +926,34 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_cast({:deliver, ref, event}, state) do
-    # Route to correct actor - may be local or remote
-    new_state = deliver_action_to_ref(state, ref, event)
+    # Deliver the event - either locally or to remote actor
+    # For local refs, we process directly (this is either from external casts
+    # or from our own async self-casts from turn commit).
+    # For remote refs, we forward to the remote actor.
+    new_state =
+      case Ref.local?(ref, state.id) do
+        true ->
+          # Local delivery - process the event directly
+          deliver_event_impl(state, ref, event, nil)
+
+        false ->
+          # Remote delivery - forward to the remote actor
+          remote_actor_id = Ref.actor_id(ref)
+
+          case resolve_actor(remote_actor_id) do
+            {:ok, actor_pid} ->
+              GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
+              state
+
+            :error ->
+              Logger.warning(
+                "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
+              )
+
+              state
+          end
+      end
+
     {:noreply, new_state}
   end
 
@@ -1504,12 +1535,23 @@ defmodule Absynthe.Core.Actor do
   end
 
   # Deliver an action/event to a target ref (used during turn commit)
+  #
+  # Local delivery is ASYNCHRONOUS - events are enqueued via self-cast rather than
+  # processed immediately. This keeps call stacks shallow and allows the actor to
+  # process mailbox work between cascades.
+  #
+  # IMPORTANT: This means turns no longer complete all local effects atomically.
+  # Observers will see effects in subsequent turns. This is a trade-off for:
+  # - Shallow call stacks (prevents stack overflow on large fan-out)
+  # - Fair scheduling (actor doesn't monopolize scheduler during cascades)
+  # - Interleaved mailbox processing (external messages can be processed between local deliveries)
   defp deliver_action_to_ref(state, ref, event) do
     case Ref.local?(ref, state.id) do
       true ->
-        # Local delivery - process directly
-        # nil sender_pid - we own these assertions, no crash tracking needed
-        deliver_event_impl(state, ref, event, nil)
+        # Local delivery - enqueue via self-cast for async processing
+        # This keeps call stacks shallow during observer fan-out
+        GenServer.cast(self(), {:deliver, ref, event})
+        state
 
       false ->
         # Remote delivery - send to remote actor with sender PID for crash tracking
