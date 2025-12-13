@@ -74,7 +74,9 @@ defmodule Absynthe.Relay.Broker do
   @type state :: %{
           actor_pid: pid(),
           dataspace_ref: Ref.t(),
-          listeners: [pid()]
+          listeners: [pid()],
+          # Service assertion handles for listener advertisements
+          service_handles: %{pid() => Absynthe.Assertions.Handle.t()}
         }
 
   # Client API
@@ -87,6 +89,7 @@ defmodule Absynthe.Relay.Broker do
   - `:socket_path` - Path for Unix domain socket
   - `:tcp_port` - TCP port to listen on
   - `:tcp_host` - TCP host to bind to (default: `{127, 0, 0, 1}`)
+  - `:idle_timeout` - Idle timeout in milliseconds for relay connections (default: `:infinity`)
   - `:name` - Optional GenServer name
 
   At least one of `:socket_path` or `:tcp_port` should be provided.
@@ -162,46 +165,55 @@ defmodule Absynthe.Relay.Broker do
     state = %{
       actor_pid: actor_pid,
       dataspace_ref: dataspace_ref,
-      listeners: []
+      listeners: [],
+      service_handles: %{}
     }
 
-    # Start listeners
+    # Start listeners and advertise them in the dataspace
     state = start_listeners(state, opts)
 
     {:ok, state}
   end
 
   defp start_listeners(state, opts) do
-    listeners = []
+    idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
 
     # Unix socket listener
-    listeners =
+    state =
       case Keyword.get(opts, :socket_path) do
         nil ->
-          listeners
+          state
 
         path ->
           case Listener.start_link(
                  type: :unix,
                  path: path,
                  dataspace_ref: state.dataspace_ref,
-                 actor_pid: state.actor_pid
+                 actor_pid: state.actor_pid,
+                 idle_timeout: idle_timeout
                ) do
             {:ok, pid} ->
               Process.monitor(pid)
-              [pid | listeners]
+              # Assert service advertisement into the dataspace
+              handle = assert_listener_service(state, {:unix, path})
+
+              %{
+                state
+                | listeners: [pid | state.listeners],
+                  service_handles: Map.put(state.service_handles, pid, handle)
+              }
 
             {:error, reason} ->
               Logger.error("Failed to start Unix listener: #{inspect(reason)}")
-              listeners
+              state
           end
       end
 
     # TCP listener
-    listeners =
+    state =
       case Keyword.get(opts, :tcp_port) do
         nil ->
-          listeners
+          state
 
         port ->
           host = Keyword.get(opts, :tcp_host, {127, 0, 0, 1})
@@ -211,19 +223,56 @@ defmodule Absynthe.Relay.Broker do
                  port: port,
                  host: host,
                  dataspace_ref: state.dataspace_ref,
-                 actor_pid: state.actor_pid
+                 actor_pid: state.actor_pid,
+                 idle_timeout: idle_timeout
                ) do
             {:ok, pid} ->
               Process.monitor(pid)
-              [pid | listeners]
+              # Get actual port from listener
+              {:tcp, actual_host, actual_port} = Listener.address(pid)
+              # Assert service advertisement into the dataspace
+              handle = assert_listener_service(state, {:tcp, actual_host, actual_port})
+
+              %{
+                state
+                | listeners: [pid | state.listeners],
+                  service_handles: Map.put(state.service_handles, pid, handle)
+              }
 
             {:error, reason} ->
               Logger.error("Failed to start TCP listener: #{inspect(reason)}")
-              listeners
+              state
           end
       end
 
-    %{state | listeners: listeners}
+    state
+  end
+
+  # Assert a listener service record into the dataspace
+  # Returns the assertion handle
+  defp assert_listener_service(state, {:unix, path}) do
+    # Create a <ListenerService <unix "path">> record
+    service_record =
+      {:record,
+       {{:symbol, "ListenerService"}, [{:record, {{:symbol, "unix"}, [{:string, path}]}}]}}
+
+    handle = Actor.assert(state.actor_pid, state.dataspace_ref, service_record)
+    Logger.debug("Asserted listener service: unix:#{path}")
+    handle
+  end
+
+  defp assert_listener_service(state, {:tcp, host, port}) do
+    # Create a <ListenerService <tcp "host" port>> record
+    host_str = :inet.ntoa(host) |> to_string()
+
+    service_record =
+      {:record,
+       {{:symbol, "ListenerService"},
+        [{:record, {{:symbol, "tcp"}, [{:string, host_str}, {:integer, port}]}}]}}
+
+    handle = Actor.assert(state.actor_pid, state.dataspace_ref, service_record)
+    Logger.debug("Asserted listener service: tcp:#{host_str}:#{port}")
+    handle
   end
 
   @impl GenServer
@@ -253,6 +302,18 @@ defmodule Absynthe.Relay.Broker do
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
     if pid in state.listeners do
       Logger.warning("Listener #{inspect(pid)} terminated: #{inspect(reason)}")
+
+      # Retract the service assertion for this listener
+      state =
+        case Map.get(state.service_handles, pid) do
+          nil ->
+            state
+
+          handle ->
+            Actor.retract(state.actor_pid, handle)
+            %{state | service_handles: Map.delete(state.service_handles, pid)}
+        end
+
       state = %{state | listeners: List.delete(state.listeners, pid)}
       {:noreply, state}
     else
@@ -262,6 +323,15 @@ defmodule Absynthe.Relay.Broker do
 
   @impl GenServer
   def terminate(_reason, state) do
+    # Retract all service assertions
+    Enum.each(state.service_handles, fn {_pid, handle} ->
+      try do
+        Actor.retract(state.actor_pid, handle)
+      catch
+        _, _ -> :ok
+      end
+    end)
+
     # Stop all listeners
     Enum.each(state.listeners, fn listener ->
       try do

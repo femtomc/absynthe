@@ -121,7 +121,13 @@ defmodule Absynthe.Relay.Relay do
           next_wire_handle: non_neg_integer(),
           pending_syncs: %{non_neg_integer() => Ref.t()},
           next_sync_id: non_neg_integer(),
-          closed: boolean()
+          closed: boolean(),
+          # Idle timeout configuration
+          idle_timeout: timeout(),
+          idle_timer_ref: reference() | nil,
+          idle_timer_token: reference() | nil,
+          # Connection identifier for logging
+          connection_id: String.t()
         }
 
   # Client API
@@ -135,6 +141,8 @@ defmodule Absynthe.Relay.Relay do
   - `:transport` - Transport module, `:gen_tcp` or `:ssl` (default: `:gen_tcp`)
   - `:dataspace_ref` - Ref to the target dataspace entity (required)
   - `:actor_pid` - PID of the hosting actor (default: start a new actor)
+  - `:idle_timeout` - Idle timeout in milliseconds (default: `:infinity`)
+  - `:connection_id` - Unique identifier for logging (default: auto-generated)
 
   ## Returns
 
@@ -178,6 +186,12 @@ defmodule Absynthe.Relay.Relay do
     socket = Keyword.fetch!(opts, :socket)
     transport = Keyword.get(opts, :transport, :gen_tcp)
     dataspace_ref = Keyword.fetch!(opts, :dataspace_ref)
+    idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+
+    connection_id =
+      Keyword.get_lazy(opts, :connection_id, fn ->
+        generate_connection_id()
+      end)
 
     # Start or use provided actor for spawning proxy entities
     actor_pid =
@@ -218,15 +232,37 @@ defmodule Absynthe.Relay.Relay do
       next_wire_handle: 0,
       pending_syncs: %{},
       next_sync_id: 0,
-      closed: false
+      closed: false,
+      idle_timeout: idle_timeout,
+      idle_timer_ref: nil,
+      idle_timer_token: nil,
+      connection_id: connection_id
     }
 
-    Logger.debug("Relay started for socket #{inspect(socket)}")
+    Logger.info("[#{connection_id}] Relay started")
 
     # Don't activate socket yet - wait for activate/1 to be called
     # after controlling_process has transferred ownership
 
     {:ok, state}
+  end
+
+  defp generate_connection_id do
+    :crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower)
+  end
+
+  defp reset_idle_timer(%{idle_timeout: :infinity} = state), do: state
+
+  defp reset_idle_timer(state) do
+    # Cancel existing timer if any
+    if state.idle_timer_ref do
+      Process.cancel_timer(state.idle_timer_ref)
+    end
+
+    # Generate a unique token for this timer to avoid acting on stale messages
+    timer_token = make_ref()
+    timer_ref = Process.send_after(self(), {:idle_timeout, timer_token}, state.idle_timeout)
+    %{state | idle_timer_ref: timer_ref, idle_timer_token: timer_token}
   end
 
   @impl GenServer
@@ -243,8 +279,9 @@ defmodule Absynthe.Relay.Relay do
   end
 
   def handle_cast(:activate_socket, state) do
-    Logger.debug("Relay: activating socket")
+    Logger.debug("[#{state.connection_id}] Activating socket")
     set_socket_active(state)
+    state = reset_idle_timer(state)
     {:noreply, state}
   end
 
@@ -260,23 +297,23 @@ defmodule Absynthe.Relay.Relay do
 
   # Handle TCP close
   def handle_info({:tcp_closed, socket}, %{socket: socket} = state) do
-    Logger.info("Relay: connection closed by peer")
+    Logger.info("[#{state.connection_id}] Connection closed by peer")
     {:stop, :normal, %{state | closed: true}}
   end
 
   def handle_info({:ssl_closed, socket}, %{socket: socket} = state) do
-    Logger.info("Relay: SSL connection closed by peer")
+    Logger.info("[#{state.connection_id}] SSL connection closed by peer")
     {:stop, :normal, %{state | closed: true}}
   end
 
   # Handle TCP error
   def handle_info({:tcp_error, socket, reason}, %{socket: socket} = state) do
-    Logger.error("Relay: TCP error: #{inspect(reason)}")
+    Logger.error("[#{state.connection_id}] TCP error: #{inspect(reason)}")
     {:stop, {:error, reason}, %{state | closed: true}}
   end
 
   def handle_info({:ssl_error, socket, reason}, %{socket: socket} = state) do
-    Logger.error("Relay: SSL error: #{inspect(reason)}")
+    Logger.error("[#{state.connection_id}] SSL error: #{inspect(reason)}")
     {:stop, {:error, reason}, %{state | closed: true}}
   end
 
@@ -307,9 +344,20 @@ defmodule Absynthe.Relay.Relay do
     {:noreply, state}
   end
 
+  # Handle idle timeout - verify token matches to avoid acting on stale timer messages
+  def handle_info({:idle_timeout, token}, state) when token == state.idle_timer_token do
+    Logger.info("[#{state.connection_id}] Idle timeout, closing connection")
+    {:stop, {:shutdown, :idle_timeout}, %{state | closed: true}}
+  end
+
+  # Ignore stale idle timeout messages with non-matching tokens
+  def handle_info({:idle_timeout, _stale_token}, state) do
+    {:noreply, state}
+  end
+
   @impl GenServer
   def terminate(reason, state) do
-    Logger.debug("Relay terminating: #{inspect(reason)}")
+    Logger.info("[#{state.connection_id}] Relay terminating: #{inspect(reason)}")
 
     # Retract all assertions we made to the local dataspace
     retract_all_inbound_assertions(state)
@@ -325,6 +373,9 @@ defmodule Absynthe.Relay.Relay do
   # Implementation
 
   defp handle_incoming_data(state, data) do
+    # Reset idle timer on any incoming data
+    state = reset_idle_timer(state)
+
     case Framing.append_and_decode(state.recv_buffer, data) do
       {:ok, packets, buffer} ->
         state = %{state | recv_buffer: buffer}
@@ -340,7 +391,10 @@ defmodule Absynthe.Relay.Relay do
               end
             rescue
               error ->
-                Logger.error("Relay: error processing packet: #{inspect(error)}")
+                Logger.error(
+                  "[#{state.connection_id}] Error processing packet: #{inspect(error)}"
+                )
+
                 Logger.error(Exception.format_stacktrace(__STACKTRACE__))
                 {:cont, {:ok, acc_state}}
             end
@@ -371,7 +425,10 @@ defmodule Absynthe.Relay.Relay do
               end
             rescue
               error ->
-                Logger.error("Relay: error processing packet: #{inspect(error)}")
+                Logger.error(
+                  "[#{state.connection_id}] Error processing packet: #{inspect(error)}"
+                )
+
                 Logger.error(Exception.format_stacktrace(__STACKTRACE__))
                 {:cont, {:ok, acc_state}}
             end
@@ -385,7 +442,9 @@ defmodule Absynthe.Relay.Relay do
           end
 
         # Log the decode error and close the connection
-        Logger.error("Relay: framing decode error: #{inspect(reason)}, closing connection")
+        Logger.error(
+          "[#{state.connection_id}] Framing decode error: #{inspect(reason)}, closing connection"
+        )
 
         # Send error packet to peer before closing
         error_packet = Packet.error("protocol error", {:symbol, "decode_error"})
@@ -410,14 +469,14 @@ defmodule Absynthe.Relay.Relay do
   end
 
   defp process_inbound_packet(state, %Packet.Error{message: msg, detail: detail}) do
-    Logger.error("Relay: received error from peer: #{msg} (#{inspect(detail)})")
+    Logger.error("[#{state.connection_id}] Received error from peer: #{msg} (#{inspect(detail)})")
     # Per Syndicate protocol: receiving an error packet means the sender has
     # crashed and will not respond further. Close the connection.
     {:error, state, {:peer_error, msg, detail}}
   end
 
   defp process_inbound_packet(state, %Packet.Extension{label: label}) do
-    Logger.debug("Relay: ignoring unknown extension: #{inspect(label)}")
+    Logger.debug("[#{state.connection_id}] Ignoring unknown extension: #{inspect(label)}")
     {:ok, state}
   end
 
@@ -428,7 +487,7 @@ defmodule Absynthe.Relay.Relay do
         process_event_for_ref(state, ref, oid, event)
 
       :error ->
-        Logger.warning("Relay: received event for unknown OID #{oid}")
+        Logger.warning("[#{state.connection_id}] Received event for unknown OID #{oid}")
         state
     end
   end
@@ -477,7 +536,10 @@ defmodule Absynthe.Relay.Relay do
   defp process_event_for_ref(state, ref, _target_oid, %Packet.Retract{handle: wire_handle}) do
     case Map.get(state.inbound_wire_handles, wire_handle) do
       nil ->
-        Logger.warning("Relay: retract for unknown inbound handle #{wire_handle}")
+        Logger.warning(
+          "[#{state.connection_id}] Retract for unknown inbound handle #{wire_handle}"
+        )
+
         state
 
       local_handle ->
@@ -584,12 +646,12 @@ defmodule Absynthe.Relay.Relay do
             {{:embedded, ref}, state, [{:export, oid}]}
 
           :error ->
-            Logger.warning("Relay: yours ref for unknown OID #{oid}")
+            Logger.warning("[#{state.connection_id}] Yours ref for unknown OID #{oid}")
             {{:embedded, nil}, state, []}
         end
 
       {:error, reason} ->
-        Logger.warning("Relay: failed to decode wire ref: #{inspect(reason)}")
+        Logger.warning("[#{state.connection_id}] Failed to decode wire ref: #{inspect(reason)}")
         {{:embedded, nil}, state, []}
     end
   end
@@ -675,7 +737,7 @@ defmodule Absynthe.Relay.Relay do
   defp handle_outbound_retract(state, handle) do
     case Map.get(state.outbound_local_handles, handle) do
       nil ->
-        Logger.warning("Relay: retract for unknown outbound local handle")
+        Logger.warning("[#{state.connection_id}] Retract for unknown outbound local handle")
         state
 
       wire_handle ->
@@ -718,7 +780,7 @@ defmodule Absynthe.Relay.Relay do
 
           :error ->
             Logger.error(
-              "Relay: missing OID mapping for handle #{inspect(handle)}, dropping retract"
+              "[#{state.connection_id}] Missing OID mapping for handle #{inspect(handle)}, dropping retract"
             )
 
             # Clean up handle mappings but don't send a retract with wrong OID
@@ -849,7 +911,7 @@ defmodule Absynthe.Relay.Relay do
         nil ->
           # Fallback to dataspace_ref if not found (shouldn't happen in normal operation)
           Logger.warning(
-            "Relay: no tracked ref for handle #{inspect(local_handle)}, using dataspace_ref"
+            "[#{state.connection_id}] No tracked ref for handle #{inspect(local_handle)}, using dataspace_ref"
           )
 
           Actor.deliver(
@@ -870,13 +932,13 @@ defmodule Absynthe.Relay.Relay do
 
   # Socket helpers
 
-  defp set_socket_active(%{socket: socket, transport: :gen_tcp}) do
+  defp set_socket_active(%{socket: socket, transport: :gen_tcp, connection_id: conn_id}) do
     case :inet.setopts(socket, active: :once) do
       :ok ->
         :ok
 
       {:error, reason} ->
-        Logger.error("Relay: failed to set socket active: #{inspect(reason)}")
+        Logger.error("[#{conn_id}] Failed to set socket active: #{inspect(reason)}")
         {:error, reason}
     end
   end
@@ -889,8 +951,12 @@ defmodule Absynthe.Relay.Relay do
     case Framing.encode(packet) do
       {:ok, data} ->
         case send_data(state, data) do
-          :ok -> {:ok, state}
-          {:error, reason} -> {:error, reason}
+          :ok ->
+            # Reset idle timer on successful outbound send
+            {:ok, reset_idle_timer(state)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       {:error, reason} ->

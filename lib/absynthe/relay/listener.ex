@@ -29,6 +29,8 @@ defmodule Absynthe.Relay.Listener do
   Common options:
   - `:dataspace_ref` - Ref to the target dataspace entity (required)
   - `:actor_pid` - PID of the hosting actor (optional)
+  - `:idle_timeout` - Idle timeout in milliseconds for relay connections (default: `:infinity`)
+  - `:listener_id` - Unique identifier for logging (default: auto-generated)
 
   Unix socket options:
   - `:type` - `:unix`
@@ -60,7 +62,10 @@ defmodule Absynthe.Relay.Listener do
           dataspace_ref: Absynthe.Core.Ref.t(),
           actor_pid: pid() | nil,
           socket_path: String.t() | nil,
-          relays: [pid()]
+          relays: [pid()],
+          idle_timeout: timeout(),
+          listener_id: String.t(),
+          connection_counter: non_neg_integer()
         }
 
   # Client API
@@ -117,20 +122,39 @@ defmodule Absynthe.Relay.Listener do
     type = Keyword.fetch!(opts, :type)
     dataspace_ref = Keyword.fetch!(opts, :dataspace_ref)
     actor_pid = Keyword.get(opts, :actor_pid)
+    idle_timeout = Keyword.get(opts, :idle_timeout, :infinity)
+
+    listener_id =
+      Keyword.get_lazy(opts, :listener_id, fn ->
+        generate_listener_id()
+      end)
+
+    common_state = %{
+      dataspace_ref: dataspace_ref,
+      actor_pid: actor_pid,
+      relays: [],
+      idle_timeout: idle_timeout,
+      listener_id: listener_id,
+      connection_counter: 0
+    }
 
     case type do
       :unix ->
         path = Keyword.fetch!(opts, :path)
-        init_unix(path, dataspace_ref, actor_pid)
+        init_unix(path, common_state)
 
       :tcp ->
         port = Keyword.fetch!(opts, :port)
         host = Keyword.get(opts, :host, {127, 0, 0, 1})
-        init_tcp(host, port, dataspace_ref, actor_pid)
+        init_tcp(host, port, common_state)
     end
   end
 
-  defp init_unix(path, dataspace_ref, actor_pid) do
+  defp generate_listener_id do
+    :crypto.strong_rand_bytes(3) |> Base.encode16(case: :lower)
+  end
+
+  defp init_unix(path, common_state) do
     # Remove existing socket file if present
     File.rm(path)
 
@@ -143,16 +167,14 @@ defmodule Absynthe.Relay.Listener do
            {:ifaddr, {:local, path}}
          ]) do
       {:ok, listen_socket} ->
-        Logger.info("Relay listener started on Unix socket: #{path}")
+        Logger.info("[#{common_state.listener_id}] Listener started on Unix socket: #{path}")
 
-        state = %{
-          type: :unix,
-          listen_socket: listen_socket,
-          dataspace_ref: dataspace_ref,
-          actor_pid: actor_pid,
-          socket_path: path,
-          relays: []
-        }
+        state =
+          Map.merge(common_state, %{
+            type: :unix,
+            listen_socket: listen_socket,
+            socket_path: path
+          })
 
         # Start accepting connections
         send(self(), :accept)
@@ -164,7 +186,7 @@ defmodule Absynthe.Relay.Listener do
     end
   end
 
-  defp init_tcp(host, port, dataspace_ref, actor_pid) do
+  defp init_tcp(host, port, common_state) do
     opts = [
       :binary,
       {:packet, :raw},
@@ -177,18 +199,19 @@ defmodule Absynthe.Relay.Listener do
       {:ok, listen_socket} ->
         # Get actual port (useful if port 0 was specified)
         {:ok, actual_port} = :inet.port(listen_socket)
-        Logger.info("Relay listener started on TCP #{:inet.ntoa(host)}:#{actual_port}")
 
-        state = %{
-          type: :tcp,
-          listen_socket: listen_socket,
-          dataspace_ref: dataspace_ref,
-          actor_pid: actor_pid,
-          socket_path: nil,
-          host: host,
-          port: actual_port,
-          relays: []
-        }
+        Logger.info(
+          "[#{common_state.listener_id}] Listener started on TCP #{:inet.ntoa(host)}:#{actual_port}"
+        )
+
+        state =
+          Map.merge(common_state, %{
+            type: :tcp,
+            listen_socket: listen_socket,
+            socket_path: nil,
+            host: host,
+            port: actual_port
+          })
 
         # Start accepting connections
         send(self(), :accept)
@@ -213,6 +236,7 @@ defmodule Absynthe.Relay.Listener do
   def handle_info(:accept, state) do
     # Accept is blocking, so we do it in a spawned task to keep the GenServer responsive
     parent = self()
+    listener_id = state.listener_id
 
     Task.start(fn ->
       case :gen_tcp.accept(state.listen_socket) do
@@ -224,7 +248,10 @@ defmodule Absynthe.Relay.Listener do
               send(parent, {:accepted, client_socket})
 
             {:error, reason} ->
-              Logger.error("Socket handoff to listener failed: #{inspect(reason)}")
+              Logger.error(
+                "[#{listener_id}] Socket handoff to listener failed: #{inspect(reason)}"
+              )
+
               :gen_tcp.close(client_socket)
               send(parent, :accept)
           end
@@ -234,7 +261,7 @@ defmodule Absynthe.Relay.Listener do
           :ok
 
         {:error, reason} ->
-          Logger.error("Accept failed: #{inspect(reason)}")
+          Logger.error("[#{listener_id}] Accept failed: #{inspect(reason)}")
           send(parent, :accept)
       end
     end)
@@ -243,13 +270,19 @@ defmodule Absynthe.Relay.Listener do
   end
 
   def handle_info({:accepted, client_socket}, state) do
-    Logger.debug("Accepted new connection")
+    # Generate connection ID for this relay
+    connection_id = "#{state.listener_id}-#{state.connection_counter}"
+    state = %{state | connection_counter: state.connection_counter + 1}
+
+    Logger.info("[#{state.listener_id}] Accepted connection #{connection_id}")
 
     # Spawn a relay for this connection
     relay_opts = [
       socket: client_socket,
       transport: :gen_tcp,
-      dataspace_ref: state.dataspace_ref
+      dataspace_ref: state.dataspace_ref,
+      idle_timeout: state.idle_timeout,
+      connection_id: connection_id
     ]
 
     relay_opts =
@@ -265,16 +298,11 @@ defmodule Absynthe.Relay.Listener do
     case GenServer.start(Relay, relay_opts) do
       {:ok, relay_pid} ->
         # Transfer socket ownership to the relay
-        Logger.debug(
-          "Transferring socket #{inspect(client_socket)} to relay #{inspect(relay_pid)}"
-        )
+        Logger.debug("[#{state.listener_id}] Transferring socket to relay #{connection_id}")
 
         case :gen_tcp.controlling_process(client_socket, relay_pid) do
           :ok ->
-            Logger.debug("controlling_process succeeded")
-
             # Activate the socket now that ownership is transferred
-            Logger.debug("Activating relay")
             Relay.activate(relay_pid)
 
             # Monitor the relay
@@ -288,7 +316,9 @@ defmodule Absynthe.Relay.Listener do
             {:noreply, state}
 
           {:error, reason} ->
-            Logger.error("Socket handoff to relay failed: #{inspect(reason)}")
+            Logger.error(
+              "[#{state.listener_id}] Socket handoff failed for #{connection_id}: #{inspect(reason)}"
+            )
 
             # Stop the relay since handoff failed - guard with Process.alive?
             # to avoid crashing the listener if relay already exited (which may
@@ -306,7 +336,10 @@ defmodule Absynthe.Relay.Listener do
         end
 
       {:error, reason} ->
-        Logger.error("Failed to start relay: #{inspect(reason)}")
+        Logger.error(
+          "[#{state.listener_id}] Failed to start relay for #{connection_id}: #{inspect(reason)}"
+        )
+
         :gen_tcp.close(client_socket)
 
         # Accept next connection
@@ -317,13 +350,15 @@ defmodule Absynthe.Relay.Listener do
   end
 
   def handle_info({:DOWN, _ref, :process, pid, reason}, state) do
-    Logger.debug("Relay #{inspect(pid)} terminated: #{inspect(reason)}")
+    Logger.debug("[#{state.listener_id}] Relay #{inspect(pid)} terminated: #{inspect(reason)}")
     state = %{state | relays: List.delete(state.relays, pid)}
     {:noreply, state}
   end
 
   @impl GenServer
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
+    Logger.info("[#{state.listener_id}] Listener terminating: #{inspect(reason)}")
+
     # Close listen socket
     :gen_tcp.close(state.listen_socket)
 
