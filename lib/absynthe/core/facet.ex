@@ -68,7 +68,11 @@ defmodule Absynthe.Core.Facet do
           children: MapSet.t(facet_id()),
           entities: %{entity_id() => entity()},
           outbound_handles: MapSet.t(handle()),
-          alive?: boolean()
+          alive?: boolean(),
+          # Counter for preventing inertness checks during setup
+          inert_check_preventers: non_neg_integer(),
+          # Set of linked task references (for future async task support)
+          linked_tasks: MapSet.t(reference())
         }
 
   defstruct [
@@ -77,7 +81,9 @@ defmodule Absynthe.Core.Facet do
     children: MapSet.new(),
     entities: %{},
     outbound_handles: MapSet.new(),
-    alive?: true
+    alive?: true,
+    inert_check_preventers: 0,
+    linked_tasks: MapSet.new()
   ]
 
   @doc """
@@ -428,4 +434,184 @@ defmodule Absynthe.Core.Facet do
   """
   @spec handles(t()) :: MapSet.t(handle())
   def handles(%__MODULE__{outbound_handles: handles}), do: handles
+
+  # Inertness Detection
+
+  @doc """
+  Checks if a facet is inert (has no work to do).
+
+  A facet is considered inert if ALL of the following are true:
+  - It is alive (dead facets are not "inert" - they're terminated)
+  - It has no child facets
+  - It has no outbound assertion handles
+  - It has no linked tasks
+  - It has no active inert-check preventers
+
+  Inert facets should be automatically terminated to clean up unused
+  conversational scopes. When a facet becomes inert, it should be
+  stopped, and this may cascade to parent facets if they also become
+  inert as a result.
+
+  ## Parameters
+
+    - `facet` - The facet to check
+
+  ## Returns
+
+  `true` if the facet is inert, `false` otherwise.
+
+  ## Examples
+
+      iex> facet = Facet.new(:my_facet)
+      iex> Facet.is_inert?(facet)
+      true
+
+      iex> facet = Facet.new(:my_facet) |> Facet.add_child(:child)
+      iex> Facet.is_inert?(facet)
+      false
+
+      iex> facet = Facet.new(:my_facet) |> Facet.add_handle(:h1)
+      iex> Facet.is_inert?(facet)
+      false
+  """
+  @spec is_inert?(t()) :: boolean()
+  def is_inert?(%__MODULE__{alive?: false}), do: false
+
+  def is_inert?(%__MODULE__{
+        alive?: true,
+        children: children,
+        outbound_handles: handles,
+        linked_tasks: tasks,
+        inert_check_preventers: preventers
+      }) do
+    MapSet.size(children) == 0 and
+      MapSet.size(handles) == 0 and
+      MapSet.size(tasks) == 0 and
+      preventers == 0
+  end
+
+  @doc """
+  Prevents inertness checks from succeeding for this facet.
+
+  Returns a tuple of `{token, updated_facet}` where the token can be used
+  with `allow_inert_check/2` to re-enable inertness checks.
+
+  This is used during facet boot to prevent premature garbage collection
+  while the facet is still being set up (e.g., while wiring up assertions
+  or spawning entities).
+
+  ## Parameters
+
+    - `facet` - The facet to prevent inertness checks for
+
+  ## Returns
+
+  A tuple of `{token, updated_facet}` where token is a unique reference.
+
+  ## Examples
+
+      iex> facet = Facet.new(:my_facet)
+      iex> {token, facet} = Facet.prevent_inert_check(facet)
+      iex> Facet.is_inert?(facet)
+      false
+      iex> {_, facet} = Facet.allow_inert_check(facet, token)
+      iex> Facet.is_inert?(facet)
+      true
+  """
+  @spec prevent_inert_check(t()) :: {reference(), t()}
+  def prevent_inert_check(%__MODULE__{inert_check_preventers: count} = facet) do
+    token = make_ref()
+    {token, %{facet | inert_check_preventers: count + 1}}
+  end
+
+  @doc """
+  Re-enables inertness checks after a previous `prevent_inert_check/1`.
+
+  This decrements the facet's preventer counter. When the counter reaches zero,
+  the facet becomes eligible for automatic inertness termination.
+
+  Note: The token parameter is required for API symmetry with `prevent_inert_check/1`
+  but is not validated. Callers are responsible for ensuring balanced
+  prevent/allow calls.
+
+  ## Parameters
+
+    - `facet` - The facet to allow inertness checks for
+    - `token` - The token from `prevent_inert_check/1` (kept for API symmetry)
+
+  ## Returns
+
+  A tuple of `{:ok, updated_facet}` or `{:error, :no_preventers}`.
+
+  ## Examples
+
+      iex> facet = Facet.new(:my_facet)
+      iex> {token, facet} = Facet.prevent_inert_check(facet)
+      iex> {:ok, facet} = Facet.allow_inert_check(facet, token)
+      iex> facet.inert_check_preventers
+      0
+  """
+  @spec allow_inert_check(t(), reference()) :: {:ok, t()} | {:error, :no_preventers}
+  def allow_inert_check(%__MODULE__{inert_check_preventers: 0}, _token) do
+    {:error, :no_preventers}
+  end
+
+  def allow_inert_check(%__MODULE__{inert_check_preventers: count} = facet, _token) do
+    {:ok, %{facet | inert_check_preventers: count - 1}}
+  end
+
+  # Linked Tasks (for future async task support)
+
+  @doc """
+  Links a task to this facet.
+
+  Linked tasks prevent the facet from becoming inert until they complete.
+  This is used for async operations that should keep the facet alive.
+
+  ## Parameters
+
+    - `facet` - The facet to link the task to
+    - `task_ref` - A reference identifying the task
+
+  ## Returns
+
+  Updated facet with the task linked.
+  """
+  @spec link_task(t(), reference()) :: t()
+  def link_task(%__MODULE__{linked_tasks: tasks} = facet, task_ref) do
+    %{facet | linked_tasks: MapSet.put(tasks, task_ref)}
+  end
+
+  @doc """
+  Unlinks a task from this facet.
+
+  ## Parameters
+
+    - `facet` - The facet to unlink the task from
+    - `task_ref` - The reference of the task to unlink
+
+  ## Returns
+
+  Updated facet with the task unlinked.
+  """
+  @spec unlink_task(t(), reference()) :: t()
+  def unlink_task(%__MODULE__{linked_tasks: tasks} = facet, task_ref) do
+    %{facet | linked_tasks: MapSet.delete(tasks, task_ref)}
+  end
+
+  @doc """
+  Checks if the facet has any linked tasks.
+
+  ## Parameters
+
+    - `facet` - The facet to check
+
+  ## Returns
+
+  `true` if the facet has linked tasks, `false` otherwise.
+  """
+  @spec has_linked_tasks?(t()) :: boolean()
+  def has_linked_tasks?(%__MODULE__{linked_tasks: tasks}) do
+    MapSet.size(tasks) > 0
+  end
 end

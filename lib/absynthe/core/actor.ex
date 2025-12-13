@@ -232,7 +232,10 @@ defmodule Absynthe.Core.Actor do
           id: facet_id(),
           parent_id: facet_id() | nil,
           children: MapSet.t(facet_id()),
-          entities: MapSet.t(entity_id())
+          entities: MapSet.t(entity_id()),
+          # Inertness tracking
+          inert_check_preventers: non_neg_integer(),
+          linked_tasks: MapSet.t(reference())
         }
 
   # Client API
@@ -568,6 +571,71 @@ defmodule Absynthe.Core.Actor do
     GenServer.call(actor, {:terminate_facet, facet_id})
   end
 
+  @doc """
+  Prevents inertness checks from auto-terminating a facet.
+
+  This is used during facet setup to prevent premature garbage collection
+  while the facet is still being initialized (e.g., while wiring up assertions
+  or spawning entities).
+
+  Returns a token that must be passed to `allow_inert_check/3` to re-enable
+  inertness checking.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+  - `facet_id` - The ID of the facet to prevent inertness checks for
+
+  ## Examples
+
+      {:ok, token} = Absynthe.Core.Actor.prevent_inert_check(actor, :my_facet)
+      # ... do setup work ...
+      :ok = Absynthe.Core.Actor.allow_inert_check(actor, :my_facet, token)
+
+  ## Returns
+
+  - `{:ok, token}` - Token for later allowing inert checks
+  - `{:error, :facet_not_found}` - Facet doesn't exist
+  """
+  @spec prevent_inert_check(GenServer.server(), facet_id()) ::
+          {:ok, reference()} | {:error, term()}
+  def prevent_inert_check(actor, facet_id) do
+    GenServer.call(actor, {:prevent_inert_check, facet_id})
+  end
+
+  @doc """
+  Re-enables inertness checks for a facet after `prevent_inert_check/2`.
+
+  This decrements the facet's preventer counter. When the counter reaches zero,
+  the facet becomes eligible for automatic inertness termination.
+
+  Note: The token parameter is required for API symmetry with `prevent_inert_check/2`
+  but is not validated. Callers are responsible for ensuring balanced
+  prevent/allow calls.
+
+  ## Parameters
+
+  - `actor` - The actor PID or registered name
+  - `facet_id` - The ID of the facet to allow inertness checks for
+  - `token` - The token returned from `prevent_inert_check/2` (kept for API symmetry)
+
+  ## Examples
+
+      {:ok, token} = Absynthe.Core.Actor.prevent_inert_check(actor, :my_facet)
+      :ok = Absynthe.Core.Actor.allow_inert_check(actor, :my_facet, token)
+
+  ## Returns
+
+  - `:ok` - Inertness checks re-enabled
+  - `{:error, :facet_not_found}` - Facet doesn't exist
+  - `{:error, :no_preventers}` - No preventers active (unbalanced calls)
+  """
+  @spec allow_inert_check(GenServer.server(), facet_id(), reference()) ::
+          :ok | {:error, term()}
+  def allow_inert_check(actor, facet_id, token) do
+    GenServer.call(actor, {:allow_inert_check, facet_id, token})
+  end
+
   # GenServer Callbacks
 
   @impl GenServer
@@ -577,11 +645,16 @@ defmodule Absynthe.Core.Actor do
     root_facet_id = Keyword.get(opts, :root_facet_id, :root)
 
     # Create the root facet
+    # Note: root facet starts with inert_check_preventers=1 to prevent premature termination
+    # The root facet is special and should not be auto-terminated by inertness
     root_facet = %{
       id: root_facet_id,
       parent_id: nil,
       children: MapSet.new(),
-      entities: MapSet.new()
+      entities: MapSet.new(),
+      # Inertness tracking
+      inert_check_preventers: 1,
+      linked_tasks: MapSet.new()
     }
 
     # Initialize actor state
@@ -662,7 +735,7 @@ defmodule Absynthe.Core.Actor do
     case Map.fetch(state.outbound_assertions, handle) do
       {:ok, {ref, _assertion}} ->
         # Remove from tracking (outbound_assertions and facet_handles)
-        new_state = untrack_assertion_handle(state, handle)
+        {new_state, owning_facet_id} = untrack_assertion_handle(state, handle)
 
         # Create the retract event
         event = Event.retract(ref, handle)
@@ -670,6 +743,14 @@ defmodule Absynthe.Core.Actor do
         # Deliver asynchronously to align with documented behavior
         # deliver_to_ref handles both local and remote delivery
         new_state = deliver_to_ref(new_state, ref, event, :async)
+
+        # Check if the owning facet became inert after losing this handle
+        new_state =
+          if owning_facet_id do
+            stop_inert_facets(new_state, owning_facet_id)
+          else
+            new_state
+          end
 
         {:reply, :ok, new_state}
 
@@ -729,21 +810,29 @@ defmodule Absynthe.Core.Actor do
         # All validations passed - now perform the atomic update
 
         # Step 3a: Retract old assertion (if handle provided)
-        state =
+        {state, owning_facet_id} =
           case old_info do
             nil ->
-              state
+              {state, nil}
 
             {handle, old_ref} ->
-              new_state = untrack_assertion_handle(state, handle)
+              {new_state, owner_fid} = untrack_assertion_handle(state, handle)
               event = Event.retract(old_ref, handle)
-              deliver_to_ref(new_state, old_ref, event, :async)
+              {deliver_to_ref(new_state, old_ref, event, :async), owner_fid}
           end
 
         # Step 3b: Assert new value (if provided)
         case rewritten_assertion do
           nil ->
             # Just retraction, no new assertion
+            # Check if the owning facet became inert after losing this handle
+            state =
+              if owning_facet_id do
+                stop_inert_facets(state, owning_facet_id)
+              else
+                state
+              end
+
             {:reply, :ok, state}
 
           rewritten ->
@@ -792,6 +881,41 @@ defmodule Absynthe.Core.Actor do
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:prevent_inert_check, facet_id}, _from, state) do
+    case Map.fetch(state.facets, facet_id) do
+      {:ok, facet} ->
+        token = make_ref()
+        updated_facet = %{facet | inert_check_preventers: facet.inert_check_preventers + 1}
+        new_state = %{state | facets: Map.put(state.facets, facet_id, updated_facet)}
+        {:reply, {:ok, token}, new_state}
+
+      :error ->
+        {:reply, {:error, :facet_not_found}, state}
+    end
+  end
+
+  @impl GenServer
+  def handle_call({:allow_inert_check, facet_id, _token}, _from, state) do
+    case Map.fetch(state.facets, facet_id) do
+      {:ok, facet} ->
+        if facet.inert_check_preventers > 0 do
+          updated_facet = %{facet | inert_check_preventers: facet.inert_check_preventers - 1}
+          new_state = %{state | facets: Map.put(state.facets, facet_id, updated_facet)}
+
+          # After allowing inert check, check if the facet is now inert
+          new_state = stop_inert_facets(new_state, facet_id)
+
+          {:reply, :ok, new_state}
+        else
+          {:reply, {:error, :no_preventers}, state}
+        end
+
+      :error ->
+        {:reply, {:error, :facet_not_found}, state}
     end
   end
 
@@ -873,7 +997,10 @@ defmodule Absynthe.Core.Actor do
           id: facet_id,
           parent_id: parent_id,
           children: MapSet.new(),
-          entities: MapSet.new()
+          entities: MapSet.new(),
+          # Inertness tracking
+          inert_check_preventers: 0,
+          linked_tasks: MapSet.new()
         }
 
         # Update parent to reference this child
@@ -1135,9 +1262,14 @@ defmodule Absynthe.Core.Actor do
     facet_id = Turn.facet_id(turn)
 
     # Process each pending action
-    Enum.reduce(actions, state, fn action, acc_state ->
-      process_action(acc_state, action, facet_id)
-    end)
+    state =
+      Enum.reduce(actions, state, fn action, acc_state ->
+        process_action(acc_state, action, facet_id)
+      end)
+
+    # After processing actions, check for inert facets and terminate them
+    # This implements the SAM inertness detection and auto-teardown
+    stop_inert_facets(state, facet_id)
   end
 
   @doc false
@@ -1174,7 +1306,8 @@ defmodule Absynthe.Core.Actor do
   # Remove from tracking if this was a turn-initiated retraction of our own assertion
   defp process_action(state, %Retract{ref: ref, handle: handle} = event, _facet_id) do
     # Remove from outbound assertions and facet handles if we own this handle
-    state = untrack_assertion_handle(state, handle)
+    # Note: inertness check happens after commit_turn via stop_inert_facets
+    {state, _owning_facet_id} = untrack_assertion_handle(state, handle)
     deliver_action_to_ref(state, ref, event)
   end
 
@@ -1237,22 +1370,92 @@ defmodule Absynthe.Core.Actor do
   end
 
   # Remove an assertion handle from tracking
+  # Returns {state, owning_facet_id | nil} where owning_facet_id is the facet that owned
+  # the handle, allowing the caller to trigger inertness checks if needed.
   defp untrack_assertion_handle(state, handle) do
     case Map.fetch(state.outbound_assertions, handle) do
       {:ok, _} ->
         # Remove from outbound assertions
         state = %{state | outbound_assertions: Map.delete(state.outbound_assertions, handle)}
 
-        # Remove from facet handles (check all facets since we don't know which one owns it)
-        facet_handles =
-          Map.new(state.facet_handles, fn {fid, handles} ->
-            {fid, MapSet.delete(handles, handle)}
+        # Find which facet owns this handle and remove it
+        {facet_handles, owning_facet_id} =
+          Enum.reduce(state.facet_handles, {%{}, nil}, fn {fid, handles}, {acc_map, owner} ->
+            if MapSet.member?(handles, handle) do
+              {Map.put(acc_map, fid, MapSet.delete(handles, handle)), fid}
+            else
+              {Map.put(acc_map, fid, handles), owner}
+            end
           end)
 
-        %{state | facet_handles: facet_handles}
+        {%{state | facet_handles: facet_handles}, owning_facet_id}
 
       :error ->
         # Not our handle, nothing to do
+        {state, nil}
+    end
+  end
+
+  # Inertness Detection and Auto-Teardown
+  #
+  # A facet is "inert" when it has no work left to do:
+  # - No children facets
+  # - No outbound assertion handles
+  # - No linked tasks
+  # - No inert-check preventers active
+  #
+  # Inert facets are automatically terminated to clean up unused conversational
+  # scopes. When a facet is terminated due to inertness, we check if its parent
+  # also becomes inert, cascading up the tree.
+
+  # Check if a specific facet is inert
+  defp facet_is_inert?(state, facet_id, facet) do
+    # Get the handles for this facet
+    handles = Map.get(state.facet_handles, facet_id, MapSet.new())
+
+    # A facet is inert if:
+    # - It has no children
+    # - It has no outbound handles
+    # - It has no linked tasks
+    # - It has no inert-check preventers
+    MapSet.size(facet.children) == 0 and
+      MapSet.size(handles) == 0 and
+      MapSet.size(facet.linked_tasks) == 0 and
+      facet.inert_check_preventers == 0
+  end
+
+  # Stop inert facets starting from a given facet, cascading to parents
+  defp stop_inert_facets(state, facet_id) do
+    case Map.fetch(state.facets, facet_id) do
+      {:ok, facet} ->
+        if facet_is_inert?(state, facet_id, facet) do
+          # Don't terminate the root facet via inertness
+          if facet_id == state.root_facet_id do
+            state
+          else
+            # Terminate this facet
+            Logger.debug("Facet #{inspect(facet_id)} is inert, auto-terminating")
+
+            case terminate_facet_impl(state, facet_id) do
+              {:ok, new_state} ->
+                # Check if parent is now inert
+                if facet.parent_id do
+                  stop_inert_facets(new_state, facet.parent_id)
+                else
+                  new_state
+                end
+
+              {:error, _reason} ->
+                # Failed to terminate, just return current state
+                state
+            end
+          end
+        else
+          state
+        end
+
+      :error ->
+        # Facet doesn't exist, nothing to do
         state
     end
   end
