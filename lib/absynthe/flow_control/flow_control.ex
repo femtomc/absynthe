@@ -13,7 +13,9 @@ defmodule Absynthe.FlowControl do
 
   - `Account`: Tracks debt for a source with pause/resume thresholds
   - `LoanedItem`: Represents a unit of borrowed work to be repaid
-  - `Registry`: ETS-backed storage for account state (optional)
+
+  Accounts are stored in process state (not in a shared registry), so each
+  process manages its own flow control independently.
 
   ## Usage Patterns
 
@@ -77,14 +79,16 @@ defmodule Absynthe.FlowControl do
         [:absynthe, :flow_control, :account, :pause],
         &log_pause/4, nil)
 
-  ## Configuration
+  ## Defaults
 
-  Default limits can be configured in application config:
+  Default values are hardcoded in `Account.new/1`:
 
-      config :absynthe, :flow_control,
-        default_limit: 1000,
-        default_high_water_percent: 80,
-        default_low_water_percent: 40
+  - `limit`: 1000
+  - `high_water_mark`: 80% of limit (800)
+  - `low_water_mark`: 40% of limit (400)
+
+  Pass these options explicitly to `Account.new/1` or `FlowControl.new_account/1`
+  to override the defaults.
 
   ## See Also
 
