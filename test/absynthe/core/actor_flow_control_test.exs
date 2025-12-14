@@ -133,23 +133,67 @@ defmodule Absynthe.Core.ActorFlowControlTest do
   end
 
   describe "debt tracking" do
-    test "external message does not affect debt" do
+    test "external messages borrow then repay debt" do
       {:ok, actor} =
         Actor.start_link(id: :debt_test_actor, flow_control: true)
 
       # Spawn entity
       {:ok, ref} = Actor.spawn_entity(actor, :root, %EchoEntity{messages: []})
 
-      # Send external message - this shouldn't borrow or repay debt
+      # Send external message - now tracks debt for incoming load
       Actor.send_message(actor, ref, {:string, "hello"})
 
       # Give time for processing
       Process.sleep(50)
 
-      # Debt should be zero since external messages don't borrow
+      # After processing, debt should return to zero (borrow then repay)
       stats = Actor.flow_control_stats(actor)
       assert stats.debt == 0
 
+      GenServer.stop(actor)
+    end
+
+    test "single incoming message triggers pause when high_water_mark is 1" do
+      test_pid = self()
+
+      # Use high_water_mark of 1 so a single message triggers pause
+      {:ok, actor} =
+        Actor.start_link(
+          id: :"single_msg_pause_#{:erlang.unique_integer([:positive])}",
+          flow_control: [limit: 10, high_water_mark: 1, low_water_mark: 0]
+        )
+
+      # Attach telemetry to capture pause event
+      handler_id = "single-msg-pause-test-#{:erlang.unique_integer()}"
+
+      :telemetry.attach(
+        handler_id,
+        [:absynthe, :flow_control, :account, :pause],
+        fn _event, measurements, _metadata, _config ->
+          send(test_pid, {:paused, measurements.debt})
+        end,
+        nil
+      )
+
+      # Spawn a simple entity that does nothing on message (no fan-out)
+      {:ok, ref} = Actor.spawn_entity(actor, :root, %EchoEntity{messages: []})
+
+      # Send a single message - incoming borrow should trigger pause at debt=1
+      Actor.send_message(actor, ref, {:string, "trigger_pause"})
+
+      # Should receive pause telemetry from the incoming event borrow
+      # (not from any fan-out actions since EchoEntity has no target)
+      assert_receive {:paused, debt}, 500
+      assert debt >= 1
+
+      # Give time for processing
+      Process.sleep(50)
+
+      # After processing, debt returns to zero
+      stats = Actor.flow_control_stats(actor)
+      assert stats.debt == 0
+
+      :telemetry.detach(handler_id)
       GenServer.stop(actor)
     end
 
@@ -355,6 +399,191 @@ defmodule Absynthe.Core.ActorFlowControlTest do
 
       :telemetry.detach("overload-test-handler")
       GenServer.stop(actor)
+    end
+  end
+
+  describe "inter-actor flow control" do
+    # Entity that creates fan-out when receiving from another actor
+    defmodule InterActorFanOutEntity do
+      defstruct [:targets]
+
+      defimpl Entity do
+        def on_message(entity, _msg, turn) do
+          # Forward to all targets - this creates internal fan-out
+          turn =
+            Enum.reduce(entity.targets || [], turn, fn target_ref, acc_turn ->
+              Turn.add_action(acc_turn, Event.message(target_ref, {:symbol, "forwarded"}))
+            end)
+
+          {entity, turn}
+        end
+
+        def on_publish(entity, _assertion, _handle, turn), do: {entity, turn}
+        def on_retract(entity, _handle, turn), do: {entity, turn}
+        def on_sync(entity, _peer, turn), do: {entity, turn}
+      end
+    end
+
+    test "receiver tracks debt for fan-out triggered by inter-actor messages" do
+      test_pid = self()
+
+      # Use unique atom names to avoid global registration conflicts
+      sender_id = :"sender_actor_#{:erlang.unique_integer([:positive])}"
+      receiver_id = :"receiver_actor_#{:erlang.unique_integer([:positive])}"
+
+      # Start sender actor (no flow control, registered with unique name)
+      {:ok, sender} = Actor.start_link(id: sender_id, name: sender_id)
+
+      # Start receiver actor with flow control
+      {:ok, receiver} =
+        Actor.start_link(
+          id: receiver_id,
+          name: receiver_id,
+          flow_control: [limit: 20, high_water_mark: 5, low_water_mark: 2]
+        )
+
+      # Create receiver entities
+      receivers =
+        for _ <- 1..10 do
+          {:ok, ref} = Actor.spawn_entity(receiver, :root, %EchoEntity{messages: []})
+          ref
+        end
+
+      # Create fan-out entity that forwards to all receivers
+      {:ok, fanout_ref} =
+        Actor.spawn_entity(receiver, :root, %InterActorFanOutEntity{targets: receivers})
+
+      # Attach telemetry to capture pause event
+      :telemetry.attach(
+        "inter-actor-fanout-test-#{:erlang.unique_integer()}",
+        [:absynthe, :flow_control, :account, :pause],
+        fn _event, measurements, metadata, _config ->
+          if metadata.account_id == {:actor, receiver_id} do
+            send(test_pid, {:paused, measurements.debt})
+          end
+        end,
+        nil
+      )
+
+      # Send message from sender to receiver's fan-out entity
+      # This triggers internal fan-out of 10 messages
+      Actor.send_message(sender, fanout_ref, {:symbol, "trigger"})
+
+      # Should trigger pause from the internal fan-out
+      assert_receive {:paused, debt}, 500
+      assert debt >= 5
+
+      # After processing completes, debt should return to zero
+      Process.sleep(100)
+      stats = Actor.flow_control_stats(receiver)
+      assert stats.debt == 0
+
+      GenServer.stop(sender)
+      GenServer.stop(receiver)
+    end
+
+    test "external API calls borrow and repay debt correctly" do
+      test_pid = self()
+
+      # Use unique atom name to avoid global registration conflicts
+      actor_id = :"external_api_actor_#{:erlang.unique_integer([:positive])}"
+
+      # Start actor with flow control and low threshold to trigger pause
+      {:ok, actor} =
+        Actor.start_link(
+          id: actor_id,
+          flow_control: [limit: 10, high_water_mark: 3, low_water_mark: 1]
+        )
+
+      # Attach telemetry to verify borrowing actually occurs
+      :telemetry.attach(
+        "external-api-borrow-test-#{:erlang.unique_integer()}",
+        [:absynthe, :flow_control, :account, :pause],
+        fn _event, measurements, _metadata, _config ->
+          send(test_pid, {:paused, measurements.debt})
+        end,
+        nil
+      )
+
+      # Create a fan-out entity that will generate enough internal messages
+      # to trigger pause (proving borrowing occurs)
+      receivers =
+        for _ <- 1..5 do
+          {:ok, ref} = Actor.spawn_entity(actor, :root, %EchoEntity{messages: []})
+          ref
+        end
+
+      {:ok, fanout_ref} =
+        Actor.spawn_entity(actor, :root, %InterActorFanOutEntity{targets: receivers})
+
+      # Send message to trigger fan-out
+      Actor.send_message(actor, fanout_ref, {:symbol, "trigger"})
+
+      # Should receive pause telemetry (proves borrowing occurred)
+      assert_receive {:paused, debt}, 500
+      assert debt >= 3
+
+      # Give time for processing
+      Process.sleep(100)
+
+      # After processing, debt should return to zero (proves repayment)
+      stats = Actor.flow_control_stats(actor)
+      assert stats.debt == 0
+
+      GenServer.stop(actor)
+    end
+
+    test "inter-actor messages with internal fan-out trigger overload telemetry" do
+      test_pid = self()
+
+      # Use unique atom names for actor IDs to avoid global registration conflicts
+      sender_id = :"overload_sender_#{:erlang.unique_integer([:positive])}"
+      receiver_id = :"overload_receiver_#{:erlang.unique_integer([:positive])}"
+
+      # Start sender actor (no flow control, registered with unique name)
+      {:ok, sender} = Actor.start_link(id: sender_id, name: sender_id)
+
+      # Start receiver with low limits (registered with unique name)
+      {:ok, receiver} =
+        Actor.start_link(
+          id: receiver_id,
+          name: receiver_id,
+          flow_control: [limit: 10, high_water_mark: 5, low_water_mark: 2]
+        )
+
+      # Create receiver entities
+      receivers =
+        for _ <- 1..15 do
+          {:ok, ref} = Actor.spawn_entity(receiver, :root, %EchoEntity{messages: []})
+          ref
+        end
+
+      # Create fan-out entity
+      {:ok, fanout_ref} =
+        Actor.spawn_entity(receiver, :root, %InterActorFanOutEntity{targets: receivers})
+
+      # Attach telemetry for overload events
+      :telemetry.attach(
+        "overload-inter-actor-test-#{:erlang.unique_integer()}",
+        [:absynthe, :flow_control, :actor, :overload],
+        fn _event, measurements, metadata, _config ->
+          if metadata.actor_id == receiver_id do
+            send(test_pid, {:overload, measurements})
+          end
+        end,
+        nil
+      )
+
+      # Send message from sender to trigger fan-out
+      Actor.send_message(sender, fanout_ref, {:symbol, "trigger"})
+
+      # Should receive overload telemetry from fan-out
+      assert_receive {:overload, measurements}, 500
+      assert Map.has_key?(measurements, :debt)
+      assert Map.has_key?(measurements, :mailbox_length)
+
+      GenServer.stop(sender)
+      GenServer.stop(receiver)
     end
   end
 end

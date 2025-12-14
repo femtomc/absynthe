@@ -995,15 +995,18 @@ defmodule Absynthe.Core.Actor do
   @impl GenServer
   def handle_cast({:deliver, ref, event}, state) do
     # External delivery - from Actor.deliver/3 or Actor.send_message/3
-    # No flow control repayment here since we didn't borrow for external events
     # Deliver the event - either locally or to remote actor
-    # For local refs, we process directly.
-    # For remote refs, we forward to the remote actor.
+    # For local refs, we process directly with flow control tracking
+    # For remote refs, we forward to the remote actor (which tracks its own load)
     new_state =
       case Ref.local?(ref, state.id) do
         true ->
-          # Local delivery - process the event directly
-          deliver_event_impl(state, ref, event, nil)
+          # Local delivery - borrow debt, process, then repay
+          # This tracks load from external API calls
+          state = borrow_for_incoming_event(state, event)
+          state = check_flow_control_overload(state)
+          state = deliver_event_impl(state, ref, event, nil)
+          repay_action_cost(state, event)
 
         false ->
           # Remote delivery - forward to the remote actor
@@ -1044,8 +1047,15 @@ defmodule Absynthe.Core.Actor do
 
   @impl GenServer
   def handle_cast({:deliver_from, ref, event, sender_pid}, state) do
-    # Remote delivery with sender tracking for crash cleanup
+    # Delivery from another local actor with sender tracking for crash cleanup
+    # Flow control: borrow debt for incoming events to track receiver load
+    state = borrow_for_incoming_event(state, event)
+    state = check_flow_control_overload(state)
+
     new_state = deliver_event_impl(state, ref, event, sender_pid)
+
+    # Flow control: repay debt after processing
+    new_state = repay_action_cost(new_state, event)
     {:noreply, new_state}
   end
 
@@ -1433,6 +1443,44 @@ defmodule Absynthe.Core.Actor do
     if total_cost > 0 do
       # Directly increment debt (no loan tracking needed for aggregate debt)
       new_debt = account.debt + total_cost
+      new_account = %{account | debt: new_debt}
+
+      # Check if we should pause (debt exceeded high water mark)
+      new_account =
+        if not account.paused and new_debt >= account.high_water_mark do
+          :telemetry.execute(
+            [:absynthe, :flow_control, :account, :pause],
+            %{debt: new_debt, high_water: account.high_water_mark},
+            %{account_id: account.id}
+          )
+
+          paused_account = %{new_account | paused: true}
+
+          if account.pause_callback do
+            account.pause_callback.(paused_account)
+          end
+
+          paused_account
+        else
+          new_account
+        end
+
+      %{state | flow_control_account: new_account}
+    else
+      state
+    end
+  end
+
+  # Borrow from flow control account for an incoming event from another local actor
+  # This tracks receiver load for inter-actor communication
+  defp borrow_for_incoming_event(%{flow_control_account: nil} = state, _event), do: state
+
+  defp borrow_for_incoming_event(%{flow_control_account: account} = state, event) do
+    cost = action_cost(event)
+
+    if cost > 0 do
+      # Directly increment debt (no loan tracking needed for aggregate debt)
+      new_debt = account.debt + cost
       new_account = %{account | debt: new_debt}
 
       # Check if we should pause (debt exceeded high water mark)
