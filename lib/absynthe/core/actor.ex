@@ -1320,6 +1320,25 @@ defmodule Absynthe.Core.Actor do
   #
   # Foreign handles (from remote actors via relay or Actor.deliver) must pass
   # through unconditionally - we don't track them in outbound_assertions.
+  #
+  # ## Important Ordering Invariants
+  #
+  # Foreign handles that entities (e.g., dataspaces) create in their turns ARE
+  # tracked in outbound_assertions, but their actor_id differs from ours.
+  # This is safe because:
+  #
+  # 1. **Action-before-termination**: commit_turn processes ALL actions before
+  #    stop_inert_facets checks for termination, so foreign-handle asserts are
+  #    tracked and queued BEFORE any facet termination.
+  #
+  # 2. **FIFO mailbox**: Async deliveries via self-cast preserve order. Assert
+  #    is queued first, retract is queued after termination.
+  #
+  # 3. **Correct semantics**: Observers see assert then retract, which is the
+  #    correct syndicate behavior - the assertion existed and was retracted.
+  #
+  # The foreign handle's owner actor is responsible for its lifecycle and
+  # retract ordering on their end.
   @doc false
   defp assert_handle_alive?(%Event.Assert{handle: handle}, state) do
     # Only apply liveness check to handles we own (created by this actor)
