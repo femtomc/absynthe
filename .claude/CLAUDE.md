@@ -84,14 +84,41 @@ bd close absynthe-abc
 bd dep add absynthe-abc --depends-on absynthe-xyz
 bd blocked                 # Show blocked issues
 
-# Sync
-bd sync                    # Push/pull issues with remote
+# Sync (use --flush-only, see bug below)
+bd sync --flush-only       # Safe: export only, no import
 bd info                    # Show database info
 ```
 
 ### Issue ID Format
 
 Issues use prefix + hash format: `absynthe-abc`, `absynthe-xyz`
+
+### Known Bug: `bd sync` deletes newly created issues
+
+**Problem:** `bd sync` runs `git-history-backfill` during import which incorrectly
+deletes newly added issues, treating them as "recovered from history" and adding
+them to `deletions.jsonl`. This happens even when `--no-git-history` flag or
+config settings are used.
+
+**Workaround:** Use `--flush-only` instead of full sync:
+
+```bash
+# Safe sync workflow
+bd sync --flush-only       # Export only, no destructive import
+
+# If you need to import new issues from JSONL:
+bd import --ignore-deletions --no-git-history < .beads/issues.jsonl
+bd sync --flush-only
+```
+
+**Config settings (set but not honored by sync):**
+```bash
+bd config set sync.no_git_history true
+bd config set import.no_git_history true
+```
+
+This is a bug in beads v0.29.0 - the config keys exist but aren't passed through
+to the sync command's internal import.
 
 ## Architecture Overview
 
