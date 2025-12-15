@@ -414,14 +414,23 @@ defmodule Absynthe.Core.Actor do
       # Later, retract it
       :ok = Absynthe.Core.Actor.retract(actor, handle)
 
+  ## Options
+
+  - `:facet_id` - The facet to associate this assertion with (default: root facet).
+    When the specified facet terminates, the assertion is automatically retracted.
+    This enables fate-sharing between facets and their assertions.
+
   ## Returns
 
   - `{:ok, handle}` - Handle allocated and delivery enqueued
   - `{:error, :attenuation_rejected}` - Assertion blocked by ref attenuation
+  - `{:error, :facet_not_found}` - Specified facet_id does not exist
   """
-  @spec assert(GenServer.server(), Ref.t(), term()) :: {:ok, Handle.t()} | {:error, term()}
-  def assert(actor, ref, assertion) do
-    GenServer.call(actor, {:assert, ref, assertion})
+  @spec assert(GenServer.server(), Ref.t(), term(), keyword()) ::
+          {:ok, Handle.t()} | {:error, term()}
+  def assert(actor, ref, assertion, opts \\ []) do
+    facet_id = Keyword.get(opts, :facet_id)
+    GenServer.call(actor, {:assert, ref, assertion, facet_id})
   end
 
   @doc """
@@ -763,43 +772,53 @@ defmodule Absynthe.Core.Actor do
   end
 
   @impl GenServer
-  def handle_call({:assert, ref, assertion}, _from, state) do
-    # Check attenuation BEFORE tracking - reject if attenuation fails
-    attenuation = Ref.attenuation(ref)
+  def handle_call({:assert, ref, assertion, facet_id}, _from, state) do
+    # Determine which facet to track this assertion with
+    # If facet_id is nil, use root_facet_id (backwards compatible behavior)
+    # If facet_id is provided, verify it exists
+    target_facet_id = facet_id || state.root_facet_id
 
-    case Rewrite.apply_attenuation(assertion, attenuation || []) do
-      {:ok, rewritten_assertion} ->
-        # Generate a new handle for this assertion (namespaced by actor_id for global uniqueness)
-        handle = Handle.new(state.id, state.next_handle_id)
-        new_state = %{state | next_handle_id: state.next_handle_id + 1}
+    # Validate the target facet exists (unless it's the root facet)
+    if facet_id != nil and not Map.has_key?(state.facets, target_facet_id) do
+      {:reply, {:error, :facet_not_found}, state}
+    else
+      # Check attenuation BEFORE tracking - reject if attenuation fails
+      attenuation = Ref.attenuation(ref)
 
-        # Use the underlying ref (without attenuation) for delivery since we already applied it
-        # This prevents double-checking attenuation at deliver_event_impl
-        underlying_ref = Ref.without_attenuation(ref)
+      case Rewrite.apply_attenuation(assertion, attenuation || []) do
+        {:ok, rewritten_assertion} ->
+          # Generate a new handle for this assertion (namespaced by actor_id for global uniqueness)
+          handle = Handle.new(state.id, state.next_handle_id)
+          new_state = %{state | next_handle_id: state.next_handle_id + 1}
 
-        # Track the assertion handle with the root facet
-        # (client-initiated assertions don't have a specific facet context)
-        # Track with the underlying ref and REWRITTEN assertion for consistency
-        new_state =
-          track_assertion_handle(
-            new_state,
-            state.root_facet_id,
-            handle,
-            underlying_ref,
-            rewritten_assertion
-          )
+          # Use the underlying ref (without attenuation) for delivery since we already applied it
+          # This prevents double-checking attenuation at deliver_event_impl
+          underlying_ref = Ref.without_attenuation(ref)
 
-        # Create the assert event with rewritten assertion and underlying ref
-        event = Event.assert(underlying_ref, rewritten_assertion, handle)
+          # Track the assertion handle with the specified facet
+          # This enables fate-sharing: when the facet terminates, this assertion is retracted
+          # Track with the underlying ref and REWRITTEN assertion for consistency
+          new_state =
+            track_assertion_handle(
+              new_state,
+              target_facet_id,
+              handle,
+              underlying_ref,
+              rewritten_assertion
+            )
 
-        # Deliver asynchronously to align with documented behavior
-        # deliver_to_ref handles both local and remote delivery
-        new_state = deliver_to_ref(new_state, underlying_ref, event, :async)
+          # Create the assert event with rewritten assertion and underlying ref
+          event = Event.assert(underlying_ref, rewritten_assertion, handle)
 
-        {:reply, {:ok, handle}, new_state}
+          # Deliver asynchronously to align with documented behavior
+          # deliver_to_ref handles both local and remote delivery
+          new_state = deliver_to_ref(new_state, underlying_ref, event, :async)
 
-      :rejected ->
-        {:reply, {:error, :attenuation_rejected}, state}
+          {:reply, {:ok, handle}, new_state}
+
+        :rejected ->
+          {:reply, {:error, :attenuation_rejected}, state}
+      end
     end
   end
 

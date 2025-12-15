@@ -168,14 +168,14 @@ defmodule Absynthe.Integration.SAMInvariantsTest do
     )
   end
 
-  defp subscribe_observer(actor, dataspace_ref, pattern, observer_ref) do
+  defp subscribe_observer(actor, dataspace_ref, pattern, observer_ref, opts \\ []) do
     observe =
       Value.record(
         Value.symbol("Observe"),
         [pattern, {:embedded, observer_ref}]
       )
 
-    Actor.assert(actor, dataspace_ref, observe)
+    Actor.assert(actor, dataspace_ref, observe, opts)
   end
 
   describe "turn atomicity" do
@@ -671,7 +671,10 @@ defmodule Absynthe.Integration.SAMInvariantsTest do
 
       ephemeral_collector = %CountingCollector{}
       {:ok, ephemeral_collector_ref} = Actor.spawn_entity(actor, :ephemeral, ephemeral_collector)
-      {:ok, _} = subscribe_observer(actor, ds_ref, pattern, ephemeral_collector_ref)
+
+      # Associate the Observe assertion with the ephemeral facet so it's retracted on facet termination
+      {:ok, _} =
+        subscribe_observer(actor, ds_ref, pattern, ephemeral_collector_ref, facet_id: :ephemeral)
 
       Process.sleep(50)
 
@@ -747,16 +750,11 @@ defmodule Absynthe.Integration.SAMInvariantsTest do
         |> Map.values()
         |> Enum.map(fn observer -> observer.entity_ref.entity_id end)
 
-      # NOTE: This assertion documents a known bug (absynthe-0cc):
-      # Facet teardown does not retract assertions/Observe handles.
-      # When that bug is fixed, uncomment this assertion:
-      #
-      # refute ephemeral_entity_id in observer_targets,
-      #        "Ephemeral observer subscription should be retracted from dataspace after facet termination"
-      #
-      # For now, we verify the entity is cleaned up (which works) even though
-      # the observer subscription remains (a leak that should be fixed).
-      _ = observer_targets
+      # With the facet_id option on Actor.assert/4, the Observe assertion is now
+      # associated with the ephemeral facet, so when the facet terminates, the
+      # assertion is automatically retracted (fixing absynthe-0cc).
+      refute ephemeral_entity_id in observer_targets,
+             "Ephemeral observer subscription should be retracted from dataspace after facet termination"
 
       GenServer.stop(actor)
     end
