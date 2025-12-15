@@ -77,15 +77,19 @@ defmodule Absynthe.Core.Actor do
   3. **Message** - Send a one-shot, stateless message
   4. **Sync** - Establish a synchronization barrier
 
-  All event delivery is asynchronous via `handle_cast/2`. This includes:
+  Event delivery follows the syndicate-rs pattern: all delivery is asynchronous with
+  a liveness check at delivery time. This design provides:
 
-  - Events from external actors (always async)
-  - Events generated during turn commit (enqueued via self-cast)
-  - Facet teardown operations (sync for proper cleanup ordering)
+  - **Correct ordering**: Events are queued via self-cast (local) or GenServer.cast
+    (remote), ensuring FIFO ordering via the actor's mailbox
+  - **Liveness check**: Assert events are dropped if their handle was already retracted
+    (e.g., because the owning facet terminated). This prevents stale assertions from
+    arriving after their corresponding retractions.
+  - **Flow control**: All delivery paths apply borrow/repay accounting
 
-  Note: The client API functions `assert/3`, `retract/3`, and `update_assertion/4`
+  Note: The client API functions `assert/4`, `retract/3`, and `update_assertion/5`
   use `GenServer.call` to synchronously validate attenuation and track handles,
-  but the actual event delivery to the target entity is still asynchronous.
+  but the actual event delivery to entities is asynchronous with liveness checks.
   Functions `send_message/3` and `sync/3` are fully asynchronous.
 
   **Important**: Local turn-initiated actions are processed in subsequent turns,
@@ -827,11 +831,11 @@ defmodule Absynthe.Core.Actor do
           # Create the assert event with rewritten assertion and underlying ref
           event = Event.assert(underlying_ref, rewritten_assertion, handle)
 
-          # Deliver synchronously for local refs to ensure correct ordering relative to
-          # facet termination. For remote refs, deliver_to_ref still uses async via cast.
-          # This prevents a race condition where terminate_facet's sync retraction could
-          # arrive before an async assertion.
-          new_state = deliver_to_ref(new_state, underlying_ref, event, :sync)
+          # Deliver asynchronously. Ordering is preserved because both asserts and retracts
+          # use the same mailbox (via self-cast for local, cast for remote). A liveness
+          # check at delivery time drops Assert events if the handle was already retracted.
+          # This follows the syndicate-rs pattern: async delivery + liveness checks.
+          new_state = deliver_to_ref(new_state, underlying_ref, event, :async)
 
           {:reply, {:ok, handle}, new_state}
 
@@ -929,7 +933,7 @@ defmodule Absynthe.Core.Actor do
           # All validations passed - now perform the atomic update
 
           # Step 3a: Retract old assertion (if handle provided)
-          # Use sync delivery for local refs to ensure correct ordering
+          # Deliver asynchronously - ordering is preserved via mailbox FIFO
           {state, owning_facet_id} =
             case old_info do
               nil ->
@@ -938,7 +942,7 @@ defmodule Absynthe.Core.Actor do
               {handle, old_ref} ->
                 {new_state, owner_fid} = untrack_assertion_handle(state, handle)
                 event = Event.retract(old_ref, handle)
-                {deliver_to_ref(new_state, old_ref, event, :sync), owner_fid}
+                {deliver_to_ref(new_state, old_ref, event, :async), owner_fid}
             end
 
           # Step 3b: Assert new value (if provided)
@@ -974,9 +978,9 @@ defmodule Absynthe.Core.Actor do
                 )
 
               # Create and deliver the assert event
-              # Use sync delivery for local refs to ensure correct ordering
+              # Deliver asynchronously - liveness check at delivery time handles races
               event = Event.assert(underlying_ref, rewritten, new_handle)
-              state = deliver_to_ref(state, underlying_ref, event, :sync)
+              state = deliver_to_ref(state, underlying_ref, event, :async)
 
               {:reply, {:ok, new_handle}, state}
           end
@@ -1047,31 +1051,49 @@ defmodule Absynthe.Core.Actor do
     # Deliver the event - either locally or to remote actor
     # For local refs, we process directly with flow control tracking
     # For remote refs, we forward to the remote actor (which tracks its own load)
+    #
+    # LIVENESS CHECK (syndicate-rs pattern): For Assert events, check if the handle
+    # is still tracked in outbound_assertions. If not (facet terminated and retracted),
+    # drop the event - the entity will receive the retraction instead.
     new_state =
       case Ref.local?(ref, state.id) do
         true ->
-          # Local delivery - borrow debt, process, then repay
-          # This tracks load from external API calls
-          state = borrow_for_incoming_event(state, event)
-          state = check_flow_control_overload(state)
-          state = deliver_event_impl(state, ref, event, nil)
-          repay_action_cost(state, event)
+          # Liveness check for Assert events (syndicate-rs pattern)
+          if assert_handle_alive?(event, state) do
+            # Local delivery - borrow debt, process, then repay
+            # This tracks load from external API calls
+            state = borrow_for_incoming_event(state, event)
+            state = check_flow_control_overload(state)
+            state = deliver_event_impl(state, ref, event, nil)
+            repay_action_cost(state, event)
+          else
+            # Handle was retracted (facet terminated), drop this assert
+            Logger.debug("Dropping Assert for retracted handle (liveness check)")
+            state
+          end
 
         false ->
           # Remote delivery - forward to the remote actor
-          remote_actor_id = Ref.actor_id(ref)
+          # Apply same liveness check as local to prevent stale asserts reaching remotes
+          if assert_handle_alive?(event, state) do
+            remote_actor_id = Ref.actor_id(ref)
 
-          case resolve_actor(remote_actor_id) do
-            {:ok, actor_pid} ->
-              GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
-              state
+            case resolve_actor(remote_actor_id) do
+              {:ok, actor_pid} ->
+                GenServer.cast(actor_pid, {:deliver_from, ref, event, self()})
+                state
 
-            :error ->
-              Logger.warning(
-                "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
-              )
+              :error ->
+                Logger.warning(
+                  "Cannot deliver to remote actor #{inspect(remote_actor_id)}: not found"
+                )
 
-              state
+                state
+            end
+          else
+            # Handle was retracted, drop this assert (retract will reach remote)
+            Logger.debug("Dropping remote Assert for retracted handle (liveness check)")
+            state
           end
       end
 
@@ -1082,14 +1104,23 @@ defmodule Absynthe.Core.Actor do
   def handle_cast({:deliver_internal, ref, event}, state) do
     # Internal delivery from self-cast during commit_turn
     # We borrowed for these in borrow_for_actions, so we repay here
-    state = check_flow_control_overload(state)
+    #
+    # LIVENESS CHECK (syndicate-rs pattern): same as :deliver - drop Assert if handle retracted
+    new_state =
+      if assert_handle_alive?(event, state) do
+        state = check_flow_control_overload(state)
 
-    # Local delivery - process the event directly
-    state = deliver_event_impl(state, ref, event, nil)
+        # Local delivery - process the event directly
+        state = deliver_event_impl(state, ref, event, nil)
 
-    # Flow control: repay debt after turn completion
-    # This corresponds to the borrow done in commit_turn
-    new_state = repay_action_cost(state, event)
+        # Flow control: repay debt after turn completion
+        # This corresponds to the borrow done in commit_turn
+        repay_action_cost(state, event)
+      else
+        # Handle was retracted, drop this assert but still repay the borrowed debt
+        Logger.debug("Dropping internal Assert for retracted handle (liveness check)")
+        repay_action_cost(state, event)
+      end
 
     {:noreply, new_state}
   end
@@ -1249,6 +1280,9 @@ defmodule Absynthe.Core.Actor do
   end
 
   # Retract all handles owned by a facet
+  # Following syndicate-rs pattern: async delivery for all events.
+  # Ordering is preserved via mailbox FIFO - retracts queued after asserts
+  # will be processed after asserts.
   @doc false
   defp retract_facet_handles(state, facet_id) do
     handles = Map.get(state.facet_handles, facet_id, MapSet.new())
@@ -1256,11 +1290,14 @@ defmodule Absynthe.Core.Actor do
     Enum.reduce(handles, state, fn handle, acc_state ->
       case Map.fetch(acc_state.outbound_assertions, handle) do
         {:ok, {ref, _assertion}} ->
-          # Create and deliver the retract event
+          # Create and deliver the retract event asynchronously
           event = Event.retract(ref, handle)
-          acc_state = deliver_to_ref(acc_state, ref, event)
+          acc_state = deliver_to_ref(acc_state, ref, event, :async)
 
-          # Remove from outbound assertions
+          # Remove from outbound assertions after queuing the retract delivery.
+          # Since delivery is async (via cast), by the time any pending assert
+          # deliveries are processed, this removal will have taken effect.
+          # The liveness check in handle_cast sees the updated state.
           %{acc_state | outbound_assertions: Map.delete(acc_state.outbound_assertions, handle)}
 
         :error ->
@@ -1269,6 +1306,34 @@ defmodule Absynthe.Core.Actor do
       end
     end)
   end
+
+  # Liveness check for Assert events (syndicate-rs pattern)
+  #
+  # Returns true if the event should be delivered:
+  # - For Assert events with handles WE OWN: only if the handle is still tracked
+  # - For Assert events with FOREIGN handles (from remote actors): always true
+  # - For all other events (Retract, Message, Sync): always true
+  #
+  # This prevents delivering OUR Assert events for handles that have already been
+  # retracted (e.g., because the owning facet terminated). The entity will
+  # receive the Retract event instead, maintaining consistent state.
+  #
+  # Foreign handles (from remote actors via relay or Actor.deliver) must pass
+  # through unconditionally - we don't track them in outbound_assertions.
+  @doc false
+  defp assert_handle_alive?(%Event.Assert{handle: handle}, state) do
+    # Only apply liveness check to handles we own (created by this actor)
+    # Foreign handles from remote actors always pass through
+    if Handle.actor_id(handle) == state.id do
+      # Our handle - check if still tracked (not retracted)
+      Map.has_key?(state.outbound_assertions, handle)
+    else
+      # Foreign handle - always allow
+      true
+    end
+  end
+
+  defp assert_handle_alive?(_event, _state), do: true
 
   @doc false
   # sender_pid is nil for local deliveries, or the PID of the remote actor for remote deliveries
@@ -1799,21 +1864,32 @@ defmodule Absynthe.Core.Actor do
   end
 
   # Deliver an event to a target ref (local or remote)
-  # Used for internal operations like facet teardown that require synchronous local delivery
+  # NOTE: This 3-arg version defaults to :sync but is currently unused.
+  # All code paths now use explicit :async mode following the syndicate-rs pattern.
   defp deliver_to_ref(state, ref, event) do
     deliver_to_ref(state, ref, event, :sync)
   end
 
   # Deliver an event to a target ref with specified mode
-  # - mode: :sync for synchronous local delivery (teardown), :async for async (client ops)
+  #
+  # Following the syndicate-rs pattern, all delivery is now asynchronous:
+  # - :async mode queues events via self-cast for local refs, GenServer.cast for remote
+  # - :sync mode is kept for backwards compatibility but currently unused
+  #
+  # The async pattern ensures ordering via mailbox FIFO, with a liveness check
+  # at delivery time that drops Assert events if their handle was already retracted.
   defp deliver_to_ref(state, ref, event, mode) do
     case Ref.local?(ref, state.id) do
       true ->
         case mode do
           :sync ->
-            # Synchronous local delivery for internal operations (facet teardown)
+            # Synchronous local delivery - currently unused, kept for backwards compat
+            # Apply flow control hooks to maintain proper accounting
+            state = borrow_for_incoming_event(state, event)
+            state = check_flow_control_overload(state)
             # nil sender_pid - we own these assertions, no crash tracking needed
-            deliver_event_impl(state, ref, event, nil)
+            state = deliver_event_impl(state, ref, event, nil)
+            repay_action_cost(state, event)
 
           :async ->
             # Async local delivery for client-initiated operations
