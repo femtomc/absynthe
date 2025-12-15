@@ -282,7 +282,22 @@ defmodule Absynthe.Dataflow.Field do
   end
 
   defp find_and_reassign_fields(list, new_owner_pid) when is_list(list) do
-    Enum.each(list, fn elem -> find_and_reassign_fields(elem, new_owner_pid) end)
+    # Manually traverse to handle improper lists (e.g., from :rand.state())
+    # Enum.each crashes on improper lists like [a | b] where b is not a list
+    traverse_list(list, new_owner_pid)
+  end
+
+  defp traverse_list([], _new_owner_pid), do: :ok
+
+  defp traverse_list([head | tail], new_owner_pid) do
+    find_and_reassign_fields(head, new_owner_pid)
+
+    if is_list(tail) do
+      traverse_list(tail, new_owner_pid)
+    else
+      # Improper list tail - recurse into it as a value
+      find_and_reassign_fields(tail, new_owner_pid)
+    end
   end
 
   defp find_and_reassign_fields(tuple, new_owner_pid) when is_tuple(tuple) do
