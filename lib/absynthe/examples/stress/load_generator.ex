@@ -205,10 +205,26 @@ defmodule Absynthe.Examples.Stress.LoadGenerator do
 
   @impl GenServer
   def handle_call(:results, _from, state) do
-    # Collect trader stats
+    # Collect trader stats from the actual Actor state (not the stale copies in state.traders)
+    # The entities in state.traders are the initial copies at spawn time, but the Actor's
+    # entities map contains the updated versions after on_message callbacks
+    alias Absynthe.Core.Ref
+
+    actor_state = :sys.get_state(state.actor_pid)
+
     trader_stats =
       Enum.map(state.traders, fn {id, trader_state} ->
-        {id, Trader.stats(trader_state.entity)}
+        entity_id = Ref.entity_id(trader_state.ref)
+
+        # Get the actual entity from the Actor's state
+        case Map.get(actor_state.entities, entity_id) do
+          {_facet_id, actual_entity} ->
+            {id, Trader.stats(actual_entity)}
+
+          nil ->
+            # Fallback to the stale copy if entity not found (shouldn't happen)
+            {id, Trader.stats(trader_state.entity)}
+        end
       end)
       |> Map.new()
 
@@ -251,6 +267,8 @@ defmodule Absynthe.Examples.Stress.LoadGenerator do
   # Internal implementation
 
   defp spawn_traders(state) do
+    alias Absynthe.Preserves.Value
+
     # Use reduce to properly thread the rand_state through iterations
     {traders, rand_state} =
       Enum.reduce(1..state.clients, {%{}, state.rand_state}, fn i, {acc, rs} ->
@@ -269,6 +287,43 @@ defmodule Absynthe.Examples.Stress.LoadGenerator do
 
         # Spawn in the actor
         {:ok, ref} = Actor.spawn_entity(state.actor_pid, :root, trader)
+
+        # Subscribe trader to Fill messages for all symbols they trade
+        # Traders need to receive fills to update their order state
+        Enum.each(state.symbols, fn symbol ->
+          fill_pattern =
+            Value.record(
+              Value.symbol("Fill"),
+              [
+                # fill_id - any
+                {:symbol, "_"},
+                # order_id - any
+                {:symbol, "_"},
+                # symbol - must match
+                Value.symbol(symbol),
+                # side - any
+                {:symbol, "_"},
+                # price - any
+                {:symbol, "_"},
+                # qty - any
+                {:symbol, "_"},
+                # counterparty - any
+                {:symbol, "_"},
+                # timestamp - any
+                {:symbol, "_"},
+                # seq - any
+                {:symbol, "_"}
+              ]
+            )
+
+          observe_assertion =
+            Value.record(
+              Value.symbol("Observe"),
+              [fill_pattern, {:embedded, ref}]
+            )
+
+          {:ok, _} = Actor.assert(state.actor_pid, state.dataspace_ref, observe_assertion)
+        end)
 
         {Map.put(acc, trader_id, %{ref: ref, entity: trader}), rs}
       end)
@@ -302,6 +357,10 @@ defmodule Absynthe.Examples.Stress.LoadGenerator do
     elapsed = System.monotonic_time(:millisecond) - state.start_time
 
     case state.profile do
+      :quick ->
+        # Quick test: similar to steady but smaller
+        max(1, div(state.clients, 2))
+
       :steady ->
         # Steady state: 5 orders/sec/client = 0.5 orders/100ms tick per client
         # Total = 0.5 * clients
