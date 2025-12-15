@@ -19,6 +19,14 @@ defmodule StressRunner do
   """
 
   @profiles %{
+    quick: %{
+      name: "Quick Test",
+      clients: 5,
+      symbols: ["BTC-USD"],
+      duration: 5_000,
+      warmup: 1_000,
+      seed: 42
+    },
     steady: %{
       name: "Steady State",
       clients: 10,
@@ -174,16 +182,18 @@ defmodule StressRunner do
   end
 
   defp spawn_market_entities(broker, dataspace_ref, symbols) do
+    alias Absynthe.Preserves.Value
+
     Enum.each(symbols, fn symbol ->
-      # OrderBook
+      # OrderBook - observes Order assertions for this symbol
       order_book = OrderBook.new(symbol)
-      {:ok, _} = Actor.spawn_entity(broker, :root, order_book)
+      {:ok, order_book_ref} = Actor.spawn_entity(broker, :root, order_book)
 
-      # Matcher
+      # Matcher - observes Order assertions for this symbol
       matcher = Matcher.new(symbol, dataspace_ref)
-      {:ok, _} = Actor.spawn_entity(broker, :root, matcher)
+      {:ok, matcher_ref} = Actor.spawn_entity(broker, :root, matcher)
 
-      # History
+      # History - observes Fill messages for this symbol
       history =
         History.new(
           symbol: symbol,
@@ -192,16 +202,87 @@ defmodule StressRunner do
           max_trades: 1000
         )
 
-      {:ok, _} = Actor.spawn_entity(broker, :root, history)
+      {:ok, history_ref} = Actor.spawn_entity(broker, :root, history)
 
-      # Analytics
+      # Analytics - observes Order assertions AND Fill messages for this symbol
       analytics =
         Analytics.new(symbol,
           dataspace_ref: dataspace_ref,
           assert_stats: true
         )
 
-      {:ok, _} = Actor.spawn_entity(broker, :root, analytics)
+      {:ok, analytics_ref} = Actor.spawn_entity(broker, :root, analytics)
+
+      # Create Observe assertions to wire up dataspace routing
+      # Pattern for Order assertions matching this symbol:
+      # <Order id symbol side price qty trader seq>
+      # We use wildcards for all fields except symbol which must match
+      order_pattern =
+        Value.record(
+          Value.symbol("Order"),
+          [
+            {:symbol, "_"},           # id - any
+            Value.symbol(symbol),     # symbol - must match
+            {:symbol, "_"},           # side - any
+            {:symbol, "_"},           # price - any
+            {:symbol, "_"},           # qty - any
+            {:symbol, "_"},           # trader - any
+            {:symbol, "_"}            # seq - any
+          ]
+        )
+
+      # Pattern for Fill messages matching this symbol:
+      # <Fill fill_id order_id symbol side price qty counterparty timestamp seq>
+      fill_pattern =
+        Value.record(
+          Value.symbol("Fill"),
+          [
+            {:symbol, "_"},           # fill_id - any
+            {:symbol, "_"},           # order_id - any
+            Value.symbol(symbol),     # symbol - must match
+            {:symbol, "_"},           # side - any
+            {:symbol, "_"},           # price - any
+            {:symbol, "_"},           # qty - any
+            {:symbol, "_"},           # counterparty - any
+            {:symbol, "_"},           # timestamp - any
+            {:symbol, "_"}            # seq - any
+          ]
+        )
+
+      # Subscribe OrderBook to Order assertions
+      order_book_observe = Value.record(
+        Value.symbol("Observe"),
+        [order_pattern, {:embedded, order_book_ref}]
+      )
+      {:ok, _} = Actor.assert(broker, dataspace_ref, order_book_observe)
+
+      # Subscribe Matcher to Order assertions
+      matcher_observe = Value.record(
+        Value.symbol("Observe"),
+        [order_pattern, {:embedded, matcher_ref}]
+      )
+      {:ok, _} = Actor.assert(broker, dataspace_ref, matcher_observe)
+
+      # Subscribe Analytics to Order assertions
+      analytics_order_observe = Value.record(
+        Value.symbol("Observe"),
+        [order_pattern, {:embedded, analytics_ref}]
+      )
+      {:ok, _} = Actor.assert(broker, dataspace_ref, analytics_order_observe)
+
+      # Subscribe History to Fill messages
+      history_fill_observe = Value.record(
+        Value.symbol("Observe"),
+        [fill_pattern, {:embedded, history_ref}]
+      )
+      {:ok, _} = Actor.assert(broker, dataspace_ref, history_fill_observe)
+
+      # Subscribe Analytics to Fill messages
+      analytics_fill_observe = Value.record(
+        Value.symbol("Observe"),
+        [fill_pattern, {:embedded, analytics_ref}]
+      )
+      {:ok, _} = Actor.assert(broker, dataspace_ref, analytics_fill_observe)
     end)
   end
 
@@ -235,6 +316,24 @@ defmodule StressRunner do
     Logger.info("  Pause events: #{report.flow_control.pause_events}")
     Logger.info("  Resume events: #{report.flow_control.resume_events}")
     Logger.info("  Max debt: #{report.flow_control.max_debt}")
+
+    # Aggregate trader stats
+    trader_filled =
+      gen_results.trader_stats
+      |> Map.values()
+      |> Enum.map(& &1.orders_filled)
+      |> Enum.sum()
+
+    trader_volume =
+      gen_results.trader_stats
+      |> Map.values()
+      |> Enum.map(& &1.total_volume)
+      |> Enum.sum()
+
+    Logger.info("")
+    Logger.info("Trader Stats:")
+    Logger.info("  Total orders filled: #{trader_filled}")
+    Logger.info("  Total volume traded: #{trader_volume}")
 
     Logger.info("")
 
