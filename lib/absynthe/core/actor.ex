@@ -262,6 +262,30 @@ defmodule Absynthe.Core.Actor do
   - `:id` - The actor's unique identifier (defaults to self())
   - `:name` - Optional registered name for the GenServer
   - `:root_facet_id` - ID for the root facet (defaults to :root)
+  - `:flow_control` - Per-actor flow control instrumentation (see Flow Control below)
+
+  ## Flow Control
+
+  Flow control provides instrumentation for monitoring internal event cascades.
+  When enabled, each action (assert, retract, message, etc.) incurs a "debt" that
+  is repaid when the event is processed.
+
+  **Note**: Flow control tracks debt and emits telemetry but does not automatically
+  throttle or block event processing. To implement actual backpressure, use the
+  `pause_callback` and `resume_callback` options to integrate with your own
+  throttling mechanism (e.g., pausing socket reads in relays).
+
+  Options:
+
+  - `false` or omitted - No flow control (default)
+  - `true` - Enable with default settings (limit: 1000)
+  - `[limit: n, ...]` - Custom configuration passed to `Absynthe.FlowControl.Account.new/1`
+
+  When debt exceeds the high water mark, the account enters a "paused" state and
+  emits telemetry events on `[:absynthe, :flow_control, :account, :pause]` and
+  `[:absynthe, :flow_control, :actor, :overload]`. When debt falls below the low
+  water mark, a resume event is emitted on `[:absynthe, :flow_control, :account, :resume]`.
+  Use `flow_control_stats/1` to inspect the current state.
 
   ## Examples
 
@@ -272,6 +296,18 @@ defmodule Absynthe.Core.Actor do
       {:ok, actor} = Absynthe.Core.Actor.start_link(
         id: :my_actor,
         name: MyApp.MyActor
+      )
+
+      # Start with default flow control
+      {:ok, actor} = Absynthe.Core.Actor.start_link(
+        id: :my_actor,
+        flow_control: true
+      )
+
+      # Start with custom flow control settings
+      {:ok, actor} = Absynthe.Core.Actor.start_link(
+        id: :my_actor,
+        flow_control: [limit: 500, high_water_mark: 400, low_water_mark: 100]
       )
 
   ## Returns
