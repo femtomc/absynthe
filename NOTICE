@@ -1,0 +1,24 @@
+absynthe
+Copyright 2024 McCoy R. Becker (femtomc)
+
+This project implements the Syndicated Actor Model for Elixir, inspired by:
+
+- Syndicate (https://syndicate-lang.org/)
+  Copyright Tony Garnock-Jones
+  The original Syndicated Actor Model design and semantics.
+
+- syndicate-rs (https://git.syndicate-lang.org/syndicate-lang/syndicate-rs)
+  Copyright Tony Garnock-Jones
+  Apache License 2.0
+  Rust implementation of Syndicate.
+
+- Synit (https://synit.org/)
+  Copyright Tony Garnock-Jones
+  Documentation and conceptual guidance for Syndicate concepts.
+
+- Preserves (https://preserves.gitlab.io/preserves/)
+  Copyright Tony Garnock-Jones
+  Data format specification used for structured data representation.
+
+This is a clean-room Elixir implementation based on published specifications
+and research. No code from the above projects is directly incorporated.

@@ -211,4 +211,4 @@ Field.get(sum) # => 13
 
 ## License
 
-MIT License – see `LICENSE`.
+Apache 2.0 - See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
