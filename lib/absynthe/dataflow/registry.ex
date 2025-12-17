@@ -58,8 +58,12 @@ defmodule Absynthe.Dataflow.Registry do
   use GenServer
   require Logger
 
+  alias Absynthe.Dataflow.Field
+
   @fields_table __MODULE__.Fields
   @owners_table __MODULE__.Owners
+
+  @type field_id :: term()
 
   # Client API
 
@@ -74,6 +78,7 @@ defmodule Absynthe.Dataflow.Registry do
         {Absynthe.Dataflow.Registry, []}
       ]
   """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
       id: __MODULE__,
@@ -87,6 +92,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Starts the registry.
   """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -94,6 +100,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Ensures the registry is started and tables exist. Idempotent.
   """
+  @spec ensure_started() :: :ok
   def ensure_started do
     # Simple approach: just try to start, handle all error cases
     case start_link() do
@@ -106,6 +113,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Stores or updates a field in the registry.
   """
+  @spec put_field(Field.t(), pid()) :: Field.t()
   def put_field(field, owner_pid \\ self()) do
     with_retry(
       fn ->
@@ -120,6 +128,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Retrieves a field by ID.
   """
+  @spec get_field(field_id()) :: Field.t() | nil
   def get_field(field_id) do
     with_retry(
       fn ->
@@ -138,6 +147,7 @@ defmodule Absynthe.Dataflow.Registry do
   Uses `:ets.select_replace` for atomic read-modify-write.
   Returns the updated field or nil if not found.
   """
+  @spec update_field(field_id(), (Field.t() -> Field.t())) :: Field.t() | nil
   def update_field(field_id, update_fn) when is_function(update_fn, 1) do
     with_retry(
       fn ->
@@ -161,6 +171,7 @@ defmodule Absynthe.Dataflow.Registry do
   This is more efficient than update_field for simple attribute changes.
   Returns true if update succeeded, false if field not found.
   """
+  @spec update_field_attrs(field_id(), keyword()) :: boolean()
   def update_field_attrs(field_id, updates) when is_list(updates) do
     with_retry(
       fn ->
@@ -185,6 +196,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Cleans up all fields owned by the specified process.
   """
+  @spec cleanup(pid()) :: :ok
   def cleanup(owner_pid \\ self()) do
     with_retry(
       fn ->
@@ -207,6 +219,7 @@ defmodule Absynthe.Dataflow.Registry do
 
   This is used when reassigning ownership to a different process.
   """
+  @spec remove_ownership(field_id()) :: :ok
   def remove_ownership(field_id) do
     with_retry(
       fn ->
@@ -228,6 +241,7 @@ defmodule Absynthe.Dataflow.Registry do
 
   Associates the field with the specified owner process for cleanup tracking.
   """
+  @spec add_ownership(field_id(), pid()) :: :ok
   def add_ownership(field_id, owner_pid) do
     with_retry(
       fn ->
@@ -241,6 +255,7 @@ defmodule Absynthe.Dataflow.Registry do
   @doc """
   Returns all field IDs (for debugging/testing).
   """
+  @spec all_field_ids() :: [field_id()]
   def all_field_ids do
     with_retry(
       fn ->

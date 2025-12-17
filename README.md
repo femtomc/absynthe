@@ -13,8 +13,11 @@ Syndicated Actor Model (SAM) for Elixir. `absynthe` follows Tony Garnock-Jones' 
 ## Project status
 
 - Experimental/alpha; APIs may change.
-- Single-node only; dataspaces are local entities, no distribution or persistence yet.
+- Single-node focus: dataspaces are local entities, no persistence yet.
+- Network relay support (Syndicate protocol) is available but experimental—see `lib/absynthe/relay/` for broker, client, and Noise transport.
 - Best for learning/experimentation with SAM concepts; see `test/` and `examples/` for coverage of current behavior.
+
+**Note on delivery semantics:** All event delivery (assertions, messages) is asynchronous. The API calls (`assert_to`, `send_to`, etc.) enqueue events and return immediately; effects are not visible until the target actor processes them from its mailbox.
 
 ## Syndicate primer (concepts & mapping)
 

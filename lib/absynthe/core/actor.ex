@@ -462,14 +462,16 @@ defmodule Absynthe.Core.Actor do
 
   ## Returns
 
-  - `{:ok, handle}` - Handle allocated and delivery completed (local) or enqueued (remote)
+  - `{:ok, handle}` - Handle allocated and delivery enqueued
   - `{:error, :attenuation_rejected}` - Assertion blocked by ref attenuation
   - `{:error, :facet_not_found}` - Specified facet_id does not exist
 
   ## Delivery Semantics
 
-  For local refs (same actor), delivery is synchronous to ensure correct ordering
-  relative to facet termination. For remote refs, delivery is asynchronous via cast.
+  All delivery is asynchronous, following the syndicate-rs pattern. For local refs,
+  events are enqueued via self-cast to the actor's mailbox. For remote refs, events
+  are sent via GenServer.cast. This ensures shallow call stacks and fair scheduling
+  during observer fan-out. Ordering is preserved via mailbox FIFO semantics.
   """
   @spec assert(GenServer.server(), Ref.t(), term(), keyword()) ::
           {:ok, Handle.t()} | {:error, term()}
@@ -517,8 +519,8 @@ defmodule Absynthe.Core.Actor do
   When the old handle is `nil` or no new assertion is provided, this becomes a simple
   assert or retract operation respectively.
 
-  This function blocks the caller to validate attenuation and manage handles atomically.
-  For local refs, delivery is synchronous. For remote refs, delivery is asynchronous via cast.
+  This function blocks the caller to validate attenuation and manage handles atomically,
+  but the actual event delivery to target entities is asynchronous (see `assert/4` for details).
 
   ## Parameters
 
@@ -549,7 +551,7 @@ defmodule Absynthe.Core.Actor do
 
   ## Returns
 
-  - `{:ok, handle}` - New handle allocated and delivery completed (local) or enqueued (remote)
+  - `{:ok, handle}` - New handle allocated and delivery enqueued
   - `:ok` - Only retraction performed (no new assertion)
   - `{:error, :attenuation_rejected}` - New assertion rejected by ref attenuation
   - `{:error, :not_found}` - Old handle not found (already retracted?)

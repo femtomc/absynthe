@@ -2,6 +2,17 @@ defprotocol Absynthe.Core.Entity do
   @moduledoc """
   Protocol defining how entities respond to events in the Syndicated Actor Model.
 
+  ## Type Specifications
+
+  All callbacks return `{updated_entity, updated_turn}`:
+
+      @type entity :: t()
+      @type assertion :: Absynthe.Preserves.Value.t()
+      @type handle :: Absynthe.Assertions.Handle.t()
+      @type turn :: Absynthe.Core.Turn.t()
+      @type ref :: Absynthe.Core.Ref.t()
+      @type callback_result :: {t(), turn()}
+
   ## Overview
 
   An Entity in the Syndicated Actor Model is any data structure that can respond to
@@ -118,6 +129,8 @@ defprotocol Absynthe.Core.Entity do
         {new_entity, turn}
       end
   """
+  @spec on_publish(t(), term(), Absynthe.Assertions.Handle.t(), Absynthe.Core.Turn.t()) ::
+          {t(), Absynthe.Core.Turn.t()}
   def on_publish(entity, assertion, handle, turn)
 
   @doc """
@@ -140,6 +153,8 @@ defprotocol Absynthe.Core.Entity do
         {new_entity, turn}
       end
   """
+  @spec on_retract(t(), Absynthe.Assertions.Handle.t(), Absynthe.Core.Turn.t()) ::
+          {t(), Absynthe.Core.Turn.t()}
   def on_retract(entity, handle, turn)
 
   @doc """
@@ -165,6 +180,7 @@ defprotocol Absynthe.Core.Entity do
         {%{entity | running: false}, turn}
       end
   """
+  @spec on_message(t(), term(), Absynthe.Core.Turn.t()) :: {t(), Absynthe.Core.Turn.t()}
   def on_message(entity, message, turn)
 
   @doc """
@@ -200,6 +216,8 @@ defprotocol Absynthe.Core.Entity do
         {entity, turn}
       end
   """
+  @spec on_sync(t(), Absynthe.Core.Ref.t(), Absynthe.Core.Turn.t()) ::
+          {t(), Absynthe.Core.Turn.t()}
   def on_sync(entity, peer_ref, turn)
 end
 

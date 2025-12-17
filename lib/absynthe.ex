@@ -43,7 +43,9 @@ defmodule Absynthe do
 
   ## Modules
 
-  - `Absynthe.Preserves` - Data serialization format
+  - `Absynthe.Preserves.Value` - Preserves data values and type guards
+  - `Absynthe.Preserves.Encoder.Binary` / `Text` - Serialization
+  - `Absynthe.Preserves.Decoder.Binary` / `Text` - Deserialization
   - `Absynthe.Core.Actor` - Actor process implementation
   - `Absynthe.Core.Turn` - Transaction handling
   - `Absynthe.Core.Facet` - Conversational scopes
