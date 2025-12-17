@@ -26,55 +26,21 @@ You are working on the absynthe project. Follow this workflow:
 When you believe the implementation is complete:
 
 1. Run `mix compile` and `mix test` one final time
-2. Track which files you modified during implementation
-3. Request a Codex review by running:
+2. Run the triple review script:
    ```bash
-   codex exec --dangerously-bypass-approvals-and-sandbox 'You are reviewing code changes for issue <issue-id>: "<issue title>".
-
-   Files modified:
-   - path/to/file1.ex
-   - path/to/file2.ex
-
-   Your task:
-   1. Run `git diff HEAD~1` to see the changes
-   2. Read the modified files to understand the full context
-   3. Be critical and thorough in your review:
-      - Look for bugs, logic errors, and incorrect assumptions
-      - Question whether the approach is correct for the problem domain
-      - Identify missing edge cases in tests (boundary conditions, error paths, concurrency)
-      - Check for performance issues (unnecessary allocations, N+2 queries, inefficient algorithms)
-      - Verify consistency with existing patterns in the codebase
-      - Point out any untested code paths or missing test coverage
-      - Challenge if the implementation matches specifications/semantics
-      - Look for potential race conditions or process interaction issues
-   4. Write your review summary to the issue:
-      - If you find issues: `bd comment <issue-id> "REVIEW: [issues found]\n\n<your detailed review>"`
-      - If no issues: `bd comment <issue-id> "REVIEW: LGTM\n\n<brief summary of what was reviewed>"`'
+   ./scripts/triple-review.sh <issue-id>
    ```
 
-   **Key principle**: Encourage Codex to be **skeptical and critical**, not just verify correctness.
+   This script automatically:
+   - Detects modified files from git
+   - Fetches the issue title
+   - Spawns Codex, Gemini, and Claude reviewers in parallel
+   - Waits for all three to complete
+   - Shows all review comments
 
-   **Good example** (encourages critical thinking):
-   ```bash
-   codex exec --dangerously-bypass-approvals-and-sandbox 'You are reviewing code changes for issue absynthe-xyz: "Fix set pattern matching".
-
-   Files modified:
-   - lib/absynthe/dataspace/pattern.ex
-   - test/absynthe/dataspace/pattern_test.exs
-
-   Be especially critical about:
-   - Is using sorted order correct for unordered sets?
-   - Are we missing size mismatch checks?
-   - What happens with nested sets or duplicate elements?
-   - Is sorting on every extraction a performance issue?
-
-   Write your findings to the issue with `bd comment absynthe-xyz "REVIEW: ..."`'
-   ```
-
-4. Check the review:
-   - Run `bd show <issue-id>` to see the review comment
-   - If review finds **issues**: Address the feedback and repeat Phase 3
-   - If review says **LGTM**: Proceed to Phase 4
+3. Review the results:
+   - If **any** reviewer requested changes: Address the feedback and re-run the script
+   - If **all three** say LGTM: Proceed to Phase 4
 
 ## Phase 4: Close and Complete
 
@@ -90,7 +56,10 @@ When you believe the implementation is complete:
 ## Important Rules
 
 - Work on ONE issue at a time
-- Do not skip the review cycle
+- **Do not skip the review cycle**. **DO NOT do the review yourself**.
+- ALWAYS let **all three** reviewers (Codex, Gemini, Claude) finish their reviews
+- Seriously, ALWAYS let all three reviewers finish before proceeding
+- All three reviews must pass (LGTM) before closing an issue
 - If you get stuck, add a comment with `bd comment <issue-id> "description of blocker"` and stop
 - If tests fail repeatedly, investigate the root cause before continuing
 - Always run `mix format` before requesting review
