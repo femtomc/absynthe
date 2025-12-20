@@ -2,6 +2,8 @@
 
 This document sketches how to add a network-facing Syndicate broker/relay to Absynthe, mirroring the shape of `syndicate-rs` while fitting OTP/Elixir. It is meant to guide the milestone issues and give reviewers a single source for scope and non-goals.
 
+Note: `lib/absynthe/relay` already contains an experimental broker/relay and client. This document describes the intended shape and remaining work.
+
 ## Goals
 - Enable remote peers to exchange asserts/retracts/messages/syncs with a local dataspace via the Syndicate protocol.
 - Support both TCP and Unix domain sockets so local clients can use low-latency sockets and remote nodes can traverse networks.
@@ -71,4 +73,3 @@ This document sketches how to add a network-facing Syndicate broker/relay to Abs
 2. **Transports & config**: add TCP and Unix listeners, CLI/config wiring, supervised accept loops, idle timeouts, and service assertions in the broker dataspace.
 3. **Gatekeeper & sturdy refs**: validate/mint sturdy refs, resolve to live refs for relay imports, and optionally stage Noise handshake. Include a cross-node auth example.
 4. **Observability & examples**: telemetry/logging, debt reporter hooks, and runnable examples (cross-node ping/pong, presence) plus docs.
-

@@ -67,6 +67,7 @@ defmodule Absynthe.Core.Actor do
   - Is associated with exactly one facet (its parent)
   - Implements the `Absynthe.Core.Entity` protocol
   - Can be referenced via `Absynthe.Core.Ref` structs
+  - Is a plain struct stored in actor state (not a separate process)
 
   ## Event Delivery
 

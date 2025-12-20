@@ -17,16 +17,16 @@ Syndicated Actor Model (SAM) for Elixir. `absynthe` follows Tony Garnock-Jones' 
 - Network relay support (Syndicate protocol) is available but experimental—see `lib/absynthe/relay/` for broker, client, and Noise transport.
 - Best for learning/experimentation with SAM concepts; see `test/` and `examples/` for coverage of current behavior.
 
-**Note on delivery semantics:** All event delivery (assertions, messages) is asynchronous. The API calls (`assert_to`, `send_to`, etc.) enqueue events and return immediately; effects are not visible until the target actor processes them from its mailbox.
+**Note on delivery semantics:** All event delivery (assertions, messages) is asynchronous. The API calls (`assert_to`, `send_to`, etc.) enqueue events and return immediately; effects are not visible until the target actor processes them from its mailbox. Turns still commit atomically, but their actions are delivered in subsequent turns.
 
 ## Syndicate primer (concepts & mapping)
 
 - `Actor` (GenServer) hosts entities and processes events inside *turns*.
-- `Entity` implements `Absynthe.Core.Entity` callbacks: `on_message/3`, `on_publish/4`, `on_retract/3`, `on_sync/3`.
+- `Entity` implements `Absynthe.Core.Entity` callbacks: `on_message/3`, `on_publish/4`, `on_retract/3`, `on_sync/3`. Entities are plain structs stored inside the actor (not processes).
 - `Assertion` is a persistent fact; identified by a `Absynthe.Assertions.Handle`. Assertions remain until fully retracted.
 - `Dataspace` routes assertions to observers. Subscriptions are `Observe` assertions with a pattern and an observer `Ref`.
 - `Facet` is a conversational scope; create via `Absynthe.create_facet/3`, terminate via `Absynthe.terminate_facet/2` (fate-sharing).
-- `Turn` is the atomic unit of execution; handlers add actions and the actor commits or discards them together.
+- `Turn` is the atomic unit of execution; handlers add actions and the actor commits or discards them together. Committed actions are delivered asynchronously in later turns.
 - `Preserves` is the data model: tagged tuples with records, sets, sequences, and embedded refs. Patterns use `wildcard/0` and `capture/1`.
 
 ## Installation
@@ -135,6 +135,17 @@ end
 ```
 
 From outside an actor, use the high-level API (`assert_to/3`, `retract_from/2`, `send_to/3`) and keep the returned handles if you need to retract later.
+
+## Idioms and patterns
+
+- Keep assertion handles in entity state; retractions require the handle returned from `assert_to/3` or `assert_value/3`.
+- Subscriptions are assertions: `Observe` is asserted to the dataspace; keep the Observe handle to unsubscribe.
+- Use facets to scope lifetimes (per session, agent, tool). When a facet terminates, all entities and assertions it owns are cleaned up (fate-sharing).
+- Use messages for request/response by including a reply `Ref` in the message; replies are just messages.
+- Keep turns small and deterministic; offload long work to Tasks and send results back as messages.
+- Use `Ref.attenuate/2` and `Absynthe.Core.Caveat` to enforce capability boundaries for tools/agents.
+
+See `docs/idioms.md` for a more complete guide with examples.
 
 ## Patterns and Observe assertions
 

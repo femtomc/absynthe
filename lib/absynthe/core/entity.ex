@@ -20,6 +20,10 @@ defprotocol Absynthe.Core.Entity do
   implement application logic by reacting to changes in shared state (assertions)
   and messages.
 
+  Entities are plain structs stored in an actor's state. They are not separate
+  processes; the actor executes entity callbacks sequentially in its GenServer
+  loop. Offload long-running work to Tasks and send results back as messages.
+
   ## Entity Lifecycle
 
   Entities participate in the dataspace through four types of events:
@@ -52,7 +56,8 @@ defprotocol Absynthe.Core.Entity do
   - Creating subscriptions
 
   The Turn ensures that all effects are properly sequenced and that the system
-  maintains consistency.
+  maintains consistency. Actions are enqueued and delivered asynchronously after
+  the turn commits, so callbacks should not expect immediate effects.
 
   ## Implementing the Protocol
 

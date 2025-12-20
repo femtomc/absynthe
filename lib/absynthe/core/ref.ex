@@ -44,11 +44,13 @@ defmodule Absynthe.Core.Ref do
   dataspace when establishing subscriptions. Users interact with refs
   primarily by passing them to message-sending and assertion functions:
 
+      {:ok, actor} = Absynthe.start_actor(id: :client)
+
       # Send a message to an entity
-      Absynthe.Core.Actor.send_message(ref, {:ping, self()})
+      Absynthe.send_to(actor, ref, {:ping, self()})
 
       # Assert a fact about an entity
-      Absynthe.Core.Actor.assert(ref, {:status, :online})
+      {:ok, _handle} = Absynthe.assert_to(actor, ref, {:status, :online})
 
   ## Capability Attenuation
 

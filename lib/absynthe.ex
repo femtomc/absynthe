@@ -10,6 +10,7 @@ defmodule Absynthe do
   ### Actors
   Actors are independent concurrent processes that communicate through assertions
   and messages. Each actor maintains its own state and executes turns atomically.
+  Entities are plain structs stored inside the actor; callbacks run in the actor process.
 
   ### Assertions
   Assertions are claims that actors make about the world. Unlike messages, assertions
@@ -24,6 +25,7 @@ defmodule Absynthe do
   ### Turns
   Turns are atomic transaction units. All changes within a turn either commit
   together or are discarded. This provides strong consistency guarantees.
+  Committed actions are delivered asynchronously in subsequent turns.
 
   ### Facets
   Facets represent conversational contexts within an actor. They provide scoping
@@ -40,6 +42,10 @@ defmodule Absynthe do
 
       # Create a dataspace
       dataspace = Absynthe.new_dataspace()
+
+      # Start an actor and host the dataspace
+      {:ok, actor} = Absynthe.start_actor(id: :example)
+      {:ok, ds_ref} = Absynthe.spawn_entity(actor, :root, dataspace)
 
   ## Modules
 
