@@ -10,15 +10,6 @@ Syndicated Actor Model (SAM) for Elixir. `absynthe` follows Tony Garnock-Jones' 
 - Implements SAM semantics on the BEAM: assertions, Observe subscriptions, turns, and fate-sharing facets.
 - Implements the Preserves data format with binary and text encoders/decoders.
 
-## Project status
-
-- Experimental/alpha; APIs may change.
-- Single-node focus: dataspaces are local entities, no persistence yet.
-- Network relay support (Syndicate protocol) is available but experimental—see `lib/absynthe/relay/` for broker, client, and Noise transport.
-- Best for learning/experimentation with SAM concepts; see `test/` and `examples/` for coverage of current behavior.
-
-**Note on delivery semantics:** All event delivery (assertions, messages) is asynchronous. The API calls (`assert_to`, `send_to`, etc.) enqueue events and return immediately; effects are not visible until the target actor processes them from its mailbox. Turns still commit atomically, but their actions are delivered in subsequent turns.
-
 ## Syndicate primer (concepts & mapping)
 
 - `Actor` (GenServer) hosts entities and processes events inside *turns*.
@@ -28,6 +19,15 @@ Syndicated Actor Model (SAM) for Elixir. `absynthe` follows Tony Garnock-Jones' 
 - `Facet` is a conversational scope; create via `Absynthe.create_facet/3`, terminate via `Absynthe.terminate_facet/2` (fate-sharing).
 - `Turn` is the atomic unit of execution; handlers add actions and the actor commits or discards them together. Committed actions are delivered asynchronously in later turns.
 - `Preserves` is the data model: tagged tuples with records, sets, sequences, and embedded refs. Patterns use `wildcard/0` and `capture/1`.
+
+## Project status
+
+- Experimental/alpha; APIs may change.
+- Single-node focus: dataspaces are local entities, no persistence yet.
+- Network relay support (Syndicate protocol) is available but experimental—see `lib/absynthe/relay/` for broker, client, and Noise transport.
+- Best for learning/experimentation with SAM concepts; see `test/` and `examples/` for coverage of current behavior.
+
+**Note on delivery semantics:** All event delivery (assertions, messages) is asynchronous. The API calls (`assert_to`, `send_to`, etc.) enqueue events and return immediately; effects are not visible until the target actor processes them from its mailbox. Turns still commit atomically, but their actions are delivered in subsequent turns.
 
 ## Installation
 
