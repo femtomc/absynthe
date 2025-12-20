@@ -4,10 +4,10 @@ You are working on the absynthe project. Follow this workflow:
 
 ## Phase 1: Select Issue
 
-1. Run `bd ready` to see issues with no blockers
-2. Select the highest priority issue (P0 > P1 > P2)
-3. Run `bd show <issue-id>` to get full context
-4. Run `bd update <issue-id> --status in_progress` to claim it
+1. Run `tissue ready` to see issues with no blockers
+2. Select the highest priority issue (P1 > P2 > P3 > P4 > P5)
+3. Run `tissue show <issue-id>` to get full context
+4. Run `tissue status <issue-id> in_progress` to claim it
 
 ## Phase 2: Implement
 
@@ -44,11 +44,10 @@ When you believe the implementation is complete:
 
 ## Phase 4: Close and Complete
 
-1. Run `bd close <issue-id>` to close the issue
+1. Run `tissue status <issue-id> closed` to close the issue
 2. Commit and push your changes:
    - `git add <files>` - stage the files you changed
    - `git commit -m "fix: <description>"` - commit with a descriptive message
-   - `bd sync` - sync beads changes
    - `git push` - push to remote
 3. Summarize what was accomplished
 4. Stop - do not pick up another issue unless requested
@@ -60,6 +59,6 @@ When you believe the implementation is complete:
 - ALWAYS let **all three** reviewers (Codex, Gemini, Claude) finish their reviews
 - Seriously, ALWAYS let all three reviewers finish before proceeding
 - All three reviews must pass (LGTM) before closing an issue
-- If you get stuck, add a comment with `bd comment <issue-id> "description of blocker"` and stop
+- If you get stuck, add a comment with `tissue comment <issue-id> -m "description of blocker"` and stop
 - If tests fail repeatedly, investigate the root cause before continuing
 - Always run `mix format` before requesting review

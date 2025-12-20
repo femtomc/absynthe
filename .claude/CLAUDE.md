@@ -11,14 +11,13 @@ mix test             # Run tests
 mix format           # Format code (always run before commits)
 mix docs             # Generate documentation
 
-# Issue tracking (bd/beads)
-bd list              # List all issues
-bd show <id>         # Show issue details
-bd create "title"    # Create new issue
-bd update <id> --status in_progress
-bd close <id>        # Close an issue
-bd ready             # Show ready work (no blockers)
-bd sync              # Sync with git remote
+# Issue tracking (tissue)
+tissue list              # List all issues
+tissue show <id>         # Show issue details
+tissue new "title"       # Create new issue
+tissue status <id> in_progress
+tissue status <id> closed
+tissue ready             # Show ready work (no blockers)
 ```
 
 ## Project Structure
@@ -58,67 +57,36 @@ examples/
   # Usage examples
 ```
 
-## Issue Tracking with `bd` (Beads)
+## Issue Tracking with `tissue`
 
-This project uses `bd` for issue tracking. Issues are stored in `.beads/issues.jsonl` and sync with git.
+This project uses `tissue` for issue tracking. Issues are stored in `.tissue/`.
 
 ### Common Workflows
 
 ```bash
 # View issues
-bd list                    # All open issues
-bd list --status closed    # Closed issues
-bd list --label bug        # Filter by label
-bd ready                   # Issues ready to work on
+tissue list                      # All open issues
+tissue list --status closed      # Closed issues
+tissue list --tag bug            # Filter by tag
+tissue ready                     # Issues ready to work on
 
 # Create issues
-bd create "Add feature X" -t feature -p 1
-bd create "Fix bug Y" -t bug -p 0 --label urgent
+tissue new "Add feature X" -t feature -p 1
+tissue new "Fix bug Y" -t bug -p 1
 
 # Work on issues
-bd update absynthe-abc --status in_progress
-bd comment absynthe-abc "Working on this now"
-bd close absynthe-abc
+tissue status absynthe-abc in_progress
+tissue comment absynthe-abc -m "Working on this now"
+tissue status absynthe-abc closed
 
 # Dependencies
-bd dep add absynthe-abc --depends-on absynthe-xyz
-bd blocked                 # Show blocked issues
-
-# Sync (use --flush-only, see bug below)
-bd sync --flush-only       # Safe: export only, no import
-bd info                    # Show database info
+tissue dep add absynthe-abc blocks absynthe-xyz
+tissue deps absynthe-abc         # Show issue dependencies
 ```
 
 ### Issue ID Format
 
-Issues use prefix + hash format: `absynthe-abc`, `absynthe-xyz`
-
-### Known Bug: `bd sync` deletes newly created issues
-
-**Problem:** `bd sync` runs `git-history-backfill` during import which incorrectly
-deletes newly added issues, treating them as "recovered from history" and adding
-them to `deletions.jsonl`. This happens even when `--no-git-history` flag or
-config settings are used.
-
-**Workaround:** Use `--flush-only` instead of full sync:
-
-```bash
-# Safe sync workflow
-bd sync --flush-only       # Export only, no destructive import
-
-# If you need to import new issues from JSONL:
-bd import --ignore-deletions --no-git-history < .beads/issues.jsonl
-bd sync --flush-only
-```
-
-**Config settings (set but not honored by sync):**
-```bash
-bd config set sync.no_git_history true
-bd config set import.no_git_history true
-```
-
-This is a bug in beads v0.29.0 - the config keys exist but aren't passed through
-to the sync command's internal import.
+Issues use prefix + hash format: `absynthe-abc123xy`, `absynthe-xyz789ab`
 
 ## Architecture Overview
 

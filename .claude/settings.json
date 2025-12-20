@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo '=== absynthe ===' && echo 'Syndicated Actor Model for Elixir' && echo '' && bd ready 2>/dev/null | head -12 || echo 'bd not available'"
+            "command": "echo '=== absynthe ===' && echo 'Syndicated Actor Model for Elixir' && echo '' && tissue ready 2>/dev/null | head -12 || echo 'tissue not available'"
           }
         ]
       }
