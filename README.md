@@ -10,10 +10,9 @@ An implementation of Tony Garnock-Jones' [Syndicate](https://syndicate-lang.org/
 
 ## Why?
 
-- **Dataspaces** — Shared tuple spaces for coordination (beyond message passing)
-- **Assertions** — Persistent facts, not ephemeral messages
-- **Atomic Turns** — Consistent state transitions with fate-sharing facets
-- **Preserves** — Rich data format with patterns, records, and embedded refs
+The actor model is powerful, but message passing alone can be limiting. When actors need to coordinate—sharing state, observing changes, or synchronizing—you end up building ad-hoc protocols on top of messages. These protocols are error-prone and hard to reason about.
+
+The Syndicated Actor Model offers a different primitive: assertions. Instead of sending ephemeral messages, actors assert persistent facts into shared dataspaces. Other actors can observe patterns in those facts and react when they appear or disappear. All changes happen in atomic turns, so you get consistent snapshots of the world. This makes coordination protocols explicit and composable rather than implicit and fragile.
 
 ## Syndicate primer (concepts & mapping)
 
